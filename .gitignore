@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+.pi/
+*.log
+*.tsbuildinfo
+.env
+.env.*
+config.json
+TASK.md
+.DS_Store

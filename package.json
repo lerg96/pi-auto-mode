@@ -1,0 +1,45 @@
+{
+  "name": "pi-auto-mode",
+  "version": "0.1.0",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "lint": "prettier --check .",
+    "lint:fix": "prettier --write .",
+    "test": "jest --coverage",
+    "test:watch": "jest --watch",
+    "build": "tsc -p tsconfig.json",
+    "prepare": "husky"
+  },
+  "dependencies": {
+    "zod": "^3"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@swc/jest": "^0.2.39",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^20",
+    "husky": "^9.1.7",
+    "jest": "^30.5.0",
+    "lint-staged": "^17.4.1",
+    "prettier": "^3.9.6",
+    "typescript": "^5"
+  },
+  "lint-staged": {
+    "*.ts": [
+      "prettier --write",
+      "npm test -- --passWithNoTests"
+    ],
+    "*.{js,json,md}": [
+      "prettier --write"
+    ]
+  }
+}

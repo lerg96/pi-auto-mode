@@ -1,0 +1,82 @@
+{
+  "permissions": {
+    "tools": {
+      "*": "ask",
+      "read": "allow",
+      "write": "ask",
+      "bash": [
+        { "pattern": "aws get_*", "action": "allow" },
+        {
+          "pattern": "aws delete_*",
+          "action": "deny",
+          "reason": "destructive command not allowed"
+        },
+        { "pattern": "rm -rf *", "action": "deny", "reason": "destructive" },
+        {
+          "pattern": "cat *.env",
+          "action": "deny",
+          "reason": "reading environment variables is not allowed"
+        },
+        {
+          "pattern": "git push --force*",
+          "action": "deny",
+          "reason": "force-push blocked"
+        }
+      ]
+    },
+    "skills": {},
+    "mcps": {},
+    "external_directory": {
+      "/tmp/*": "ask",
+      "/etc/*": "deny"
+    }
+  },
+  "permissionSets": {
+    "project-default": {
+      "permissions": {
+        "tools": {
+          "bash": [
+            {
+              "pattern": "aws *",
+              "action": "deny",
+              "reason": "aws blocked in this project"
+            }
+          ]
+        },
+        "skills": { "ts-language-server": "allow" },
+        "external_directory": { "/mnt/shared/*": "allow" }
+      }
+    }
+  },
+  "activePermissionSets": ["project-default"],
+  "mode": "default",
+  "confineToWorkingDirectory": true,
+  "classifier": {
+    "enabled": true,
+    "llm": {
+      "provider": "anthropic",
+      "model": "claude-opus-4",
+      "baseUrl": "",
+      "apiKey": "",
+      "timeoutMs": 30000,
+      "maxTokens": 1024,
+      "fallbackModel": "claude-sonnet-4",
+      "systemPrompt": "You classify whether a tool call is safe to auto-approve.",
+      "enabled": true
+    },
+    "fallback": { "onTimeout": "ask-user", "onError": "ask-user" },
+    "onBlock": "deny",
+    "onBlockUserOverride": false
+  },
+  "denyStrategy": {
+    "mode": "auto-retry",
+    "escalation": { "consecutive": 3, "total": 10 }
+  },
+  "ui": {
+    "promptMaxRows": 10,
+    "promptFieldMaxWidth": 80,
+    "showClassifierRisk": true,
+    "modalTimeoutMs": 120000
+  },
+  "telemetry": { "enabled": false, "path": "" }
+}

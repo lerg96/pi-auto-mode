@@ -393,6 +393,41 @@ describe('external_directory scope', () => {
     expect(verdict).toBeUndefined()
   })
 
+  it('one allowed path does not whitelist other outside paths', () => {
+    const allowedDir = resolve(cwd, '..', 'allowed')
+    const allowedFile = join(allowedDir, 'a.txt')
+    const secret = outside('secret.txt')
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: {
+        tools: { bash: 'allow' },
+        external_directory: { [join(allowedDir, '*')]: 'allow' },
+      },
+    })
+    const verdict = evaluateExternalDirectory(cfg, [
+      { surface: 'shell', value: `cat ${allowedFile} ${secret}` },
+    ])
+    expect(verdict?.action).toBe('ask')
+    expect(verdict?.absPath).toBe(secret)
+  })
+
+  it('allowed paths never pollute the reported target', () => {
+    const allowedDir = resolve(cwd, '..', 'allowed')
+    const allowedFile = join(allowedDir, 'a.txt')
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: {
+        tools: { bash: 'allow' },
+        external_directory: { [join(allowedDir, '*')]: 'allow' },
+      },
+    })
+    expect(
+      evaluateExternalDirectory(cfg, [
+        { surface: 'shell', value: `cat ${allowedFile}` },
+      ])?.action
+    ).toBe('allow')
+  })
+
   it('verdict names the triggering intent, not the first', () => {
     const cfg = cfgWith({
       confineToWorkingDirectory: true,

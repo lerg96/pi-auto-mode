@@ -445,51 +445,69 @@ export function evaluateExternalDirectory(
     for (const setId of cfg.activePermissionSets ?? []) {
       sources.push(cfg.permissionSets[setId]?.permissions.external_directory)
     }
-    let action: SimpleAction | undefined
-    let pattern: string | undefined
-    let matchedAbs: string | undefined
-    for (const map of sources) {
-      if (!map) continue
-      for (const key of Object.keys(map)) {
-        const candidate: SimpleAction = map[key] as SimpleAction
-        if (
-          candidate !== 'allow' &&
-          candidate !== 'deny' &&
-          candidate !== 'ask'
-        )
-          continue
-        // Expand MSYS-drive + home prefixes (and normalize separators) so
-        // globs like `~/projects/**` or `/c/work/**` match resolved paths.
-        const expandedKey = normalize(expandHomePrefix(expandMsysDrive(key)))
-        const hit = outside.find((o) => wildcardMatch(expandedKey, o.abs))
-        if (hit !== undefined) {
-          action = candidate
-          pattern = key
-          matchedAbs = hit.abs
+    // Per-entry resolution (last match wins across sources, per path).
+    // Entries resolved to `allow` are pre-filtered: they decide nothing
+    // and never appear in reasons — so one allowed path (e.g. Temp) can
+    // neither whitelist the other outside paths nor pollute the target.
+    const resolveEntry = (
+      abs: string
+    ): { action: SimpleAction; pattern: string } | undefined => {
+      let found: { action: SimpleAction; pattern: string } | undefined
+      for (const map of sources) {
+        if (!map) continue
+        for (const key of Object.keys(map)) {
+          const candidate: SimpleAction = map[key] as SimpleAction
+          if (
+            candidate !== 'allow' &&
+            candidate !== 'deny' &&
+            candidate !== 'ask'
+          )
+            continue
+          // Expand MSYS-drive + home prefixes (and normalize separators)
+          // so globs like `~/projects/**` or `/c/work/**` match resolved
+          // paths.
+          const expandedKey = normalize(expandHomePrefix(expandMsysDrive(key)))
+          if (wildcardMatch(expandedKey, abs))
+            found = { action: candidate, pattern: key }
         }
       }
+      return found
     }
-    const first = outside[0] as {
-      abs: string
-      value: string
-      surface: string
-      engine: ExternalEngine
-    }
-    if (action !== undefined) {
-      const trigger = outside.find((o) => o.abs === matchedAbs) ?? first
+    const resolved = outside.map((o) => ({ ...o, rule: resolveEntry(o.abs) }))
+    const pending = resolved.filter((o) => o.rule?.action !== 'allow')
+    if (pending.length === 0) {
+      // Every outside path explicitly allowed: allow verdict, same as before.
+      const last = resolved[resolved.length - 1]
+      if (last === undefined) return undefined
       return {
-        action,
-        pattern,
-        absPath: matchedAbs ?? first.abs,
-        matchedValue: trigger.value,
-        matchedSurface: trigger.surface,
-        engine: trigger.engine,
+        action: 'allow' as const,
+        pattern: last.rule?.pattern,
+        absPath: last.abs,
+        matchedValue: last.value,
+        matchedSurface: last.surface,
+        engine: last.engine,
       }
     }
-    const reasonAbs = reasonPathFor(outside.map((o) => o.abs))
-    const trigger = outside.find((o) => o.abs === reasonAbs) ?? first
+    // Strictest wins across the remaining entries: explicit deny beats
+    // explicit ask beats the default ask for unmatched paths.
+    const picked =
+      pending.find((o) => o.rule?.action === 'deny') ??
+      pending.find((o) => o.rule?.action === 'ask')
+    if (picked?.rule !== undefined) {
+      return {
+        action: picked.rule.action,
+        pattern: picked.rule.pattern,
+        absPath: picked.abs,
+        matchedValue: picked.value,
+        matchedSurface: picked.surface,
+        engine: picked.engine,
+      }
+    }
+    const reasonAbs = reasonPathFor(pending.map((o) => o.abs))
+    const trigger = pending.find((o) => o.abs === reasonAbs) ?? pending[0]
+    if (trigger === undefined) return undefined
     return {
-      action: 'ask',
+      action: 'ask' as const,
       pattern: undefined,
       absPath: reasonAbs,
       matchedValue: trigger.value,

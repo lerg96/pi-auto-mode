@@ -19,6 +19,7 @@ import { registerSetCommands } from './commands/set-commands.ts'
 import { SessionRules } from './permission/session-rules.ts'
 import { evaluatePermission } from './permission/visibility.ts'
 
+import { initShellParser } from './permission/shell-parse.ts'
 import { surfaceForTool } from './gate/normalize.ts'
 import { createBeforeAgentStartHandler } from './handlers/before-agent-start.ts'
 import { gateToolCall } from './gate/gate.ts'
@@ -190,6 +191,9 @@ export function computeAndApplyActiveTools(
 
 // ─── Extension entry point ──────────────────────────────────────
 export default function piAutoMode(pi: ExtensionAPI): void {
+  // Shell AST parser (tree-sitter): loads async, never throws or blocks
+  // mounting. Until ready the external scope uses the heuristic engine.
+  void initShellParser()
   // Resolve config path: env var → ~/.pi/pi-auto-mode.json → seed from example.
   // resolveConfigPath may copy config.example.json into the user dir; the
   // notify channel below uses console.* because no UI ctx has been bound yet

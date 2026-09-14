@@ -1,6 +1,12 @@
 export interface AccessIntent {
   surface: string
   value: string
+  /**
+   * Quote-preserving twin of `value` (same segments, quotes kept). Set only
+   * when it differs from `value`, so quote-free commands keep the exact
+   * legacy shape. Lets the scope extractor see quoted strings atomically.
+   */
+  rawValue?: string
 }
 
 // L1: Explicit allow-list of known built-in tools. Tools not in this set
@@ -41,7 +47,11 @@ export interface CommandSegment {
  * quoted string, so callers can treat it as data rather than a command.
  * Surrounding quotes are stripped from each segment value.
  */
-export function segmentCommand(command: string): CommandSegment[] {
+export function segmentCommand(
+  command: string,
+  opts?: { keepQuotes?: boolean }
+): CommandSegment[] {
+  const keep = opts?.keepQuotes === true
   const segments: CommandSegment[] = []
   let buf = ''
   let quoted = false
@@ -177,6 +187,7 @@ export function segmentCommand(command: string): CommandSegment[] {
         continue
       }
       if (c === quote) {
+        if (keep) buf += c
         quote = null
         i++
         continue
@@ -187,6 +198,7 @@ export function segmentCommand(command: string): CommandSegment[] {
     }
     // Outside any quote.
     if (c === "'" || c === '"') {
+      if (keep) buf += c
       quote = c
       quoted = true
       i++
@@ -309,8 +321,17 @@ export function normalizeToolCall(
 
   if (toolName === 'bash') {
     if (typeof cmd === 'string' && cmd.length > 0) {
-      const segments = splitSegments(cmd)
-      return segments.map((segment) => ({ surface, value: segment }))
+      const segments = segmentCommand(cmd)
+      const rawSegments = segmentCommand(cmd, { keepQuotes: true })
+      return segments.map((segment, i) => {
+        const intent: AccessIntent = { surface, value: segment.value }
+        // Zipped by index: splitting decisions are identical with or
+        // without quotes, only the quote chars differ. Set only when it
+        // differs so quote-free commands keep the exact legacy shape.
+        const raw = rawSegments[i]?.value
+        if (raw !== undefined && raw !== segment.value) intent.rawValue = raw
+        return intent
+      })
     }
     // 'bash' tool with no command — sentinel (never "undefined")
     return [{ surface, value: '*' }]

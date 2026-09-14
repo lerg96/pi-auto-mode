@@ -123,7 +123,7 @@ Si se aporta CI, debe correr exactamente esos tres pasos; **no debes inventar ni
 - **Surface:** tipo de superficie del tool call (`fs`, `shell`, `mcp`) + tools custom via `surfaceForTool`.
 - **Fail-closed (clave):** ante cualquier error de carga/eval, se **bloquea** la tool call — nunca se abre a un default permiso inseguro. Romper esto es un cambio de seguridad mayor.
 - **Trust boundary:** paths/órdenes protegidos — ahora en block rules del clasificador LLM, no en ruleBased.
-- **External scope (`external_directory`):** opt-in vía `confineToWorkingDirectory` (default `false`). Mapa plano `Record<glob, SimpleAction>` en cascada; fuera de `cwd()` sin match → `ask`; solo endurece, nunca relaja. El clasificador solo endurece `ask`; `allow` explícito es final.
+- **External scope (`external_directory`):** opt-in vía `confineToWorkingDirectory` (default `false`). Mapa plano `Record<glob, SimpleAction>` en cascada; fuera de `cwd()` sin match → `ask`; solo endurece, nunca relaja. El clasificador solo endurece `ask`; `allow` explícito es final. Extracción shell con tree-sitter-bash (`src/permission/shell-parse.ts`, deps `web-tree-sitter` + `tree-sitter-wasms`, sin nativos) + fallback heurístico; veredicto lleva `engine`. Crash classes conocidas del wasm 0.20.x: heredocs `<<` y `case` (→ heurístico).
 - **ReDoS / bypasses:** en `wildcard-matcher.ts`; al añadir patrones, mántelos lineales/seguros.
 
 ## 11. Troubleshooting común

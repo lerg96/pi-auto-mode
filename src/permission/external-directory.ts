@@ -2,13 +2,22 @@ import { homedir } from 'node:os'
 import { isAbsolute, normalize, relative, resolve, sep } from 'node:path'
 import type { Config, SimpleAction } from '../types/config.ts'
 import { wildcardMatch } from './wildcard-matcher.ts'
+import { extractTreePaths, isShellParserReady } from './shell-parse.ts'
 
 // Local structural intent — deliberately NOT imported from gate/normalize.ts
 // to avoid an import cycle (gate imports this module).
 export interface ExternalIntent {
   surface: string
   value: string
+  /**
+   * Quote-preserving twin of `value` (same segments, quotes kept).
+   * The tree parser reads this when present; otherwise `value`.
+   */
+  rawValue?: string
 }
+
+/** Which extractor produced the candidates behind a verdict. */
+export type ExternalEngine = 'tree-sitter' | 'heuristic'
 
 export interface ExternalVerdict {
   action: SimpleAction
@@ -17,6 +26,7 @@ export interface ExternalVerdict {
   /** Intent that produced absPath — reporting shows the trigger, not intent[0]. */
   matchedValue?: string
   matchedSurface?: string
+  engine?: ExternalEngine
 }
 
 /**
@@ -106,7 +116,7 @@ const DOS_DEVICES = new Set([
  * DOS devices (`NUL`, `nul.txt`) on win32. Such tokens can never escape
  * the working directory, so the scope ignores them. Case-insensitive.
  */
-function isDevicePath(raw: string): boolean {
+export function isDevicePath(raw: string): boolean {
   const t = raw
     .trim()
     .replace(/[/\\]+$/, '')
@@ -134,7 +144,7 @@ const ESCAPE_DEBRIS = new Set([
   '\\"',
 ])
 
-function isEscapeDebris(raw: string): boolean {
+export function isEscapeDebris(raw: string): boolean {
   return ESCAPE_DEBRIS.has(raw.trim())
 }
 
@@ -146,7 +156,7 @@ function isEscapeDebris(raw: string): boolean {
 // (`/c/...`) still rewrite via expandMsysDrive.
 const LONE_SLASH_LETTER = /^\/[A-Za-z]$/
 
-function isWindowsFlagArg(raw: string): boolean {
+export function isWindowsFlagArg(raw: string): boolean {
   if (process.platform !== 'win32') return false
   if (raw.includes("'") || raw.includes('"')) return false
   return LONE_SLASH_LETTER.test(raw.trim())
@@ -156,7 +166,7 @@ function isWindowsFlagArg(raw: string): boolean {
 // (`sed 's/a {…/…/'` — quotes are stripped upstream, so spaces split the
 // expression and stripToken eats the brace). Real paths never start with
 // a brace (beyond exotic brace-expansion, an accepted blind spot).
-function isBraceFragment(raw: string): boolean {
+export function isBraceFragment(raw: string): boolean {
   const t = raw.trimStart()
   return t.startsWith('{') || t.startsWith('}')
 }
@@ -165,7 +175,7 @@ function isBraceFragment(raw: string): boolean {
 // `grep "//"`), not paths. Single `/` still counts (root listing asks).
 const BARE_SLASH_RUN = /^[/\\]{2,}$/
 
-function isBareSlashRun(cand: string): boolean {
+export function isBareSlashRun(cand: string): boolean {
   return BARE_SLASH_RUN.test(cand.trim())
 }
 
@@ -175,7 +185,7 @@ function isBareSlashRun(cand: string): boolean {
 // `\` (drive root) still counts.
 const ROOTED_REGEX_DEBRIS = /^\\[^A-Za-z*?]/
 
-function isRootedRegexDebris(cand: string): boolean {
+export function isRootedRegexDebris(cand: string): boolean {
   return ROOTED_REGEX_DEBRIS.test(cand)
 }
 
@@ -184,7 +194,7 @@ function isRootedRegexDebris(cand: string): boolean {
 // the cwd). Uppercase (`C:`, `D:`) still counts — real cross-drive refs.
 const BARE_LOWER_DRIVE = /^[a-z]:$/
 
-function isBareLowerDrive(cand: string): boolean {
+export function isBareLowerDrive(cand: string): boolean {
   return BARE_LOWER_DRIVE.test(cand.trim())
 }
 
@@ -195,7 +205,7 @@ const QUOTED_PURE_GLOB = /^[\\/][\\/ *?]*[*?][\\/ *?]*$/
 
 // NOTE: call with the pre-strip token — stripToken removes the quotes
 // this check looks for.
-function isQuotedPureGlob(raw: string): boolean {
+export function isQuotedPureGlob(raw: string): boolean {
   if (!raw.includes("'") && !raw.includes('"')) return false
   return QUOTED_PURE_GLOB.test(stripToken(raw))
 }
@@ -293,11 +303,11 @@ function tokenizeShell(segment: string): string[] {
   return tokens
 }
 
-function stripToken(t: string): string {
+export function stripToken(t: string): string {
   return t.replace(/^['"`[{(]+|['"`\]},;]+$/g, '')
 }
 
-function isPathLike(token: string): boolean {
+export function isPathLike(token: string): boolean {
   if (token.includes('/') || token.includes('\\')) return true
   if (token.startsWith('~')) return true
   if (token === '.' || token === '..') return true
@@ -327,6 +337,15 @@ function isPathLike(token: string): boolean {
  * considered.
  */
 export function extractBashPaths(segment: string): string[] {
+  return selectPathCandidates(tokenizeShell(segment))
+}
+
+/**
+ * Shared candidate filter for raw token lists (heuristic tokenizer words
+ * or tree-sitter node texts). Applies the full debris policy in one place
+ * so both engines agree on what counts as a path.
+ */
+export function selectPathCandidates(rawTokens: string[]): string[] {
   const out: string[] = []
   const push = (cand: string): void => {
     // A lone `/` right after a sed-substitution head (`s/a/ /` shredded by
@@ -336,7 +355,7 @@ export function extractBashPaths(segment: string): string[] {
     if (cand === '/' && prev !== undefined && /^s\/.*\//.test(prev)) return
     out.push(cand)
   }
-  for (const token of tokenizeShell(segment)) {
+  for (const token of rawTokens) {
     const eq = token.lastIndexOf('=')
     const raw = eq >= 0 ? token.slice(eq + 1) : token
     const cand = stripToken(raw)
@@ -372,7 +391,12 @@ export function evaluateExternalDirectory(
   try {
     if (cfg.confineToWorkingDirectory !== true) return undefined
     const base = cwd ?? process.cwd()
-    const outside: Array<{ abs: string; value: string; surface: string }> = []
+    const outside: Array<{
+      abs: string
+      value: string
+      surface: string
+      engine: ExternalEngine
+    }> = []
     for (const intent of intents) {
       if (intent.surface === 'fs') {
         if (intent.value === '*') continue
@@ -381,12 +405,35 @@ export function evaluateExternalDirectory(
         if (isQuotedPureGlob(intent.value)) continue
         const abs = resolveFsPath(intent.value, base)
         if (isOutsideCwd(abs, base))
-          outside.push({ abs, value: intent.value, surface: intent.surface })
+          outside.push({
+            abs,
+            value: intent.value,
+            surface: intent.surface,
+            engine: 'heuristic',
+          })
       } else if (intent.surface === 'shell') {
-        for (const cand of extractBashPaths(intent.value)) {
+        // Quote-preserving twin when the gate provides one: quoted
+        // strings stay atomic under the tree parser instead of
+        // shredding into slash debris. matchedValue reports the text
+        // the verdict was actually extracted from.
+        const source = intent.rawValue ?? intent.value
+        const treeCandidates = isShellParserReady()
+          ? extractTreePaths(source)
+          : null
+        const fromTree = treeCandidates !== null
+        const engine: ExternalEngine = fromTree ? 'tree-sitter' : 'heuristic'
+        const candidates = fromTree
+          ? treeCandidates
+          : extractBashPaths(intent.value)
+        for (const cand of candidates) {
           const abs = resolveFsPath(cand, base)
           if (isOutsideCwd(abs, base))
-            outside.push({ abs, value: intent.value, surface: intent.surface })
+            outside.push({
+              abs,
+              value: source,
+              surface: intent.surface,
+              engine,
+            })
         }
       }
       // Custom surfaces: no opinion.
@@ -426,6 +473,7 @@ export function evaluateExternalDirectory(
       abs: string
       value: string
       surface: string
+      engine: ExternalEngine
     }
     if (action !== undefined) {
       const trigger = outside.find((o) => o.abs === matchedAbs) ?? first
@@ -435,6 +483,7 @@ export function evaluateExternalDirectory(
         absPath: matchedAbs ?? first.abs,
         matchedValue: trigger.value,
         matchedSurface: trigger.surface,
+        engine: trigger.engine,
       }
     }
     const reasonAbs = reasonPathFor(outside.map((o) => o.abs))
@@ -445,8 +494,14 @@ export function evaluateExternalDirectory(
       absPath: reasonAbs,
       matchedValue: trigger.value,
       matchedSurface: trigger.surface,
+      engine: trigger.engine,
     }
   } catch {
-    return { action: 'deny', pattern: '*', absPath: '(evaluation error)' }
+    return {
+      action: 'deny',
+      pattern: '*',
+      absPath: '(evaluation error)',
+      engine: 'heuristic',
+    }
   }
 }

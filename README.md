@@ -152,6 +152,8 @@ El cambio requiere confirmación explícita (mismo flujo que `auto-mode:sets act
 
 Opt-in vía `confineToWorkingDirectory` (default `false` = sin cambios). Cuando está activo, cualquier acceso `fs` o segmento `shell` a un path fuera de `process.cwd()` endurece el veredicto: match explícito en `external_directory` (cascada como el resto, última coincidencia gana) o `ask` por defecto. Los paths internos no opinan, y un `deny` explícito de tools siempre gana a un `allow` externo.
 
+Los segmentos `shell` se extraen con tree-sitter-bash (`web-tree-sitter` + wasm, sin binarios nativos): las strings entrecomilladas quedan atómicas (un `sed "s/a/ /"` o un `python3 -c "…"` nunca se trituran en falsos paths) y se excluyen por tipo de nodo comentarios, heredocs, regexes y variables. Si el parser no está listo o el segmento lo excede (`<<` heredocs, `case`, >64KB), se usa el extractor heurístico; el veredicto indica el motor (`engine`).
+
 ```json
 {
   "confineToWorkingDirectory": true,

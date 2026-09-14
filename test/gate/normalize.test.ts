@@ -88,6 +88,47 @@ describe('splitShellSegments / segmentCommand', () => {
   })
 })
 
+describe('segmentCommand keepQuotes (raw twin for the scope extractor)', () => {
+  it('default strips quotes; keepQuotes preserves them', () => {
+    expect(segmentCommand('echo "rm -rf"')[0].value).toBe('echo rm -rf')
+    expect(segmentCommand('echo "rm -rf"', { keepQuotes: true })[0].value).toBe(
+      'echo "rm -rf"'
+    )
+  })
+
+  it('quoted sed program stays whole in the raw twin', () => {
+    const raw = segmentCommand('sed "s/^/L: /" x', { keepQuotes: true })
+    expect(raw).toHaveLength(1)
+    expect(raw[0].value).toBe('sed "s/^/L: /" x')
+    expect(raw[0].quoted).toBe(true)
+  })
+
+  it('raw and dequoted parses zip 1:1 over tricky commands', () => {
+    const cmds = [
+      'for i in 1 2; do ./gradlew :app:x 2>&1 | rg "a|b" | sed "s/^/L: /"; done',
+      'python3 -c "for p in xs: print(p)"',
+      'echo "a $(cat /tmp/x) b" | grep "//"',
+      "cat <<'EOF'\nhello\nEOF",
+      'a && b || c; d & e |& f',
+    ]
+    for (const cmd of cmds) {
+      const plain = segmentCommand(cmd)
+      const raw = segmentCommand(cmd, { keepQuotes: true })
+      expect(raw.map((s) => s.quoted)).toEqual(plain.map((s) => s.quoted))
+      expect(raw).toHaveLength(plain.length)
+    }
+  })
+
+  it('normalizeToolCall sets rawValue only when quotes are present', () => {
+    const withQuotes = normalizeToolCall('bash', { command: 'echo "a b"' })
+    expect(withQuotes).toHaveLength(1)
+    expect(withQuotes[0].rawValue).toBe('echo "a b"')
+    const bare = normalizeToolCall('bash', { command: 'ls src' })
+    expect(bare).toHaveLength(1)
+    expect(bare[0].rawValue).toBeUndefined()
+  })
+})
+
 describe('normalizeToolCall edge cases', () => {
   // L10: bash without command does not produce "undefined"
   it("bash without command yields sentinel value '*' not 'undefined'", () => {

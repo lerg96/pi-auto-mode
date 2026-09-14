@@ -1,6 +1,7 @@
 import { join, normalize, resolve, sep } from 'node:path'
 import { homedir } from 'node:os'
 import { parseConfig } from '../../src/types/config.ts'
+import { normalizeToolCall } from '../../src/gate/normalize.ts'
 import {
   evaluateExternalDirectory,
   extractBashPaths,
@@ -270,7 +271,7 @@ describe('external_directory scope', () => {
     const verdict = evaluateExternalDirectory(cfg, [
       {
         surface: 'shell',
-        value: `node -e \"x\" && echo '\\n' && git apply --cached ${target}`,
+        value: `node -e "x" && echo '\\n' && git apply --cached ${target}`,
       },
     ])
     expect(verdict?.action).toBe('ask')
@@ -404,5 +405,24 @@ describe('external_directory scope', () => {
     expect(verdict?.action).toBe('ask')
     expect(verdict?.matchedValue).toBe('cd /tmp/uicheck')
     expect(verdict?.matchedSurface).toBe('shell')
+  })
+
+  it('no spurious ask for sed-with-space pipeline (reported LOOP shape)', () => {
+    // `sed "s/^/LOOP$i: /"` — the space inside the quoted expression must
+    // not shred into a lone `/` token (quote-aware segments, a654ffa).
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: { tools: { bash: 'allow' } },
+    })
+    const intents = normalizeToolCall('bash', {
+      command:
+        'for i in 1 2; do ./gradlew :app:x 2>&1 | rg "BUILD (SUCCESS|FAILED)" | tail -n 1 | sed "s/^/LOOP$i: /"; done (timeout 1200s)',
+    })
+    expect(evaluateExternalDirectory(cfg, intents)).toBeUndefined()
+  })
+
+  it('lone slash after sed head is debris; real root and s/a path kept', () => {
+    expect(extractBashPaths('sed s/^/LOOP1: /')).toEqual(['s/^/LOOP1:'])
+    expect(extractBashPaths('ls s/a /')).toEqual(['s/a', '/'])
   })
 })

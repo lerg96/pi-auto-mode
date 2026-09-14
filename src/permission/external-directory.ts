@@ -328,6 +328,14 @@ function isPathLike(token: string): boolean {
  */
 export function extractBashPaths(segment: string): string[] {
   const out: string[] = []
+  const push = (cand: string): void => {
+    // A lone `/` right after a sed-substitution head (`s/a/ /` shredded by
+    // dequoting) is expression debris, not the root dir. The head needs two
+    // slashes (`s/a/…`) so a relative path (`s/a`) + `/` still counts.
+    const prev = out[out.length - 1]
+    if (cand === '/' && prev !== undefined && /^s\/.*\//.test(prev)) return
+    out.push(cand)
+  }
   for (const token of tokenizeShell(segment)) {
     const eq = token.lastIndexOf('=')
     const raw = eq >= 0 ? token.slice(eq + 1) : token
@@ -344,7 +352,7 @@ export function extractBashPaths(segment: string): string[] {
     if (isBareSlashRun(cand)) continue
     if (isRootedRegexDebris(cand)) continue
     if (isBareLowerDrive(cand)) continue
-    out.push(cand)
+    push(cand)
   }
   return out
 }

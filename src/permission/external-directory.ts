@@ -179,6 +179,15 @@ function isRootedRegexDebris(cand: string): boolean {
   return ROOTED_REGEX_DEBRIS.test(cand)
 }
 
+// A bare lowercase drive token (`p:` from `for p in …:`) is loop-variable
+// debris, not a path: win32 resolves `p:` drive-relative (usually outside
+// the cwd). Uppercase (`C:`, `D:`) still counts — real cross-drive refs.
+const BARE_LOWER_DRIVE = /^[a-z]:$/
+
+function isBareLowerDrive(cand: string): boolean {
+  return BARE_LOWER_DRIVE.test(cand.trim())
+}
+
 // A quoted token that is only separators, spaces and wildcards (`"\*"`,
 // `"/*"`) is a dequoted glob/pattern fragment (e.g. a grep regex), not a
 // path argument. Unquoted `\*` still counts (fail-closed: `del \*`).
@@ -334,6 +343,7 @@ export function extractBashPaths(segment: string): string[] {
     if (isBraceFragment(raw)) continue
     if (isBareSlashRun(cand)) continue
     if (isRootedRegexDebris(cand)) continue
+    if (isBareLowerDrive(cand)) continue
     out.push(cand)
   }
   return out

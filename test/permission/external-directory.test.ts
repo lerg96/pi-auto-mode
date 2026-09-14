@@ -372,6 +372,26 @@ describe('external_directory scope', () => {
     expect(verdict).toBeUndefined()
   })
 
+  it('bare lowercase drive is loop-variable debris, uppercase still counts', () => {
+    // `for p in …:` / `not in p:` — the reported `p:/` false positive
+    expect(extractBashPaths('if x not in p: continue')).toEqual([])
+    expect(extractBashPaths('del D:')).toEqual(['D:'])
+  })
+
+  it('no spurious ask for python loop over results (reported case shape)', () => {
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: { tools: { bash: 'allow' } },
+    })
+    const verdict = evaluateExternalDirectory(cfg, [
+      {
+        surface: 'shell',
+        value: `for p in glob.glob('x/*.xml'): parse(${inside('a.txt')})`,
+      },
+    ])
+    expect(verdict).toBeUndefined()
+  })
+
   it('verdict names the triggering intent, not the first', () => {
     const cfg = cfgWith({
       confineToWorkingDirectory: true,

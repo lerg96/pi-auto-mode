@@ -1,144 +1,144 @@
 # pi-auto-mode
 
-Extensión para el runtime de **Pi Coding Agent** (`@earendil-works/pi-coding-agent`) que añade un **modo seguro de auto-ejecución de comandos**. Pi por defecto ya permite todos los comandos de forma automática — esta extensión **no añade** la auto-ejecución en sí, sino una capa de validación que intenta garantizar que lo que se ejecuta sea al menos seguro. Cada llamada a herramientas se evalúa contra reglas de permisos, un clasificador de riesgo y una estrategia de bloqueo, y decide por ti entre `allow`, `deny` o `ask`. Pensado para quien quiere que el agente avance sin fricciones pero sin ceder el control de las operaciones sensibles.
+An extension for the **Pi Coding Agent** runtime (`@earendil-works/pi-coding-agent`) that adds a **safe command auto-execution mode**. Pi already auto-allows every command by default — this extension does **not** add auto-execution itself, but a validation layer that tries to guarantee whatever runs is at least safe. Every tool call is evaluated against permission rules, a risk classifier and a blocking strategy, and decides for you between `allow`, `deny` or `ask`. Built for those who want the agent to move forward without friction but without giving up control of sensitive operations.
 
-## Características principales
+## Key features
 
-- **Modelo de 4 capas** — la decisión combina un _visibility filter_ (qué ve el LLM), un _pattern matcher_ basado en claves exactas de toolName, un clasificador LLM opcional (solo cuando la cascada = `ask`) y una _deny strategy_ (qué pasa tras un bloque). Ver [Modelo de 4 capas](#modelo-de-4-capas).
-- **Política por permission sets en cascada** — defines conjuntos nombrados de permisos; se evalúan en orden (global primero, sets activos después), último match gana.
-- **Tres acciones de decisión** — `allow` (permite y sigue), `deny` (bloquea) y `ask` (pide confirmación), con matriz de decisión bien definida.
-- **Clasificador LLM opcional** — se invoca **solo** cuando la cascada de permisos resuelve a `ask`; lee archivo referenciado (≤8KB) con trust-boundary check y redactor de secretos.
-- **Fail-closed por diseño** — ante cualquier error de carga o evaluación, la herramienta se **bloquea**. Nunca se degrada a un permiso inseguro por defecto.
-- **Estrategia `auto-retry`** — tras N bloqueos consecutivos o totales, escala el aviso para que el agente no se atasque en un bucle de intentos denegados. Alias retrocompatible: `deny-and-continue` se acepta y se normaliza a `auto-retry`.
-- **Guard de secretos y trust boundary** — protege rutas y comandos sensibles (`/etc`, `~/.ssh`, `.env`, `sudo`, `rm -rf`, `git push --force`); el extractor de archivos respeta la misma frontera antes de pasar contenido al LLM.
-- **Tres modos globales (`default` / `strict` / `yolo`)** — `yolo` reescribe `ask` → `allow` sin tocar los `deny` explícitos; `strict` reescribe `ask` → `deny`. Conmutables en caliente con `/auto-mode:mode`.
-- **Ajustes en caliente** — recargas de config en runtime que **debiliten** la seguridad (desactivar clasificador, relajar fallback a `allow`, bajar la restricción del deny strategy, …) se rechazan automáticamente.
-- **Comandos de sesión** — activa/desactiva permission sets y cambia el modo en caliente con confirmación explícita; contadores de bloqueo se reinician entre sesiones.
+- **4-layer model** — the decision combines a _visibility filter_ (what the LLM sees), an exact-`toolName`-keyed _pattern matcher_, an optional LLM classifier (only when the cascade resolves to `ask`) and a _deny strategy_ (what happens after a block). See [4-layer model](#4-layer-model).
+- **Cascading permission-set policy** — define named permission sets; they evaluate in order (global first, active sets after), last match wins.
+- **Three decision actions** — `allow` (permit and continue), `deny` (block) and `ask` (prompt for confirmation), with a well-defined decision matrix.
+- **Optional LLM classifier** — invoked **only** when the permission cascade resolves to `ask`; reads referenced files (≤8KB) with trust-boundary check and secret redaction.
+- **Fail-closed by design** — on any load or evaluation error, the tool is **blocked**. It never degrades to an unsafe default permission.
+- **`auto-retry` strategy** — after N consecutive or total blocks, escalates the notice so the agent doesn't get stuck in a denied-attempt loop. Backwards-compatible alias: `deny-and-continue` is accepted and normalized to `auto-retry`.
+- **Secret guard and trust boundary** — protects sensitive paths and commands (`/etc`, `~/.ssh`, `.env`, `sudo`, `rm -rf`, `git push --force`); the file extractor respects the same boundary before passing content to the LLM.
+- **Three global modes (`default` / `strict` / `yolo`)** — `yolo` rewrites `ask` → `allow` without touching explicit `deny`s; `strict` rewrites `ask` → `deny`. Switchable live via `/auto-mode:mode`.
+- **Live adjustments** — runtime config reloads that would **weaken** security (disabling the classifier, relaxing fallback to `allow`, lowering deny-strategy restrictiveness, …) are automatically rejected.
+- **Session commands** — enable/disable permission sets and switch mode live with explicit confirmation; block counters reset between sessions.
 
-## Tabla de contenidos
+## Table of contents
 
-- [Requisitos previos](#requisitos-previos)
-- [Instalación](#instalación)
-- [Modelo de 4 capas](#modelo-de-4-capas)
-- [Configuración](#configuración)
-- [Uso](#uso)
-- [Flujo de confirmación (Ask)](#flujo-de-confirmación-ask)
-- [Eventos](#eventos)
-- [Ejemplos de configuración](#ejemplos-de-configuración)
-- [Scripts disponibles](#scripts-disponibles)
-- [Estructura del proyecto](#estructura-del-proyecto)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [4-layer model](#4-layer-model)
+- [Configuration](#configuration)
+- [Usage](#usage)
+- [Confirmation flow (Ask)](#confirmation-flow-ask)
+- [Events](#events)
+- [Configuration examples](#configuration-examples)
+- [Available scripts](#available-scripts)
+- [Project structure](#project-structure)
 - [Testing](#testing)
 - [Roadmap](#roadmap)
-- [Cómo contribuir](#cómo-contribuir)
-- [Desarrollo / Instalación local](#desarrollo--instalación-local)
-- [Licencia](#licencia)
+- [Contributing](#contributing)
+- [Local development / install](#local-development-install)
+- [License](#license)
 
-## Requisitos previos
+## Prerequisites
 
-- **Node.js >= 20** (desarrollo en v24). El proyecto es ESM (`"type": "module"`), target ES2022.
-- **npm** (viene con Node).
-- La extensión se ejecuta **dentro del runtime de Pi Coding Agent**, que inyecta el SDK `@earendil-works/pi-coding-agent` en tiempo de ejecución.
+- **Node.js >= 20** (developed on v24). The project is ESM (`"type": "module"`), ES2022 target.
+- **npm** (ships with Node).
+- The extension runs **inside the Pi Coding Agent runtime**, which injects the `@earendil-works/pi-coding-agent` SDK at runtime.
 
-## Instalación
+## Installation
 
 ```bash
-# 1. Clonar el repositorio
-git clone <url-del-repo> pi-auto-mode
+# 1. Clone the repository
+git clone <repo-url> pi-auto-mode
 cd pi-auto-mode
 
-# 2. Instalar dependencias
+# 2. Install dependencies
 npm install
 ```
 
-Hasta aquí tienes el proyecto listo para desarrollo. Para usarlo como extensión real, añádelo/cárgalo en tu configuración del runtime de Pi Coding Agent (el harness de Pi inyecta el SDK y dispara los eventos `tool_call`, `session_start`, etc.).
+That gets the project ready for development. To use it as a real extension, add/load it in your Pi Coding Agent runtime configuration (the Pi harness injects the SDK and fires the `tool_call`, `session_start`, etc. events).
 
-## Modelo de 4 capas
+## 4-layer model
 
-Una tool call atraviesa **cuatro capas** en orden antes de ejecutarse. Las tres primeras deciden _qué se ejecuta_; la cuarta decide _qué hacer tras un bloqueo_.
+A tool call goes through **four layers** in order before executing. The first three decide _what runs_; the fourth decides _what to do after a block_.
 
-1. **Capa 1 — Visibility filter** (`before_agent_start`).
+1. **Layer 1 — Visibility filter** (`before_agent_start`).
 
-   - Permisos globales `permissions.tools` / `permissions.skills` / `permissions.mcps` (claves exactas `toolName`, sin `tool:arg-pattern`).
-   - Type: `ToolPermission = SimpleAction | PatternRule[]` donde `SimpleAction = 'allow' | 'ask' | 'deny'` y `PatternRule = { pattern: string; action: SimpleAction; reason?: string }`.
-   - Sets activos (`activePermissionSets[]`) se evalúan **después** del global, en orden de array; último match gana (cascada).
-   - Resultado por nombre: `allow` | `ask` | `deny`; se pasa por el `mode` global (ver [Modos globales](#modos-globales)).
-   - `setActiveTools(...)` + dos _sanitizers_ del system prompt (`Available tools:` y `<available_skills>`) ocultan lo que resuelve a `deny`. `unknown` (sin entrada) se trata como **visible** para no romper configs previos.
-   - Implementación: `src/permission/visibility.ts`, `src/permission/active-tools.ts`, `src/permission/skill-filter.ts`, `src/permission/modes.ts`, `src/permission/wildcard-matcher.ts`, `src/handlers/before-agent-start.ts`, `src/handlers/system-prompt-sanitizer.ts`, `src/handlers/skill-prompt-sanitizer.ts`.
+   - Global `permissions.tools` / `permissions.skills` / `permissions.mcps` permissions (exact `toolName` keys, no `tool:arg-pattern`).
+   - Type: `ToolPermission = SimpleAction | PatternRule[]` where `SimpleAction = 'allow' | 'ask' | 'deny'` and `PatternRule = { pattern: string; action: SimpleAction; reason?: string }`.
+   - Active sets (`activePermissionSets[]`) evaluate **after** the global one, in array order; last match wins (cascade).
+   - Per-name result: `allow` | `ask` | `deny`; passed through the global `mode` (see [Global modes](#global-modes)).
+   - `setActiveTools(...)` + two system-prompt _sanitizers_ (`Available tools:` and `<available_skills>`) hide whatever resolves to `deny`. `unknown` (no entry) is treated as **visible** to avoid breaking existing configs.
+   - Implementation: `src/permission/visibility.ts`, `src/permission/active-tools.ts`, `src/permission/skill-filter.ts`, `src/permission/modes.ts`, `src/permission/wildcard-matcher.ts`, `src/handlers/before-agent-start.ts`, `src/handlers/system-prompt-sanitizer.ts`, `src/handlers/skill-prompt-sanitizer.ts`.
 
-2. **Capa 2 — Rule-based pattern matcher**.
+2. **Layer 2 — Rule-based pattern matcher**.
 
-   - Evalúa `PatternRule[]` (del global y de los sets activos en cascada) contra la tool call normalizada usando claves exactas `toolName`.
-   - Acciones: `allow` | `ask` | `deny`.
-   - Incluye trust boundary (`/etc`, `~/.ssh`, `~/.env`, `sudo`, `rm -rf`, `git push --force`), allow-exceptions (cubre todo el comando compuesto), block rules (primer match gana; severidad crítica → bloqueo), wrapper unwrapping (`sh -c`, `eval`, `sudo`, …) y detección de interpolación → `ask` (fail-closed).
-   - Implementación: `src/permission/visibility.ts`, `src/permission/wildcard-matcher.ts`, `src/permission/compose.ts`, `src/permission/evaluate.ts`, `src/permission/rule.ts`.
+   - Evaluates `PatternRule[]` (from the global and the active sets in cascade) against the normalized tool call using exact `toolName` keys.
+   - Actions: `allow` | `ask` | `deny`.
+   - Includes trust boundary (`/etc`, `~/.ssh`, `~/.env`, `sudo`, `rm -rf`, `git push --force`), allow-exceptions (cover the whole compound command), block rules (first match wins; critical severity → block), wrapper unwrapping (`sh -c`, `eval`, `sudo`, …) and interpolation detection → `ask` (fail-closed).
+   - Implementation: `src/permission/visibility.ts`, `src/permission/wildcard-matcher.ts`, `src/permission/compose.ts`, `src/permission/evaluate.ts`, `src/permission/rule.ts`.
 
-3. **Capa 3 — LLM classifier** (opcional, solo cuando cascada = `ask`; solo endurece `ask`: un `allow` explícito de la cascada es final y no consulta al LLM).
+3. **Layer 3 — LLM classifier** (optional, only when cascade = `ask`; only hardens `ask`: an explicit cascade `allow` is final and never consults the LLM).
 
-   - Cuando Capa 2 devuelve `ask`, se ejecuta el clasificador LLM con dos sub-pasos previos: secret guard y rule-based block rules.
-   - **File extraction**: si la tool lleva un campo `command` (shell), el clasificador intenta leer el primer archivo path-like referenciado (≤8KB), aplicando la trust boundary y un redactor de contenido sospechoso (`eval(`, `child_process`, `exec(`, `Buffer.from`, `os.system`, …). El contenido nunca llega al LLM si cae en la frontera o es sospechoso. **Nunca lanza**: cualquier error se convierte en `{ kind: 'unsupported' }`.
-   - Fallback en `classifier.fallback.onTimeout` / `classifier.fallback.onError` (ver [Fallback del clasificador](#fallback-del-clasificador)).
-   - Implementación: `src/classifier/llm-layer.ts`, `src/classifier/file-extraction.ts`, `src/classifier/pattern-matcher.ts`, `src/classifier/rule-evaluator.ts`, `src/classifier/secret-guard.ts`, `src/classifier/llm-client.ts`.
+   - When Layer 2 returns `ask`, the LLM classifier runs with two prior sub-steps: secret guard and rule-based block rules.
+   - **File extraction**: if the tool carries a `command` field (shell), the classifier tries to read the first path-like referenced file (≤8KB), applying the trust boundary and a suspicious-content redactor (`eval(`, `child_process`, `exec(`, `Buffer.from`, `os.system`, …). Content never reaches the LLM if it falls inside the boundary or looks suspicious. **Never throws**: any error becomes `{ kind: 'unsupported' }`.
+   - Fallback in `classifier.fallback.onTimeout` / `classifier.fallback.onError` (see [Classifier fallback](#classifier-fallback)).
+   - Implementation: `src/classifier/llm-layer.ts`, `src/classifier/file-extraction.ts`, `src/classifier/pattern-matcher.ts`, `src/classifier/rule-evaluator.ts`, `src/classifier/secret-guard.ts`, `src/classifier/llm-client.ts`.
 
-4. **Capa 4 — Deny strategy**.
+4. **Layer 4 — Deny strategy**.
 
-   - Decide qué hacer **después** de un `deny`: `auto-retry` (deny + motivo al LLM para que reformule), `ask-user` (modal inmediato) o `both` (`auto-retry` hasta N consecutivos, luego `ask-user`).
-   - Alias retrocompatible: `deny-and-continue` se acepta en el JSON y se normaliza a `auto-retry` en memoria (ver [Deny strategy](#deny-strategy)).
-   - Implementación: `src/deny/deny-service.ts`.
+   - Decides what to do **after** a `deny`: `auto-retry` (deny + reason to the LLM so it reformulates), `ask-user` (immediate modal) or `both` (`auto-retry` up to N consecutive, then `ask-user`).
+   - Backwards-compatible alias: `deny-and-continue` is accepted in JSON and normalized to `auto-retry` in memory (see [Deny strategy](#deny-strategy)).
+   - Implementation: `src/deny/deny-service.ts`.
 
-El gate (`src/gate/gate.ts`) orquesta las cuatro; el resolver `ask` (`src/gate/ask.ts`) es el único punto donde el usuario ve un modal, y solo se invoca cuando Capa 2 o Capa 3 devuelven `ask`.
+The gate (`src/gate/gate.ts`) orchestrates all four; the `ask` resolver (`src/gate/ask.ts`) is the only place where the user sees a modal, and it is only invoked when Layer 2 or Layer 3 return `ask`.
 
-## Configuración
+## Configuration
 
-La extensión lee un único archivo de config JSON (fail-closed: si no lo puede leer/validar, **no arranca**). Elige su ruta de dos formas:
+The extension reads a single JSON config file (fail-closed: if it cannot read/validate it, it **won't start**). Its path is chosen two ways:
 
-1. Variable de entorno `PI_AUTO_MODE_CONFIG` → ruta al archivo de config.
-2. Si no está definida, usa `config.json` en la raíz del repo.
+1. `PI_AUTO_MODE_CONFIG` environment variable → path to the config file.
+2. If unset, `config.json` at the repo root.
 
-> **Ojo:** `config.json` está en `.gitignore`. **Nunca lo edites directamente** como parte de un cambio — es config del usuario. Los cambios de diseño de config van en `config.example.json` + schema zod en `src/types/config.ts`.
+> **Note:** `config.json` is in `.gitignore`. **Never edit it directly** as part of a change — it is user config. Config design changes go in `config.example.json` + the zod schema in `src/types/config.ts`.
 
-Empieza copiando la plantilla:
+Start by copying the template:
 
 ```bash
 cp config.example.json config.json
 ```
 
-### Variables de entorno
+### Environment variables
 
-| Variable              | Obligatoria | Descripción                                                      |
-| --------------------- | ----------- | ---------------------------------------------------------------- |
-| `PI_AUTO_MODE_CONFIG` | No          | Ruta al archivo de config JSON. Si no existe, usa `config.json`. |
+| Variable              | Required | Description                                                   |
+| --------------------- | -------- | ------------------------------------------------------------- |
+| `PI_AUTO_MODE_CONFIG` | No       | Path to the JSON config file. If missing, uses `config.json`. |
 
-No hay otras variables de entorno obligatorias. Las claves de API del clasificador LLM van **dentro del config** (campos `apiKey` / `baseUrl` de la sección `classifier.llm`), no en el entorno ni en código.
+No other environment variables are required. The LLM classifier API keys go **inside the config** (`apiKey` / `baseUrl` fields of the `classifier.llm` section), not in the environment or code.
 
-### Estructura del config (schema v2)
+### Config structure (schema v2)
 
-Los bloques principales de `config.example.json`:
+The main blocks of `config.example.json`:
 
-- **`permissions`** (global, Capa 1 + 2) — mapa con tres claves opcionales:
-  - `tools` — `{ toolName: SimpleAction | PatternRule[] }`. Claves son **nombres exactos** de tool (p.ej. `"bash"`, `"read"`, `"write"`). Sin `tool:arg-pattern`. Wildcards `*` y `?` dentro de `PatternRule.pattern`.
-  - `skills` — `{ skillName: SimpleAction }` (nombre puro, sin patterns).
-  - `mcps` — `{ mcpName: SimpleAction }` (nombre puro).
-- **`permissionSets`** — conjuntos nombrados que extienden/sobrescriben el global. Cada set admite los mismos tres bloques (`tools`, `skills`, `mcps`) con la misma estructura. **Sin `priority`**: el orden de evaluación lo define `activePermissionSets`.
-- **`activePermissionSets`** — array de strings (nombres de sets). **El orden importa**: se evalúan en secuencia tras el global; último match gana (cascada).
-- **`mode`** (top-level, Capa 1) — modo global de visibilidad: `default` (honra los mapas tal cual), `strict` (colapsa `ask` → `deny`), `yolo` (colapsa `ask` → `allow`, mantiene los `deny` explícitos). Conmutable en caliente con `/auto-mode:mode`.
-- **`classifier`** — capa LLM opcional (`llm`: provider/model/apiKey). **`provider` es string libre** (cualquier ID del Pi modelRegistry). Bloque `ruleBased` **eliminado** (trust boundary, allow-exceptions, block rules viven en Capa 2). El bloque `fallback` define el comportamiento ante `onTimeout` / `onError`: `ask-user` (default, fail-closed), `deny` (fail-closed, bloqueo silencioso) o `allow` (opt-in fail-open, rechazado por `isSecurityWeakening()` al recargar). `onBlock` y `onBlockUserOverride` controlan qué pasa tras un bloqueo del clasificador.
-- **`denyStrategy`** — estrategia post-bloqueo (Capa 4): `auto-retry` (canónico, antes `deny-and-continue`), `ask-user` (modal inmediato) o `both` (auto-retry con escalado). Ver [Deny strategy](#deny-strategy).
-- **`ui`** — comportamiento de la interfaz de confirmación (`promptMaxRows`, `promptFieldMaxWidth`, `showClassifierRisk`, `modalTimeoutMs`). **`doublePressToConfirm` eliminado** (deprecado).
-- **`telemetry`** — logging de eventos (activable con ruta opcional; ver [Telemetría](#telemetría-con-ruta-por-defecto)).
+- **`permissions`** (global, Layer 1 + 2) — map with three optional keys:
+  - `tools` — `{ toolName: SimpleAction | PatternRule[] }`. Keys are **exact** tool names (e.g. `"bash"`, `"read"`, `"write"`). No `tool:arg-pattern`. `*` and `?` wildcards inside `PatternRule.pattern`.
+  - `skills` — `{ skillName: SimpleAction }` (bare name, no patterns).
+  - `mcps` — `{ mcpName: SimpleAction }` (bare name).
+- **`permissionSets`** — named sets that extend/override the global one. Each set accepts the same three blocks (`tools`, `skills`, `mcps`) with the same structure. **No `priority`**: evaluation order is defined by `activePermissionSets`.
+- **`activePermissionSets`** — array of strings (set names). **Order matters**: they evaluate in sequence after the global one; last match wins (cascade).
+- **`mode`** (top-level, Layer 1) — global visibility mode: `default` (honors the maps as-is), `strict` (collapses `ask` → `deny`), `yolo` (collapses `ask` → `allow`, keeps explicit `deny`s). Switchable live via `/auto-mode:mode`.
+- **`classifier`** — optional LLM layer (`llm`: provider/model/apiKey). **`provider` is a free-form string** (any Pi modelRegistry ID). `ruleBased` block **removed** (trust boundary, allow-exceptions, block rules live in Layer 2). The `fallback` block defines behavior on `onTimeout` / `onError`: `ask-user` (default, fail-closed), `deny` (fail-closed, silent block) or `allow` (opt-in fail-open, rejected by `isSecurityWeakening()` on reload). `onBlock` and `onBlockUserOverride` control what happens after a classifier block.
+- **`denyStrategy`** — post-block strategy (Layer 4): `auto-retry` (canonical, formerly `deny-and-continue`), `ask-user` (immediate modal) or `both` (auto-retry with escalation). See [Deny strategy](#deny-strategy).
+- **`ui`** — confirmation UI behavior (`promptMaxRows`, `promptFieldMaxWidth`, `showClassifierRisk`, `modalTimeoutMs`). **`doublePressToConfirm` removed** (deprecated).
+- **`telemetry`** — event logging (enableable with optional path; see [Telemetry with default path](#telemetry-with-default-path)).
 
-### Modos globales
+### Global modes
 
-Tres valores, todos opt-in (default = `default`):
+Three values, all opt-in (default = `default`):
 
-| `mode`    | `ask` se trata como | `deny` explícito | Uso típico                                      |
-| --------- | ------------------- | ---------------- | ----------------------------------------------- |
-| `default` | `ask` (modal)       | `deny`           | comportamiento por defecto, prompts al usuario  |
-| `strict`  | `deny` (silencioso) | `deny`           | setups zero-prompt (CI, batch)                  |
-| `yolo`    | `allow`             | `deny`           | ejecución fluida sin prompts; los `deny` siguen |
+| `mode`    | `ask` is treated as | Explicit `deny` | Typical use                                                |
+| --------- | ------------------- | --------------- | ---------------------------------------------------------- |
+| `default` | `ask` (modal)       | `deny`          | default behavior, prompts the user                         |
+| `strict`  | `deny` (silent)     | `deny`          | zero-prompt setups (CI, batch)                             |
+| `yolo`    | `allow`             | `deny`          | frictionless execution without prompts; `deny`s still hold |
 
-`unknown` (tool/skill sin entrada en los mapas) **no** se reescribe: se considera visible para mantener compatibilidad.
+`unknown` (tool/skill with no entry in the maps) is **not** rewritten: it is considered visible for backwards compatibility.
 
-Conmuta el modo en caliente:
+Switch mode live:
 
 ```
 /auto-mode:mode default
@@ -146,13 +146,13 @@ Conmuta el modo en caliente:
 /auto-mode:mode yolo
 ```
 
-El cambio requiere confirmación explícita (mismo flujo que `auto-mode:sets activate`).
+The change requires explicit confirmation (same flow as `auto-mode:sets activate`).
 
-### Ámbito de directorio externo (`external_directory`)
+### External directory scope (`external_directory`)
 
-Opt-in vía `confineToWorkingDirectory` (default `false` = sin cambios). Cuando está activo, cualquier acceso `fs` o segmento `shell` a un path fuera de `process.cwd()` endurece el veredicto: match explícito en `external_directory` (cascada como el resto, última coincidencia gana) o `ask` por defecto. Los paths internos no opinan, y un `deny` explícito de tools siempre gana a un `allow` externo.
+Opt-in via `confineToWorkingDirectory` (default `false` = no change). When active, any `fs` access or `shell` segment touching a path outside `process.cwd()` hardens the verdict: explicit match in `external_directory` (cascaded like the rest, last match wins) or default `ask`. Internal paths get no opinion, and an explicit tool `deny` always beats an external `allow`.
 
-Los segmentos `shell` se extraen con tree-sitter-bash (`web-tree-sitter` + wasm, sin binarios nativos): las strings entrecomilladas quedan atómicas (un `sed "s/a/ /"` o un `python3 -c "…"` nunca se trituran en falsos paths) y se excluyen por tipo de nodo comentarios, heredocs, regexes y variables. Si el parser no está listo o el segmento lo excede (`<<` heredocs, `case`, >64KB), se usa el extractor heurístico; el veredicto indica el motor (`engine`).
+`shell` segments are extracted with tree-sitter-bash (`web-tree-sitter` + wasm, no native binaries): quoted strings stay atomic (a `sed "s/a/ /"` or `python3 -c "…"` never shreds into false paths) and comments, heredocs, regexes and variables are excluded by node type. If the parser isn't ready or the segment exceeds it (`<<` heredocs, `case`, >64KB), the heuristic extractor is used; the verdict reports the engine (`engine`).
 
 ```json
 {
@@ -164,137 +164,137 @@ Los segmentos `shell` se extraen con tree-sitter-bash (`web-tree-sitter` + wasm,
 }
 ```
 
-### Fallback del clasificador
+### Classifier fallback
 
-`classifier.fallback.onTimeout` y `classifier.fallback.onError` aceptan tres valores:
+`classifier.fallback.onTimeout` and `classifier.fallback.onError` accept three values:
 
-| Valor      | Comportamiento                                                                                                                                                                                                       |
-| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ask-user` | Default. Prompt al usuario (fail-closed).                                                                                                                                                                            |
-| `deny`     | Bloqueo silencioso (fail-closed, sin prompt; útil para `strict`).                                                                                                                                                    |
-| `allow`    | **Opt-in fail-open.** Apertura del gate. Solo llega a aplicarse cuando el usuario lo declara explícitamente; `isSecurityWeakening()` lo marca como debilitamiento y rechaza la recarga si se introduce a posteriori. |
+| Value      | Behavior                                                                                                                                                                                  |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ask-user` | Default. Prompts the user (fail-closed).                                                                                                                                                  |
+| `deny`     | Silent block (fail-closed, no prompt; useful for `strict`).                                                                                                                               |
+| `allow`    | **Opt-in fail-open.** Opens the gate. Only applies when the user declares it explicitly; `isSecurityWeakening()` flags it as a weakening and rejects the reload if introduced afterwards. |
 
-`allow` nunca es el default del schema; nunca se llega por accidente a esta rama.
+`allow` is never the schema default; this branch is never reached by accident.
 
 ### Deny strategy
 
-`denyStrategy.mode` controla qué pasa **después** de un `deny` (Capa 4):
+`denyStrategy.mode` controls what happens **after** a `deny` (Layer 4):
 
-| Valor        | Comportamiento                                                                                                         |
-| ------------ | ---------------------------------------------------------------------------------------------------------------------- |
-| `auto-retry` | Deny + motivo al LLM para que reformule el tool call. Default práctico.                                                |
-| `ask-user`   | Modal de confirmación inmediato; el LLM no recibe el motivo hasta que el usuario decide.                               |
-| `both`       | `auto-retry` hasta `escalation.consecutive` (o `escalation.total`); al superar el umbral, escala a `ask-user` (modal). |
+| Value        | Behavior                                                                                                                  |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------- |
+| `auto-retry` | Deny + reason to the LLM so it reformulates the tool call. Practical default.                                             |
+| `ask-user`   | Immediate confirmation modal; the LLM doesn't get the reason until the user decides.                                      |
+| `both`       | `auto-retry` up to `escalation.consecutive` (or `escalation.total`); past the threshold, escalates to `ask-user` (modal). |
 
-El nombre canónico es **`auto-retry`** (alineado con opencode-auto-mode). El alias `deny-and-continue` se sigue aceptando en el JSON por retrocompatibilidad y se normaliza a `auto-retry` en memoria via `ConfigSchema`.
+The canonical name is **`auto-retry`** (aligned with opencode-auto-mode). The `deny-and-continue` alias is still accepted in JSON for backwards compatibility and normalized to `auto-retry` in memory via `ConfigSchema`.
 
-Los límites se controlan en `denyStrategy.escalation`: `consecutive` (racha de denegaciones consecutivas) y `total` (acumulado en la sesión). Una aprobación del usuario resetea `consecutive` pero deja `total` intacto.
+Limits are controlled in `denyStrategy.escalation`: `consecutive` (run of consecutive denials) and `total` (session total). A user approval resets `consecutive` but leaves `total` untouched.
 
-### Bloque `ui`
+### `ui` block
 
-| Campo                 | Tipo      | Default  | Descripción                                                                                                            |
-| --------------------- | --------- | -------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `promptMaxRows`       | `number`  | `10`     | Máximo de filas visibles en el preview del tool call dentro del modal.                                                 |
-| `promptFieldMaxWidth` | `number`  | `80`     | Ancho máximo del campo de valor mostrado en el modal.                                                                  |
-| `showClassifierRisk`  | `boolean` | `true`   | Muestra el nivel de riesgo (`low`/`medium`/`high`) y la razón del clasificador en la descripción.                      |
-| `modalTimeoutMs`      | `number`  | `120000` | Tiempo máximo (ms) que el modal espera una decisión antes de resolverse como `deny` (fail-closed). `-1` = sin timeout. |
+| Field                 | Type      | Default  | Description                                                                                               |
+| --------------------- | --------- | -------- | --------------------------------------------------------------------------------------------------------- |
+| `promptMaxRows`       | `number`  | `10`     | Max visible rows in the tool-call preview inside the modal.                                               |
+| `promptFieldMaxWidth` | `number`  | `80`     | Max width of the value field shown in the modal.                                                          |
+| `showClassifierRisk`  | `boolean` | `true`   | Shows the classifier risk level (`low`/`medium`/`high`) and reason in the description.                    |
+| `modalTimeoutMs`      | `number`  | `120000` | Max time (ms) the modal waits for a decision before resolving to `deny` (fail-closed). `-1` = no timeout. |
 
-> Cualquier recarga de config en caliente que **debilite** la seguridad (desactivar el clasificador, relajar el deny, introducir fallos-open o permite sobre superficies restringidas) se rechaza y se conserva la config anterior.
+> Any live config reload that would **weaken** security (disabling the classifier, relaxing the deny, introducing fail-opens, or allows over restricted surfaces) is rejected and the previous config is kept.
 
-## Uso
+## Usage
 
-La extensión funciona de forma pasiva: una vez cargada en el runtime, intercepta cada evento `tool_call` y aplica la política. Tú defines las reglas en el config; la lógica interna recorre las cuatro capas descritas arriba en orden. Resumido:
+The extension works passively: once loaded in the runtime, it intercepts every `tool_call` event and applies the policy. You define the rules in the config; the internals walk the four layers described above in order. In short:
 
-1. **Normalizar** el tool call (nombre + entrada).
-2. **Filtrar visibilidad** en `before_agent_start` (Capa 1): combinar `permissions.tools/skills/mcps` global + sets activos en cascada (orden de `activePermissionSets`), aplicar el `mode` global, llamar a `setActiveTools(...)` y reescribir el system prompt (secciones `Available tools:` y `<available_skills>`).
-3. **Evaluar reglas** (Capa 2): clasificar la tool call contra `PatternRule[]` del global y sets activos (cascada), con trust boundary, allow-exceptions, block rules y wrapper unwrapping. Resultado: `allow` | `ask` | `deny`.
-4. **Consultar el clasificador LLM** (Capa 3, opcional): **solo si Capa 2 = `ask`**. Si la tool lleva un campo `command`, se extrae el archivo referenciado (≤8KB, trust-check, redactor de secretos) y se inyecta en el prompt del LLM. `onTimeout` / `onError` aplican el `fallback` configurado.
-5. **Aplicar la deny strategy** (Capa 4) tras un `deny`: `auto-retry` (deny + motivo al LLM), `ask-user` (modal inmediato) o `both` (auto-retry con escalado).
-6. **Decidir** `allow` / `deny` / `ask` y actuar (bloquear con motivo, pedir confirmación vía modal, o registrar en telemetría).
+1. **Normalize** the tool call (name + input).
+2. **Filter visibility** on `before_agent_start` (Layer 1): combine global `permissions.tools/skills/mcps` + active sets in cascade (`activePermissionSets` order), apply the global `mode`, call `setActiveTools(...)` and rewrite the system prompt (`Available tools:` and `<available_skills>` sections).
+3. **Evaluate rules** (Layer 2): classify the tool call against `PatternRule[]` from the global and active sets (cascade), with trust boundary, allow-exceptions, block rules and wrapper unwrapping. Result: `allow` | `ask` | `deny`.
+4. **Consult the LLM classifier** (Layer 3, optional): **only if Layer 2 = `ask`**. If the tool carries a `command` field, the referenced file is extracted (≤8KB, trust-check, secret redactor) and injected into the LLM prompt. `onTimeout` / `onError` apply the configured `fallback`.
+5. **Apply the deny strategy** (Layer 4) after a `deny`: `auto-retry` (deny + reason to the LLM), `ask-user` (immediate modal) or `both` (auto-retry with escalation).
+6. **Decide** `allow` / `deny` / `ask` and act (block with reason, prompt for confirmation via modal, or log to telemetry).
 
-### Comandos de sesión
+### Session commands
 
-La extensión registra dos slash commands para gestionar la configuración en caliente:
+The extension registers two slash commands to manage configuration live:
 
 ```
-auto-mode:sets activate <nombre>
-auto-mode:sets deactivate <nombre>
+auto-mode:sets activate <name>
+auto-mode:sets deactivate <name>
 auto-mode:sets list
 
 auto-mode:mode default | strict | yolo
 ```
 
-Cambiar los sets activos o el modo global es una **elevación de privilegios**: requiere confirmación explícita (reutiliza el mismo resolver `ask` del gate) y arroja un error si el nombre no existe.
+Changing the active sets or the global mode is a **privilege escalation**: it requires explicit confirmation (reuses the gate's same `ask` resolver) and throws an error if the name doesn't exist.
 
-## Flujo de confirmación (Ask)
+## Confirmation flow (Ask)
 
-Cuando una tool call cae en `ask` (porque la regla de permiso lo pide o porque el clasificador la marcó como dudosa), el gate la delega al `AskResolver`, que por defecto es el modal de confirmación. El contrato end-to-end es:
+When a tool call lands on `ask` (because the permission rule asks for it or because the classifier flagged it as dubious), the gate delegates to the `AskResolver`, which by default is the confirmation modal. The end-to-end contract is:
 
-1. El gate genera un `requestId` (UUID) y construye un `AskRequest` con `surface`, `value`, la `Rule` que matcheó y el `ClassifierRisk` (si lo hay).
-2. Se emite el evento `permissions:ui_prompt` con ese `requestId` (ver [Eventos](#eventos)).
-3. Se abre el modal con la lista de decisiones y se arma el `Promise<AskDecision>`.
-4. El usuario elige una opción; el modal resuelve con `'allow'`, `'deny'` o `{ decision: 'deny', reason }` (solo en "Deny with reason").
-5. El gate consume el resultado:
-   - **Allow** → registra aprobación de sesión, resetea el streak de denegaciones consecutivas y emite `permissions:decision` con `result: 'allow'`.
-   - **Deny** → lanza `AskDeniedError` cuyo `message` empieza por `Permission denied by user` y, si hubo razón, la anexa (`Permission denied by user: <razón>`). El error llega al modelo tal cual y al evento `permissions:decision` como `denialReason`.
+1. The gate generates a `requestId` (UUID) and builds an `AskRequest` with `surface`, `value`, the matched `Rule` and the `ClassifierRisk` (if any).
+2. The `permissions:ui_prompt` event is emitted with that `requestId` (see [Events](#events)).
+3. The modal opens with the decision list and the `Promise<AskDecision>` is assembled.
+4. The user picks an option; the modal resolves with `'allow'`, `'deny'` or `{ decision: 'deny', reason }` (only on "Deny with reason").
+5. The gate consumes the result:
+   - **Allow** → records session approval, resets the consecutive-denial streak and emits `permissions:decision` with `result: 'allow'`.
+   - **Deny** → throws `AskDeniedError` whose `message` starts with `Permission denied by user` and, if a reason was given, appends it (`Permission denied by user: <reason>`). The error reaches the model verbatim and the `permissions:decision` event as `denialReason`.
 
-### Opciones del modal
+### Modal options
 
-El select expone cuatro opciones (la opción resaltada por defecto es **Deny**):
+The select exposes four options (the default-highlighted option is **Deny**):
 
-| Opción              | Efecto                                                                                                                                                                                                                                                               |
-| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Deny`              | Resuelve `'deny'`. Cierra el modal.                                                                                                                                                                                                                                  |
-| `Allow`             | Resuelve `'allow'` con un solo click.                                                                                                                                                                                                                                |
-| `Allow for session` | Persiste la aprobación para futuras tool calls equivalentes.                                                                                                                                                                                                         |
-| `Deny with reason`  | Abre un input libre (`pi.ui.input`) para capturar la razón; si hay texto no vacío, devuelve `{ decision: 'deny', reason }`. Si se cancela o queda vacío, cae a `'deny'` sin razón. La razón se sanea (sin saltos de línea, recortada) antes de inyectarse al modelo. |
+| Option              | Effect                                                                                                                                                                                                                                                                       |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Deny`              | Resolves `'deny'`. Closes the modal.                                                                                                                                                                                                                                         |
+| `Allow`             | Resolves `'allow'` with a single click.                                                                                                                                                                                                                                      |
+| `Allow for session` | Persists the approval for future equivalent tool calls.                                                                                                                                                                                                                      |
+| `Deny with reason`  | Opens a free-text input (`pi.ui.input`) to capture the reason; if there is non-empty text, returns `{ decision: 'deny', reason }`. If cancelled or left empty, falls back to reason-less `'deny'`. The reason is sanitized (no newlines, trimmed) before reaching the model. |
 
-### Timeout configurable (`ui.modalTimeoutMs`)
+### Configurable timeout (`ui.modalTimeoutMs`)
 
-El modal tiene un temporizador fail-closed controlado por el campo `ui.modalTimeoutMs`:
+The modal has a fail-closed timer controlled by `ui.modalTimeoutMs`:
 
-- **Default:** `120000` (2 minutos).
-- **`-1`** → sin timeout: el modal espera la respuesta del usuario indefinidamente.
-- Cualquier otro valor positivo → al expirar, el modal se cierra y resuelve `'deny'` (fail-closed).
+- **Default:** `120000` (2 minutes).
+- **`-1`** → no timeout: the modal waits for the user response indefinitely.
+- Any other positive value → on expiry, the modal closes and resolves `'deny'` (fail-closed).
 
-La lectura del timeout se hace sobre el config vivo (no un snapshot), así que un reload a mitad de sesión cambia el comportamiento sin reiniciar.
+The timeout is read from the live config (not a snapshot), so a mid-session reload changes behavior without restarting.
 
-### Invariantes fail-closed del modal
+### Modal fail-closed invariants
 
-El modal preserva el principio **fail-closed** de la extensión. Cualquier ruta de salida que no sea una decisión explícita del usuario termina en `'deny'`:
+The modal preserves the extension's **fail-closed** principle. Any exit path that isn't an explicit user decision ends in `'deny'`:
 
-- `!pi.ui` → `'deny'` (sin TUI no se pregunta).
-- `pi.ui.custom(...).catch(...)` → `'deny'` (cualquier error de la UI).
-- `try { ... } catch { settleDeny() }` → `'deny'` (excepción síncrona al armar el modal).
-- `onExit` del overlay → `'deny'` (el usuario cierra la overlay con una tecla distinta).
-- Timeout (`ui.modalTimeoutMs` distinto de `-1`) → `'deny'`.
-- Opción desconocida del select → `'deny'`.
+- `!pi.ui` → `'deny'` (no TUI, no asking).
+- `pi.ui.custom(...).catch(...)` → `'deny'` (any UI error).
+- `try { ... } catch { settleDeny() }` → `'deny'` (sync exception while building the modal).
+- Overlay `onExit` → `'deny'` (the user closes the overlay with another key).
+- Timeout (`ui.modalTimeoutMs` other than `-1`) → `'deny'`.
+- Unknown select option → `'deny'`.
 
-La única ruta que puede resolver `'allow'` es que el usuario elija explícitamente `Allow` o complete la confirmación de `Allow for session`.
+The only path that can resolve `'allow'` is the user explicitly picking `Allow` or completing the `Allow for session` confirmation.
 
-### Auditoría y eventos
+### Audit and events
 
-El gate es la **única** fuente de verdad para la sesión: el modal ya no llama a `sessionRules.approveForSession` directamente, lo hace el gate al recibir `'allow'`. Esto evita aprobaciones duplicadas y mantiene un único punto de auditoría.
+The gate is the **only** source of truth for the session: the modal no longer calls `sessionRules.approveForSession` directly, the gate does it on receiving `'allow'`. This avoids duplicate approvals and keeps a single audit point.
 
-Los eventos emitidos quedan así (ver sección [Eventos](#eventos) para los shapes completos):
+The emitted events look like this (see [Events](#events) for the full shapes):
 
-- **`permissions:ui_prompt`** — se emite al abrir el modal; ahora siempre lleva `requestId`.
-- **`permissions:decision`** — al resolver el ask, se enriquece con `{ requestId, decidedBy: 'user', via: 'modal', matchedPattern, denialReason? }`. El `matchedPattern` es el patrón de la regla que disparó el ask; `denialReason` solo aparece cuando el usuario eligió `Deny with reason` y escribió algo.
+- **`permissions:ui_prompt`** — emitted when the modal opens; always carries `requestId` now.
+- **`permissions:decision`** — when the ask resolves, enriched with `{ requestId, decidedBy: 'user', via: 'modal', matchedPattern, denialReason? }`. `matchedPattern` is the pattern of the rule that triggered the ask; `denialReason` only appears when the user picked `Deny with reason` and typed something.
 
-## Eventos
+## Events
 
-La extensión emite dos eventos a través de `pi.events.emit` que permiten auditar el flujo de decisión sin acoplarse a la UI. Ambos son fire-and-forget: si el consumo falla, no se interrumpe la tool call.
+The extension emits two events through `pi.events.emit` that allow auditing the decision flow without coupling to the UI. Both are fire-and-forget: if consumption fails, the tool call is not interrupted.
 
 ### `permissions:ui_prompt`
 
-Se emite **al abrir** el modal de confirmación (antes de que el usuario decida). Es la señal de que el agente está esperando input humano.
+Emitted **when** the confirmation modal opens (before the user decides). It signals the agent is waiting for human input.
 
 ```ts
 {
-  requestId: string,          // UUID generado por el gate; correlaciona ui_prompt ↔ decision
-  source: 'tool_call',        // reservado para 'skill_input' | 'skill_read' en el futuro
-  surface: string,            // p.ej. 'fs', 'shell'
-  value: string,              // path o comando que disparó el ask
+  requestId: string,          // UUID generated by the gate; correlates ui_prompt ↔ decision
+  source: 'tool_call',        // reserved for 'skill_input' | 'skill_read' in the future
+  surface: string,            // e.g. 'fs', 'shell'
+  value: string,              // path or command that triggered the ask
   agentName: string | null,
   request: { surface: string, value: string }
 }
@@ -302,7 +302,7 @@ Se emite **al abrir** el modal de confirmación (antes de que el usuario decida)
 
 ### `permissions:decision`
 
-Se emite al **resolver** cada tool call. El shape base es siempre `{ surface, value, result, resolution }` y, en el camino del ask, se enriquece con un bloque de auditoría:
+Emitted when **resolving** each tool call. The base shape is always `{ surface, value, result, resolution }` and, on the ask path, is enriched with an audit block:
 
 ```ts
 {
@@ -318,22 +318,22 @@ Se emite al **resolver** cada tool call. El shape base es siempre `{ surface, va
     | 'classifier_ask'
     | 'escalate'
     | 'unknown_tool',
-  // Solo cuando resolution es 'permission_ask' o 'classifier_ask':
+  // Only when resolution is 'permission_ask' or 'classifier_ask':
   requestId?: string,
   decidedBy?: 'user',
   via?: 'modal',
-  matchedPattern?: string,     // patrón de la regla que disparó el ask
-  denialReason?: string       // presente solo si el usuario eligió "Deny with reason" y escribió algo
+  matchedPattern?: string,     // pattern of the rule that triggered the ask
+  denialReason?: string       // present only if the user picked "Deny with reason" and typed something
 }
 ```
 
-Notas:
+Notes:
 
-- `denialReason` viaja **solo** en el camino del ask (no en denegaciones automáticas por clasificador o trust boundary).
-- `matchedPattern` identifica qué regla (de permiso o del clasificador) fue la representante para el ask — útil para entender por qué el usuario tuvo que decidir.
-- `result: 'deny'` + `resolution: 'permission_ask'` + `denialReason` es la señal canónica de que el modelo va a recibir `Permission denied by user: <razón>`.
+- `denialReason` travels **only** on the ask path (not on automatic classifier or trust-boundary denials).
+- `matchedPattern` identifies which rule (permission or classifier) was the representative for the ask — useful to understand why the user had to decide.
+- `result: 'deny'` + `resolution: 'permission_ask'` + `denialReason` is the canonical signal that the model is about to receive `Permission denied by user: <reason>`.
 
-### Ejemplo mínimo de config (config.example.json)
+### Minimal config example (config.example.json)
 
 ```json
 {
@@ -346,18 +346,18 @@ Notas:
         {
           "pattern": "aws delete_*",
           "action": "deny",
-          "reason": "comando destructivo no permitido"
+          "reason": "destructive command not allowed"
         },
-        { "pattern": "rm -rf *", "action": "deny", "reason": "destructivo" },
+        { "pattern": "rm -rf *", "action": "deny", "reason": "destructive" },
         {
           "pattern": "cat *.env",
           "action": "deny",
-          "reason": "no se permite leer variables de entorno"
+          "reason": "reading environment variables is not allowed"
         },
         {
           "pattern": "git push --force*",
           "action": "deny",
-          "reason": "force-push bloqueado"
+          "reason": "force-push blocked"
         }
       ]
     },
@@ -372,7 +372,7 @@ Notas:
             {
               "pattern": "aws *",
               "action": "deny",
-              "reason": "aws bloqueado en este proyecto"
+              "reason": "aws blocked in this project"
             }
           ]
         },
@@ -413,15 +413,15 @@ Notas:
 }
 ```
 
-## Ejemplos de configuración
+## Configuration examples
 
-Tres patrones habituales que no encajan en el `Ejemplo mínimo` anterior.
+Three common patterns that don't fit the `minimal example` above.
 
-### Telemetría con ruta por defecto
+### Telemetry with default path
 
-Si activas `telemetry.enabled` y omites `telemetry.path`, los eventos se
-escriben en `~/.pi/pi-auto-mode.jsonl` (sin necesidad de configurar la ruta).
-Una línea por evento, una por línea — formato JSONL.
+If you enable `telemetry.enabled` and omit `telemetry.path`, events are
+written to `~/.pi/pi-auto-mode.jsonl` (no need to configure the path).
+One event per line — JSONL format.
 
 ```json
 {
@@ -434,15 +434,15 @@ Una línea por evento, una por línea — formato JSONL.
 {"ts":"2026-09-02T10:11:13.000Z","type":"permissions:ui_prompt","payload":{"requestId":"9c1...","source":"tool_call","surface":"shell","value":"sudo apt update"}}
 ```
 
-Las claves con `secret|token|password|api_key|…` se redactan a `[REDACTED]`
-antes de escribirse; ver `src/telemetry/telemetry.ts`.
+Keys with `secret|token|password|api_key|…` are redacted to `[REDACTED]`
+before writing; see `src/telemetry/telemetry.ts`.
 
-### Surface personalizada para una tool propia
+### Custom surface for your own tool
 
-Si tu agente expone una tool que no es `bash`/`fs`/`mcp` (por ejemplo
-`agent_send_message`), mándala a una surface con nombre propio vía el mapa
-`permissions.tools` y luego escribe reglas como cualquier otra surface. Sin entrada en
-`permissions.tools`, la tool sigue cayendo al sentinel `denied` (fail-closed).
+If your agent exposes a tool that isn't `bash`/`fs`/`mcp` (e.g.
+`agent_send_message`), route it to a custom-named surface via the
+`permissions.tools` map and then write rules like any other surface. With no entry in
+`permissions.tools`, the tool still falls through to the `denied` sentinel (fail-closed).
 
 ```json
 {
@@ -455,7 +455,7 @@ Si tu agente expone una tool que no es `bash`/`fs`/`mcp` (por ejemplo
             {
               "pattern": "*password*",
               "action": "ask",
-              "reason": "posible secreto"
+              "reason": "possible secret"
             },
             { "pattern": "*", "action": "allow" }
           ]
@@ -467,11 +467,11 @@ Si tu agente expone una tool que no es `bash`/`fs`/`mcp` (por ejemplo
 }
 ```
 
-### llama.cpp / Ollama con `provider` libre
+### llama.cpp / Ollama with free-form `provider`
 
-El cliente LLM ya habla chat-completions genérico, así que basta con cambiar
-`provider` y apuntar `baseUrl` al endpoint OpenAI-compatible de tu servidor
-local (Ollama, llama.cpp server, LM Studio, vLLM…). `provider` acepta **cualquier ID del Pi modelRegistry**.
+The LLM client already speaks generic chat-completions, so just switch
+`provider` and point `baseUrl` at your local server's OpenAI-compatible endpoint
+(Ollama, llama.cpp server, LM Studio, vLLM…). `provider` accepts **any Pi modelRegistry ID**.
 
 ```json
 {
@@ -487,157 +487,157 @@ local (Ollama, llama.cpp server, LM Studio, vLLM…). `provider` acepta **cualqu
 }
 ```
 
-## Scripts disponibles
+## Available scripts
 
-| Comando                  | Descripción                                             |
+| Command                  | Description                                             |
 | ------------------------ | ------------------------------------------------------- |
-| `npm run check`          | Typecheck: `tsc --noEmit` (no compila a `dist/`).       |
-| `npm run build`          | Compila a `dist/` (`tsc -p tsconfig.json`).             |
-| `npm test`               | Ejecuta los tests con cobertura (Jest `--coverage`).    |
-| `npm run test:watch`     | Tests en modo watch (`jest --watch`).                   |
-| `npx prettier --write .` | Formatea todo el repo.                                  |
-| `npx prettier --check .` | Verifica el formato (actúa como "lint"; no hay ESLint). |
+| `npm run check`          | Typecheck: `tsc --noEmit` (doesn't compile to `dist/`). |
+| `npm run build`          | Compiles to `dist/` (`tsc -p tsconfig.json`).           |
+| `npm test`               | Runs tests with coverage (Jest `--coverage`).           |
+| `npm run test:watch`     | Tests in watch mode (`jest --watch`).                   |
+| `npx prettier --write .` | Formats the whole repo.                                 |
+| `npx prettier --check .` | Verifies formatting (acts as "lint"; no ESLint).        |
 
-Correr un único test o archivo:
+Running a single test or file:
 
 ```bash
 npx jest test/gate/gate.test.ts
-npx jest -t "nombredel test" test/gate/gate.test.ts
+npx jest -t "test name" test/gate/gate.test.ts
 ```
 
-## Estructura del proyecto
+## Project structure
 
 ```
-src/            Código de la extensión (entrada: src/index.ts)
-  gate/         Orquesta tool calls (normalize, gate, ask)
-  permission/   Capa 1 (visibility) + Capa 2 (rules):
+src/            Extension code (entry: src/index.ts)
+  gate/         Orchestrates tool calls (normalize, gate, ask)
+  permission/   Layer 1 (visibility) + Layer 2 (rules):
                 visibility, active-tools, skill-filter, modes,
                 wildcard-matcher, compose, evaluate, rule,
                 session-rules
-  classifier/   Capa 3: rule-based (block-rules, pattern-matcher,
+  classifier/   Layer 3: rule-based (block-rules, pattern-matcher,
                 rule-evaluator, secret-guard) + LLM (llm-layer,
                 llm-client, file-extraction)
-  handlers/     Hooks del SDK: before-agent-start,
+  handlers/     SDK hooks: before-agent-start,
                 system-prompt-sanitizer, skill-prompt-sanitizer
-  config/       Carga + validación zod del config (fail-closed)
+  config/       Config loading + zod validation (fail-closed)
   commands/     Slash commands (set-commands: auto-mode:sets, auto-mode:mode)
-  deny/         Capa 4: deny-service (auto-retry / ask-user / both)
-  state/        Estado global en memoria (config-state, ui-context)
-  ui/           Interfaz de confirmación (permission-modal, ui-prompt)
-  telemetry/    Logging de eventos (default path ~/.pi/pi-auto-mode.jsonl)
-  types/        Schemas zod del config + tipos del TUI
-  pi-sdk.d.ts   Stub de tipos del SDK Pi (no importar en runtime real)
-test/           Espejo 1:1 de src/ + stubs para el TUI
-config.example.json  Plantilla para crear tu config.json
-dist/           Build de `npm run build` (generado, gitignored)
-coverage/       Reporte de cobertura (generado, gitignored)
+  deny/         Layer 4: deny-service (auto-retry / ask-user / both)
+  state/        Global in-memory state (config-state, ui-context)
+  ui/           Confirmation UI (permission-modal, ui-prompt)
+  telemetry/    Event logging (default path ~/.pi/pi-auto-mode.jsonl)
+  types/        Config zod schemas + TUI types
+  pi-sdk.d.ts   Pi SDK type stub (don't import in real runtime)
+test/           1:1 mirror of src/ + TUI stubs
+config.example.json  Template for creating your config.json
+dist/           `npm run build` output (generated, gitignored)
+coverage/       Coverage report (generated, gitignored)
 ```
 
 ## Testing
 
-Framework: **Jest 30 + SWC** (transform rápido). Los tests en `test/`, espejo 1:1 de `src/`.
+Framework: **Jest 30 + SWC** (fast transform). Tests in `test/`, 1:1 mirror of `src/`.
 
 ```bash
-npm test        # suite completa con cobertura (579 tests)
+npm test        # full suite with coverage (579 tests)
 ```
 
-Los servicios externos (TUI y SDK de Pi) se sustituyen con `jest.mock` y stubs en `test/stubs/`. La matriz de decisión del gate, la composición en cascada, las reglas del clasificador, las cuatro capas y la estrategia `auto-retry` están cubiertas por tests: no degraden esta cobertura.
+External services (Pi TUI and SDK) are replaced with `jest.mock` and stubs in `test/stubs/`. The gate decision matrix, cascade composition, classifier rules, all four layers and the `auto-retry` strategy are covered by tests: don't degrade this coverage.
 
-## Cómo contribuir
+## Contributing
 
-Sin remoto configurado ni CI. El flujo es ahora manual:
+No configured remote or CI. The flow is manual for now:
 
-1. Crea una rama descriptiva (`fix/<algo>`, `feat/<algo>`).
-2. Realiza los cambios con **Conventional Commits** (`feat:`, `fix:`, `chore:`, `refactor:`, `test:`, `perf:`, `style:`).
-3. Deja el árbol del trabajo formateado y con tests en verde:
+1. Create a descriptive branch (`fix/<something>`, `feat/<something>`).
+2. Make changes with **Conventional Commits** (`feat:`, `fix:`, `chore:`, `refactor:`, `test:`, `perf:`, `style:`).
+3. Leave the work tree formatted and tests green:
    - `npm run check`
    - `npm test`
    - `npx prettier --check .`
 
-El hook pre-commit (`husky` + `lint-staged`) formatea y corre tests sobre los `.ts` staged. Lee `AGENTS.md` completo antes de tocar código — contiene convenciones y límites de seguridad vinculantes.
+The pre-commit hook (`husky` + `lint-staged`) formats and runs tests over staged `.ts` files. Read `AGENTS.md` in full before touching code — it contains binding conventions and security limits.
 
-## Desarrollo / Instalación local
+## Local development / install
 
-Esta sección describe el flujo para **cargar la extensión dentro del runtime de Pi** desde el repo local y poder probarla con hot-edit sobre `src/`. Complementa a [Instalación](#instalación), que solo cubre `npm install`.
+This section describes the flow for **loading the extension inside the Pi runtime** from the local repo so you can test it with hot edits over `src/`. It complements [Installation](#installation), which only covers `npm install`.
 
-### Prerrequisitos
+### Prerequisites
 
-- **Node.js >= 20** (dev en v24). ESM nativo.
-- **Pi Coding Agent instalado** — `pi --version` debe responder.
-- El repo es local; **no** hay remoto configurado, **no** se hace `git push` ni publicación sin confirmación.
+- **Node.js >= 20** (dev on v24). Native ESM.
+- **Pi Coding Agent installed** — `pi --version` must answer.
+- The repo is local; there is **no** configured remote, **no** `git push` or publishing without confirmation.
 
-### 1. Instalar dependencias
+### 1. Install dependencies
 
 ```bash
 npm install
-npm run prepare      # instala el hook pre-commit (husky)
+npm run prepare      # installs the pre-commit hook (husky)
 ```
 
-### 2. Verificar los quality gates
+### 2. Verify the quality gates
 
-Antes de cargar la extensión en Pi, confirma que el árbol está sano:
+Before loading the extension into Pi, confirm the tree is healthy:
 
 ```bash
 npm run check        # tsc --noEmit
-npm test             # 579 tests con Jest + @swc/jest
+npm test             # 579 tests with Jest + @swc/jest
 npx prettier --check .
 ```
 
-Si falla cualquiera, corrígelo antes de seguir.
+If any of them fails, fix it before continuing.
 
-### 3. Linkar en Pi (dos pasos)
+### 3. Link into Pi (two steps)
 
-Pi necesita dos cosas: que el paquete sea descubrible globalmente y que esté registrado en su config.
+Pi needs two things: the package to be globally discoverable and registered in its config.
 
 ```bash
-# Paso 1 — symlink en el node_modules global
+# Step 1 — symlink into the global node_modules
 npm link
 
-# Paso 2 — registrar la ruta absoluta en ~/.pi/agent/settings.json (array `packages`)
-pi install path:/ruta/absoluta/al/repo/pi-auto-mode
-# Atajo equivalente, si el cwd ya es la raíz del repo:
+# Step 2 — register the absolute path in ~/.pi/agent/settings.json (`packages` array)
+pi install path:/absolute/path/to/repo/pi-auto-mode
+# Equivalent shortcut, if cwd is already the repo root:
 pi install .
 ```
 
-> Pi resuelve `.` contra el cwd y guarda la **ruta absoluta** en `settings.json`. La carga se hace con jiti contra `src/index.ts` directamente, así que **no** hace falta `npm run build` durante el desarrollo. Consulta `pi install --help` si el flag cambia entre versiones.
+> Pi resolves `.` against the cwd and stores the **absolute path** in `settings.json`. Loading is done with jiti against `src/index.ts` directly, so **no** `npm run build` is needed during development. Check `pi install --help` if the flag changes between versions.
 
-### 4. Confirmar que Pi la ve
+### 4. Confirm Pi sees it
 
 ```bash
 pi --verbose
 ```
 
-Busca una línea del tipo `[Extensions] ... pi-auto-mode` en la salida. Como alternativa, abre `~/.pi/agent/settings.json` y comprueba que el path aparece en el array `packages`.
+Look for a line like `[Extensions] ... pi-auto-mode` in the output. Alternatively, open `~/.pi/agent/settings.json` and check the path appears in the `packages` array.
 
-### 5. Recargar tras editar código
+### 5. Reload after editing code
 
-- **No hay build step local**: Pi lee `src/index.ts` directamente con jiti. `dist/` solo se usa al publicar a npm.
-- Para que un cambio aplique: **reinicia Pi** (o usa `/reload` si tu build lo expone).
-- Los hooks (`before_agent_start`, sanitizers, …) se registran en cada carga; no hace falta tocar nada más.
+- **No local build step**: Pi reads `src/index.ts` directly with jiti. `dist/` is only used when publishing to npm.
+- For a change to apply: **restart Pi** (or use `/reload` if your build exposes it).
+- Hooks (`before_agent_start`, sanitizers, …) register on every load; nothing else to touch.
 
-### 6. Desinstalar
+### 6. Uninstall
 
 ```bash
-pi remove /ruta/absoluta/al/repo/pi-auto-mode
-# opcional — limpiar el symlink global
+pi remove /absolute/path/to/repo/pi-auto-mode
+# optional — clean the global symlink
 npm unlink pi-auto-mode
 ```
 
-### Dónde vive el estado
+### Where state lives
 
-| Recurso                    | Ruta                                                                                                                       |
-| -------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| Config del usuario         | `~/.pi/pi-auto-mode.json` (se autoseed desde `config.example.json` al primer arranque; override con `PI_AUTO_MODE_CONFIG`) |
-| Telemetría                 | `~/.pi/pi-auto-mode.jsonl` (configurable en `telemetry.path`)                                                              |
-| Registro del paquete en Pi | `~/.pi/agent/settings.json` → `packages[]`                                                                                 |
+| Resource                | Path                                                                                                                  |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| User config             | `~/.pi/pi-auto-mode.json` (auto-seeded from `config.example.json` on first boot; override with `PI_AUTO_MODE_CONFIG`) |
+| Telemetry               | `~/.pi/pi-auto-mode.jsonl` (configurable via `telemetry.path`)                                                        |
+| Pi package registration | `~/.pi/agent/settings.json` → `packages[]`                                                                            |
 
-### Pitfalls habituales
+### Common pitfalls
 
-- **"Module not found" al arrancar Pi** → probablemente se saltó `npm install` o `npm link`. Vuelve a correrlos.
-- **Mis cambios no surten efecto** → reinicia Pi. No hay hot-reload.
-- **Reset del config** → borra `~/.pi/pi-auto-mode.json`; el siguiente arranque lo re-seedea desde `config.example.json`.
-- **Reset total del estado** → quita la entrada de `packages` en `~/.pi/agent/settings.json`, borra `~/.pi/pi-auto-mode.json` y `~/.pi/pi-auto-mode.jsonl`, y vuelve a correr `pi install .`.
+- **"Module not found" on Pi boot** → `npm install` or `npm link` was probably skipped. Re-run them.
+- **My changes have no effect** → restart Pi. No hot-reload.
+- **Config reset** → delete `~/.pi/pi-auto-mode.json`; the next boot re-seeds it from `config.example.json`.
+- **Full state reset** → remove the `packages` entry in `~/.pi/agent/settings.json`, delete `~/.pi/pi-auto-mode.json` and `~/.pi/pi-auto-mode.jsonl`, and re-run `pi install .`.
 
-## Licencia
+## License
 
-Publicado bajo la licencia **MIT**. Ver el archivo `LICENSE`. (Aún no hay archivo `LICENSE` en el repo; se debe añadir.)
+Released under the **MIT** license. See the `LICENSE` file. (No `LICENSE` file in the repo yet; one must be added.)

@@ -421,3 +421,42 @@ describe('root-level tools map (removed in Phase 1)', () => {
     ).toThrow()
   })
 })
+
+describe('trustGitWorktrees (external_directory × git worktrees)', () => {
+  it('defaults to true when omitted', () => {
+    expect(parseConfig({}).trustGitWorktrees).toBe(true)
+  })
+
+  it('DEFAULT_CONFIG.trustGitWorktrees is true', () => {
+    expect(DEFAULT_CONFIG.trustGitWorktrees).toBe(true)
+  })
+
+  it('accepts an explicit false (worktrees counted as external again)', () => {
+    expect(parseConfig({ trustGitWorktrees: false }).trustGitWorktrees).toBe(
+      false
+    )
+  })
+
+  it('rejects non-boolean values', () => {
+    for (const bad of ['true', 1, null, {}]) {
+      expect(() =>
+        parseConfig({
+          // @ts-expect-error: testing runtime rejection of non-boolean
+          trustGitWorktrees: bad,
+        })
+      ).toThrow()
+    }
+  })
+
+  it('is an independent root key: confineToWorkingDirectory stays separate', () => {
+    const cfg = parseConfig({ confineToWorkingDirectory: false })
+    expect(cfg.confineToWorkingDirectory).toBe(false)
+    expect(cfg.trustGitWorktrees).toBe(true)
+  })
+
+  it('config.example.json parses with trustGitWorktrees=true (no drift)', () => {
+    const raw = JSON.parse(readFileSync(EXAMPLE_PATH, 'utf8'))
+    const cfg = parseConfig(raw)
+    expect(cfg.trustGitWorktrees).toBe(true)
+  })
+})

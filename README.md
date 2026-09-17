@@ -164,6 +164,28 @@ Opt-in via `confineToWorkingDirectory` (default `false` = no change). When activ
 }
 ```
 
+#### Git worktrees (`trustGitWorktrees`)
+
+`git worktree add ../feature-wt` puts a second checkout of the **same repository** outside `process.cwd()`, and a sub-agent working there (cwd is still the original checkout) used to hit an `ask` on every write. With `trustGitWorktrees: true` (default, only consulted when `confineToWorkingDirectory` is on), a path that matches **no** `external_directory` rule and lives under one of the repository's registered worktrees counts as internal.
+
+```json
+{
+  "confineToWorkingDirectory": true,
+  "trustGitWorktrees": true
+}
+```
+
+Boundaries of that trust (`src/permission/git-worktrees.ts`):
+
+- Roots come only from the repository found by walking up from the scope base dir — never from a directory named inside the tool call.
+- Shapes covered: normal checkout, linked worktree (from either side), submodule checkout, `--separate-git-dir`. A bare repository contributes only its linked worktrees (it has no working tree). Git records no back-link from a `--separate-git-dir` common dir, so that checkout is trusted only when the walk-up starts inside it.
+- Discovery reads the filesystem (`<repo>/.git/worktrees/<id>/gitdir` + the `<worktree>/.git` back-pointer). No `git` subprocess, no shell-out per tool call.
+- A registration is trusted only when the back-pointer validates: `<worktree>/.git` must be a file whose `gitdir:` resolves to that exact registration. Deleted worktrees (stale) and planted `gitdir` files pointing elsewhere are dropped.
+- `<worktree>/.git/**` is **never** covered: the common dir is shared by every worktree and holds hooks/config, so writing it from a foreign worktree would be code execution.
+- Explicit rules win. `external_directory` entries are resolved first; a `deny`/`ask` matching a worktree path still denies/asks. Worktree trust never whitelists a second, unrelated path in the same call.
+
+Set `trustGitWorktrees: false` to treat every worktree as an ordinary external directory.
+
 ### Classifier fallback
 
 `classifier.fallback.onTimeout` and `classifier.fallback.onError` accept three values:
@@ -513,7 +535,7 @@ src/            Extension code (entry: src/index.ts)
   permission/   Layer 1 (visibility) + Layer 2 (rules):
                 visibility, active-tools, skill-filter, modes,
                 wildcard-matcher, compose, evaluate, rule,
-                session-rules
+                session-rules, external-directory (+ git-worktrees)
   classifier/   Layer 3: rule-based (block-rules, pattern-matcher,
                 rule-evaluator, secret-guard) + LLM (llm-layer,
                 llm-client, file-extraction)

@@ -3,6 +3,10 @@ import { isAbsolute, normalize, relative, resolve, sep } from 'node:path'
 import type { Config, SimpleAction } from '../types/config.ts'
 import { wildcardMatch } from './wildcard-matcher.ts'
 import { extractTreePaths, isShellParserReady } from './shell-parse.ts'
+import {
+  discoverWorktreeRoots,
+  isInsideTrustedWorktree,
+} from './git-worktrees.ts'
 
 // Local structural intent — deliberately NOT imported from gate/normalize.ts
 // to avoid an import cycle (gate imports this module).
@@ -27,6 +31,12 @@ export interface ExternalVerdict {
   matchedValue?: string
   matchedSurface?: string
   engine?: ExternalEngine
+  /**
+   * True when the entry was let through because it lives in a registered git
+   * worktree of the current repository (trustGitWorktrees), not because an
+   * `external_directory` rule allowed it. Reporting only: never widens.
+   */
+  viaWorktree?: boolean
 }
 
 /**
@@ -473,10 +483,34 @@ export function evaluateExternalDirectory(
       }
       return found
     }
-    const resolved = outside.map((o) => ({ ...o, rule: resolveEntry(o.abs) }))
-    const pending = resolved.filter((o) => o.rule?.action !== 'allow')
+    // Git worktree trust (opt-in, default on): a path that matched NO explicit
+    // rule and lives under one of the current repository's registered worktrees
+    // counts as internal. It is resolved AFTER the rule lookup on purpose —
+    // an explicit allow/deny/ask from the user always wins over worktree trust.
+    // Roots are discovered lazily (fs scan) and only when a rule-less
+    // candidate exists; discovery failure means "no extra trust" (fail-closed).
+    let worktreeRoots: string[] | undefined
+    const trustedByWorktree = (abs: string): boolean => {
+      if (cfg.trustGitWorktrees === false) return false
+      if (worktreeRoots === undefined) {
+        worktreeRoots = discoverWorktreeRoots(base)
+      }
+      return isInsideTrustedWorktree(abs, worktreeRoots)
+    }
+    const resolved = outside.map((o) => {
+      const rule = resolveEntry(o.abs)
+      return {
+        ...o,
+        rule,
+        viaWorktree: rule === undefined && trustedByWorktree(o.abs),
+      }
+    })
+    const pending = resolved.filter(
+      (o) => o.rule?.action !== 'allow' && o.viaWorktree !== true
+    )
     if (pending.length === 0) {
-      // Every outside path explicitly allowed: allow verdict, same as before.
+      // Every outside path explicitly allowed (or covered by worktree trust):
+      // allow verdict, same as before.
       const last = resolved[resolved.length - 1]
       if (last === undefined) return undefined
       return {
@@ -486,6 +520,7 @@ export function evaluateExternalDirectory(
         matchedValue: last.value,
         matchedSurface: last.surface,
         engine: last.engine,
+        viaWorktree: last.rule === undefined ? last.viaWorktree : undefined,
       }
     }
     // Strictest wins across the remaining entries: explicit deny beats

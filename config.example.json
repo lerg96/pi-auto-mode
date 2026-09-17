@@ -51,6 +51,7 @@
   "activePermissionSets": ["project-default"],
   "mode": "default",
   "confineToWorkingDirectory": true,
+  "trustGitWorktrees": true,
   "classifier": {
     "enabled": true,
     "llm": {

@@ -292,6 +292,10 @@ const debugConfig = z
  *   último match gana (dentro de un mapa, la última clave que matchea gana).
  *   Solo opina sobre paths FUERA de process.cwd(); sin match explícito → 'ask'.
  *   No opina sobre paths internos. En el gate solo ENDURECE (ver gateToolCall).
+ *   Worktrees git: con `trustGitWorktrees: true` (default), un path sin regla
+ *   explícita que vive dentro de un worktree registrado del repo actual cuenta
+ *   como interno (no ask). Las reglas explícitas ganan siempre: un deny/ask que
+ *   matchea el path del worktree se aplica. Ver permission/git-worktrees.ts.
  *
  * DÓNDE ENTRA classifier.llm:
  *   Solo se consulta cuando la cascada de permissions resuelve final === 'ask'.
@@ -311,6 +315,13 @@ export const ConfigSchema = z
     // Scope de directorio: cuando es true, los paths fuera de process.cwd()
     // endurecen el veredicto vía external_directory (default false = sin cambios).
     confineToWorkingDirectory: z.boolean().default(false),
+    // Worktrees git del repo actual cuentan como internos al evaluar
+    // external_directory (solo aplica si confineToWorkingDirectory es true).
+    // true  → `git worktree add ../wt` y trabajar ahí no genera ask.
+    // false → cada worktree es un directorio externo más.
+    // Reglas explícitas de external_directory SIEMPRE ganan: un deny/ask que
+    // matchea el path del worktree se respeta igual.
+    trustGitWorktrees: z.boolean().default(true),
     // Clasificador LLM
     classifier: classifierConfig,
     // Deny strategy (sin cambios)

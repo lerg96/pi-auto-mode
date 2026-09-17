@@ -1,5 +1,6 @@
-import { join, normalize, resolve, sep } from 'node:path'
-import { homedir } from 'node:os'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { join, relative, normalize, resolve, sep } from 'node:path'
+import { homedir, tmpdir } from 'node:os'
 import { parseConfig } from '../../src/types/config.ts'
 import { normalizeToolCall } from '../../src/gate/normalize.ts'
 import {
@@ -459,5 +460,196 @@ describe('external_directory scope', () => {
   it('lone slash after sed head is debris; real root and s/a path kept', () => {
     expect(extractBashPaths('sed s/^/LOOP1: /')).toEqual(['s/^/LOOP1:'])
     expect(extractBashPaths('ls s/a /')).toEqual(['s/a', '/'])
+  })
+})
+
+describe('external_directory × git worktrees', () => {
+  // Real fixtures on disk: the scope reads the worktree registry from the
+  // filesystem, so these cannot be pure in-memory paths. Layout mirrors Git
+  // for Windows: <repo>/.git/worktrees/<id>/gitdir + <wt>/.git back-pointer.
+  const tmp = mkdtempSync(join(tmpdir(), 'pi-am-extwt-'))
+
+  afterAll(() => {
+    rmSync(tmp, { recursive: true, force: true })
+  })
+
+  function repoWithWorktree(name: string): {
+    repo: string
+    wt: string
+    unrelated: string
+  } {
+    const repo = join(tmp, name)
+    const gitDir = join(repo, '.git')
+    mkdirSync(join(gitDir, 'worktrees', 'feat'), { recursive: true })
+    writeFileSync(join(gitDir, 'HEAD'), 'ref: refs/heads/main\n')
+    const wt = join(tmp, `${name}-wt`)
+    mkdirSync(wt, { recursive: true })
+    const idDir = join(gitDir, 'worktrees', 'feat')
+    writeFileSync(join(idDir, 'gitdir'), `${wt}${sep}.git\n`)
+    writeFileSync(join(idDir, 'commondir'), `${gitDir}\n`)
+    writeFileSync(join(wt, '.git'), `gitdir: ${idDir}\n`)
+    const unrelated = join(tmp, `${name}-elsewhere`, 'secret.txt')
+    return { repo, wt, unrelated }
+  }
+
+  it('fs intent inside a registered worktree → allow, flagged viaWorktree', () => {
+    const { repo, wt } = repoWithWorktree('allow')
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: { tools: { write: 'ask' } },
+    })
+    const verdict = evaluateExternalDirectory(
+      cfg,
+      [{ surface: 'fs', value: join(wt, 'src', 'a.ts') }],
+      repo
+    )
+    expect(verdict?.action).toBe('allow')
+    expect(verdict?.viaWorktree).toBe(true)
+  })
+
+  it('relative shell intent resolving into the worktree → allow', () => {
+    const { repo, wt } = repoWithWorktree('relshell')
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: { tools: { bash: 'allow' } },
+    })
+    const rel = relative(repo, join(wt, 'file.txt'))
+    const verdict = evaluateExternalDirectory(
+      cfg,
+      [{ surface: 'shell', value: `echo hi > ${rel}` }],
+      repo
+    )
+    expect(verdict?.action).toBe('allow')
+    expect(verdict?.viaWorktree).toBe(true)
+  })
+
+  it('trustGitWorktrees: false → the worktree is external again', () => {
+    const { repo, wt } = repoWithWorktree('optout')
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      trustGitWorktrees: false,
+      permissions: { tools: { write: 'ask' } },
+    })
+    const verdict = evaluateExternalDirectory(
+      cfg,
+      [{ surface: 'fs', value: join(wt, 'a.ts') }],
+      repo
+    )
+    expect(verdict?.action).toBe('ask')
+    expect(verdict?.viaWorktree).toBeUndefined()
+  })
+
+  it('explicit deny on the worktree path wins over worktree trust', () => {
+    const { repo, wt } = repoWithWorktree('deny')
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: {
+        tools: { write: 'ask' },
+        external_directory: { [join(wt, '**')]: 'deny' },
+      },
+    })
+    const verdict = evaluateExternalDirectory(
+      cfg,
+      [{ surface: 'fs', value: join(wt, 'a.ts') }],
+      repo
+    )
+    expect(verdict?.action).toBe('deny')
+    expect(verdict?.absPath).toBe(join(wt, 'a.ts'))
+  })
+
+  it('explicit ask on the worktree path still asks', () => {
+    const { repo, wt } = repoWithWorktree('ask')
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: {
+        tools: { write: 'ask' },
+        external_directory: { [join(wt, '**')]: 'ask' },
+      },
+    })
+    const verdict = evaluateExternalDirectory(
+      cfg,
+      [{ surface: 'fs', value: join(wt, 'a.ts') }],
+      repo
+    )
+    expect(verdict?.action).toBe('ask')
+  })
+
+  it('`.git` metadata of a worktree is not covered by trust', () => {
+    const { repo, wt } = repoWithWorktree('gitmeta')
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: { tools: { write: 'ask' } },
+    })
+    const verdict = evaluateExternalDirectory(
+      cfg,
+      [{ surface: 'fs', value: join(wt, '.git', 'hooks', 'pre-commit') }],
+      repo
+    )
+    expect(verdict?.action).toBe('ask')
+  })
+
+  it('a trusted worktree never whitelists a second, unrelated path', () => {
+    const { repo, wt, unrelated } = repoWithWorktree('mixed')
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: { tools: { bash: 'allow' } },
+    })
+    const verdict = evaluateExternalDirectory(
+      cfg,
+      [
+        { surface: 'fs', value: join(wt, 'a.ts') },
+        { surface: 'fs', value: unrelated },
+      ],
+      repo
+    )
+    expect(verdict?.action).toBe('ask')
+    expect(verdict?.absPath).toBe(unrelated)
+  })
+
+  it('worktree deleted after registration (stale) → ask again', () => {
+    const { repo, wt } = repoWithWorktree('stale')
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: { tools: { write: 'ask' } },
+    })
+    rmSync(wt, { recursive: true, force: true })
+    const verdict = evaluateExternalDirectory(
+      cfg,
+      [{ surface: 'fs', value: join(wt, 'a.ts') }],
+      repo
+    )
+    expect(verdict?.action).toBe('ask')
+  })
+
+  it('main-checkout paths outside a subdirectory cwd are trusted', () => {
+    const { repo } = repoWithWorktree('subcwd')
+    const cwd = join(repo, 'packages', 'app')
+    mkdirSync(cwd, { recursive: true })
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: { tools: { write: 'ask' } },
+    })
+    const verdict = evaluateExternalDirectory(
+      cfg,
+      [{ surface: 'fs', value: join(repo, 'README.md') }],
+      cwd
+    )
+    expect(verdict?.action).toBe('allow')
+    expect(verdict?.viaWorktree).toBe(true)
+  })
+
+  it('no repository at cwd → unchanged default ask', () => {
+    const bare = join(tmp, 'norepo')
+    mkdirSync(bare, { recursive: true })
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: { tools: { write: 'ask' } },
+    })
+    const verdict = evaluateExternalDirectory(
+      cfg,
+      [{ surface: 'fs', value: join(tmp, 'somewhere-else.txt') }],
+      bare
+    )
+    expect(verdict?.action).toBe('ask')
   })
 })

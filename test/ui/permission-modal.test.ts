@@ -5,6 +5,7 @@ import type { configState } from '../../src/state/config-state.ts'
 import { parseConfig } from '../../src/types/config.ts'
 import type { SettingItem } from '../../test/stubs/pi-tui.ts'
 import { setUiContext, getUiContext } from '../../src/state/ui-context.ts'
+import { publishUi, resetUiRegistry } from '../../src/state/ui-registry.ts'
 import { BUS_CHANNEL_UI_PROMPT } from '../../src/events.ts'
 import type { AskDecision, AskRequest } from '../../src/gate/ask.ts'
 
@@ -47,8 +48,14 @@ type RenderFn = (
   close: () => void
 ) => unknown
 
-function makeConfigState(modalTimeoutMs = 120_000): typeof configState {
-  const cfg = parseConfig({ ui: { modalTimeoutMs } })
+function makeConfigState(
+  modalTimeoutMs = 120_000,
+  noUiAsks: 'bubble' | 'deny' = 'bubble',
+  subagentModalTimeoutMs = 120_000
+): typeof configState {
+  const cfg = parseConfig({
+    ui: { modalTimeoutMs, noUiAsks, subagentModalTimeoutMs },
+  })
   return {
     get: () => cfg,
     set: () => {},
@@ -96,23 +103,27 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       return Promise.resolve(undefined)
     })
     // Seed the UI holder with a fresh UI mock. Tests that want a no-UI or
-    // noOp-UI flow explicitly clear / override this with `setUiContext(...)`.
+    // noOp-UI flow explicitly clear / override this with `setUiContext(...)`
+    // AND clear the process registry (that handle is what lets a UI-less
+    // session borrow the parent's modal target).
+    resetUiRegistry()
     setUiContext(makeFakeUi(), true)
   })
 
   afterEach(() => {
     // Clear the UI holder between tests so leakage cannot bleed across cases.
     setUiContext(undefined, false)
+    resetUiRegistry()
     expect(getUiContext()).toBeNull()
   })
 
-  function makeFakeUi(): {
+  function makeFakeUi(custom: jest.Mock = customImpl): {
     custom: jest.Mock
     notify: jest.Mock
     input: jest.Mock
   } {
     return {
-      custom: customImpl,
+      custom,
       notify: uiNotify,
       input: inputImpl,
     }
@@ -143,13 +154,24 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
   function makeResolver(
     sessionRules = new SessionRules(),
     modalTimeoutMs = 120_000,
-    pi: ExtensionAPI = makePi()
+    pi: ExtensionAPI = makePi(),
+    subagentModalTimeoutMs = 120_000
   ): ReturnType<typeof createModalAskResolver> {
     return createModalAskResolver(
       pi,
       sessionRules,
-      makeConfigState(modalTimeoutMs)
+      makeConfigState(modalTimeoutMs, 'bubble', subagentModalTimeoutMs)
     )
+  }
+
+  // Publica una UI de proceso y deja la sesión actual SIN UI, que es la forma
+  // real en que llega un ask de una sub-sesión (pi-subagents no pasa
+  // `uiContext`). Devuelve la UI prestada para poder inspeccionarla.
+  function asBorrowedSession(ui: { custom: jest.Mock }): void {
+    setUiContext(ui as never, true)
+    resetUiRegistry()
+    publishUi(ui as never)
+    setUiContext(undefined, false)
   }
 
   // Drive the modal: invoke the captured render to wire up the SettingsList,
@@ -484,7 +506,8 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       const promise = resolver({ surface: 'fs', value: '/tmp/x' })
       expect(renderCapture).toBeUndefined()
       await jest.advanceTimersByTimeAsync(120_000 + 10)
-      expect(await promise).toBe('deny')
+      // Nadie respondió: no se audita como decisión de un usuario.
+      expect(await promise).toEqual({ decision: 'deny', via: 'timeout' })
     } finally {
       jest.useRealTimers()
     }
@@ -649,12 +672,18 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
     // render. The fix binds ctx.ui into the holder; with the holder empty
     // the resolver must deny-closed without ever invoking custom().
     setUiContext(undefined, false)
+    // Nadie publicó UI en este proceso: es el caso `pi -p`, donde no hay a
+    // quién preguntar.
+    resetUiRegistry()
     const resolver = createModalAskResolver(
       makePi(),
       new SessionRules(),
       makeConfigState()
     )
-    expect(await resolver({ surface: 'fs', value: '/tmp/x' })).toBe('deny')
+    expect(await resolver({ surface: 'fs', value: '/tmp/x' })).toEqual({
+      decision: 'deny',
+      via: 'no-ui',
+    })
     expect(customImpl).not.toHaveBeenCalled()
   })
 
@@ -670,13 +699,125 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       },
       false
     )
+    resetUiRegistry()
     const resolver = createModalAskResolver(
       makePi(),
       new SessionRules(),
       makeConfigState()
     )
-    expect(await resolver({ surface: 'fs', value: '/tmp/x' })).toBe('deny')
+    expect(await resolver({ surface: 'fs', value: '/tmp/x' })).toEqual({
+      decision: 'deny',
+      via: 'no-ui',
+    })
     expect(customImpl).not.toHaveBeenCalled()
+  })
+
+  // ─── Sub-sesión sin UI propia: el modal se presta la UI del padre ──
+  it('borra la UI publicada cuando noUiAsks=deny: deniega sin preguntar', async () => {
+    const parentUi = makeFakeUi()
+    setUiContext(parentUi, true)
+    resetUiRegistry()
+    publishUi(parentUi as never)
+    setUiContext(undefined, false) // esta sesión (la hija) no tiene UI
+
+    const resolver = createModalAskResolver(
+      makePi(),
+      new SessionRules(),
+      makeConfigState(120_000, 'deny')
+    )
+    expect(await resolver({ surface: 'fs', value: '/tmp/x' })).toEqual({
+      decision: 'deny',
+      via: 'no-ui',
+    })
+    expect(parentUi.custom).not.toHaveBeenCalled()
+  })
+
+  it('renderiza en la UI del padre cuando esta sesión no tiene UI', async () => {
+    const parentUi = makeFakeUi()
+    setUiContext(parentUi, true)
+    resetUiRegistry()
+    publishUi(parentUi as never)
+    setUiContext(undefined, false) // la sub-sesión hereda: ctx.hasUI === false
+
+    // custom() queda pendiente: el modal sigue abierto hasta que disparemos
+    // onChange, como en `makePiNeverRender`.
+    const pending = makeFakeUi(jest.fn(() => new Promise<undefined>(() => {})))
+    setUiContext(pending, true)
+    resetUiRegistry()
+    publishUi(pending as never)
+    setUiContext(undefined, false)
+
+    const resolver = makeResolver()
+    const promise = resolver({ surface: 'fs', value: '/tmp/x' })
+
+    // El modal tiene que haberse renderizado en la UI del PADRE, no en la suya.
+    expect(pending.custom).toHaveBeenCalledTimes(1)
+    const render = pending.custom.mock.calls[0]?.[0] as RenderFn
+    const view = render(
+      undefined,
+      fakeGlobalTheme,
+      undefined,
+      () => {}
+    ) as unknown as { render(width: number): string[] }
+    const lines = view.render(80).join('\n')
+    // Y tiene que decir de dónde viene la pregunta.
+    expect(lines).toContain('child session')
+
+    const onChange = captures.onChange
+    expect(typeof onChange).toBe('function')
+    onChange!('allow', '❯')
+    expect(await promise).toEqual({ decision: 'allow', via: 'parent-modal' })
+  })
+
+  // ─── Plazo propio para prompts de sub-sesión ─────────────────
+  it('uses subagentModalTimeoutMs (not modalTimeoutMs) for a borrowed prompt', async () => {
+    jest.useFakeTimers()
+    try {
+      const pending = makeFakeUi(
+        jest.fn(() => new Promise<undefined>(() => {}))
+      )
+      asBorrowedSession(pending)
+      // modalTimeoutMs ilimitado: si el prompt prestado usara ese valor, esto
+      // no resolvería nunca y el test fallaría por timeout.
+      const resolver = makeResolver(new SessionRules(), -1, makePi(), 500)
+      const promise = resolver({ surface: 'fs', value: '/tmp/x' })
+
+      await jest.advanceTimersByTimeAsync(490)
+      let settled = false
+      void promise.then(() => {
+        settled = true
+      })
+      await Promise.resolve()
+      expect(settled).toBe(false)
+
+      await jest.advanceTimersByTimeAsync(20)
+      expect(await promise).toEqual({ decision: 'deny', via: 'timeout' })
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
+  it('does not apply subagentModalTimeoutMs to the session own prompt', async () => {
+    jest.useFakeTimers()
+    try {
+      // UI propia + plazo de sub-agente cortísimo: el modal normal no debe
+      // cortarse por él (mandan los -1 de modalTimeoutMs).
+      const resolver = makeResolver(new SessionRules(), -1, makePi(), 100)
+      const promise = resolver({ surface: 'fs', value: '/tmp/x' })
+      await jest.advanceTimersByTimeAsync(60_000)
+      let settled = false
+      void promise.then(() => {
+        settled = true
+      })
+      await Promise.resolve()
+      expect(settled).toBe(false)
+
+      renderCapture!(undefined, fakeGlobalTheme, undefined, () => {})
+      captures.onChange!('allow', '❯')
+      expect(await promise).toBe('allow')
+    } finally {
+      jest.useRealTimers()
+    }
   })
 
   // ─── Defensive: ctx.ui.custom() rejection → fail-closed ───────

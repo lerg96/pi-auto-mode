@@ -3,7 +3,12 @@ import type { GateDeps } from '../../src/gate/gate.ts'
 import { configState } from '../../src/state/config-state.ts'
 import { SessionRules } from '../../src/permission/session-rules.ts'
 import { DenyAndContinueService } from '../../src/deny/deny-service.ts'
-import { setAskResolver, getAskResolver } from '../../src/gate/ask.ts'
+import { resolve } from 'node:path'
+import {
+  setAskResolver,
+  getAskResolver,
+  defaultAskResolver,
+} from '../../src/gate/ask.ts'
 import type { Config } from '../../src/types/config.ts'
 import type {
   ClassifierInput,
@@ -56,6 +61,8 @@ const config: Config = {
     promptFieldMaxWidth: 120,
     showClassifierRisk: true,
     modalTimeoutMs: 120000,
+    noUiAsks: 'bubble',
+    subagentModalTimeoutMs: 120000,
   },
   telemetry: { enabled: false, path: '' },
 }
@@ -405,6 +412,118 @@ describe('gateToolCall', () => {
     }
     expect(capturedAudit?.denialReason).toBeDefined()
     setAskResolver(getAskResolver())
+  })
+
+  it('no-UI denial: se audita como no-ui y el mensaje no culpa a un usuario', async () => {
+    // Regresión del bug de sub-agentes: un ask sin UI se denegaba y se
+    // registraba como `decidedBy: 'user', via: 'modal'`, o sea: un humano que
+    // nunca existió vetando la llamada.
+    configState.set({
+      ...config,
+      permissions: {
+        tools: {
+          bash: [{ pattern: 'cat *.env', action: 'ask', reason: 'secretos' }],
+        },
+      },
+    })
+    const events: Array<Record<string, unknown>> = []
+    const deps: GateDeps = {
+      configState,
+      sessionRules: new SessionRules(),
+      hooks: {
+        emit: (_channel: string, data: unknown) => {
+          events.push(data as Record<string, unknown>)
+        },
+      },
+      classify: async (): Promise<ClassifierResult> => ({
+        decision: 'allow',
+      }),
+    }
+    setAskResolver(async () => ({ decision: 'deny', via: 'no-ui' }))
+    let message = ''
+    try {
+      await gateToolCall('bash', { command: 'cat .env' }, deps)
+    } catch (err) {
+      message = (err as Error).message
+    }
+    setAskResolver(getAskResolver())
+
+    expect(message).toContain('without asking')
+    expect(message).not.toMatch(/denied by user/i)
+    const denial = events.find((e) => e.result === 'deny')
+    expect(denial?.via).toBe('no-ui')
+    expect(denial?.decidedBy).toBe('no-ui')
+  })
+
+  it('timeout: se audita como timeout, no como decisión de un usuario', async () => {
+    // El prompt se mostró pero nadie respondió: decir «denied by user» sería
+    // otra mentira de auditoría, igual que el caso no-ui.
+    configState.set({
+      ...config,
+      permissions: {
+        tools: {
+          bash: [{ pattern: 'sleep *', action: 'ask', reason: 'lento' }],
+        },
+      },
+    })
+    const events: Array<Record<string, unknown>> = []
+    const deps: GateDeps = {
+      configState,
+      sessionRules: new SessionRules(),
+      hooks: {
+        emit: (_channel: string, data: unknown) => {
+          events.push(data as Record<string, unknown>)
+        },
+      },
+      classify: async (): Promise<ClassifierResult> => ({
+        decision: 'allow',
+      }),
+    }
+    setAskResolver(async () => ({ decision: 'deny', via: 'timeout' }))
+    let message = ''
+    try {
+      await gateToolCall('bash', { command: 'sleep 5' }, deps)
+    } catch (err) {
+      message = (err as Error).message
+    }
+    setAskResolver(getAskResolver())
+
+    expect(message).toContain('expired without an answer')
+    expect(message).not.toMatch(/denied by user/i)
+    const denial = events.find((e) => e.result === 'deny')
+    expect(denial?.via).toBe('timeout')
+    expect(denial?.decidedBy).toBe('timeout')
+  })
+
+  it('parent-modal: la decisión del padre se audita como decisión humana real', async () => {
+    configState.set({
+      ...config,
+      permissions: {
+        tools: {
+          bash: [{ pattern: 'safe-parent', action: 'ask' }],
+        },
+      },
+    })
+    const events: Array<Record<string, unknown>> = []
+    const deps: GateDeps = {
+      configState,
+      sessionRules: new SessionRules(),
+      hooks: {
+        emit: (_channel: string, data: unknown) => {
+          events.push(data as Record<string, unknown>)
+        },
+      },
+      classify: async (): Promise<ClassifierResult> => ({
+        decision: 'allow',
+      }),
+    }
+    setAskResolver(async () => ({ decision: 'allow', via: 'parent-modal' }))
+    await gateToolCall('bash', { command: 'safe-parent' }, deps)
+    setAskResolver(getAskResolver())
+
+    const approval = events.find((e) => e.result === 'allow')
+    expect(approval?.via).toBe('parent-modal')
+    expect(approval?.decidedBy).toBe('user')
   })
 
   it('ask audit enrichment: allow includes requestId, decidedBy, via; plain allow does NOT persist', async () => {
@@ -1084,5 +1203,49 @@ describe('decision training fields: ruleId, strategy, userVerdict', () => {
     // The service routes mode 'auto-retry' to the 'deny-and-continue'
     // action: strategy records the outcome, not the mode.
     expect(detailOf(ev).strategy).toBe('deny-and-continue')
+  })
+})
+
+describe('externalDirectoryTools × gate', () => {
+  const outsidePath = resolve(process.cwd(), '..', 'pi-auto-mode-probe.txt')
+
+  beforeEach(() => {
+    configState.set(config)
+  })
+  afterEach(() => {
+    setAskResolver(defaultAskResolver)
+  })
+
+  it('una tool fuera de la lista no se endurece por external_directory', async () => {
+    configState.set({
+      ...config,
+      confineToWorkingDirectory: true,
+      externalDirectoryTools: ['write'],
+      permissions: { tools: { read: 'allow', write: 'allow' } },
+    })
+    // `read` tiene allow en su cascada y NO está en la lista: la capa de
+    // external_directory opina undefined y el allow manda.
+    await expect(
+      gateToolCall('read', { path: outsidePath }, makeDeps())
+    ).resolves.toBeUndefined()
+
+    // `write` sí está: el ask por defecto de un path externo se materializa.
+    setAskResolver(async () => 'deny')
+    await expect(
+      gateToolCall('write', { path: outsidePath }, makeDeps())
+    ).rejects.toThrow(/denied by user/)
+  })
+
+  it("default ['*'] sigue endureciendo cualquier tool", async () => {
+    configState.set({
+      ...config,
+      confineToWorkingDirectory: true,
+      externalDirectoryTools: ['*'],
+      permissions: { tools: { read: 'allow' } },
+    })
+    setAskResolver(async () => 'deny')
+    await expect(
+      gateToolCall('read', { path: outsidePath }, makeDeps())
+    ).rejects.toThrow()
   })
 })

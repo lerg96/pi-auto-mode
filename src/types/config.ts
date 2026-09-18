@@ -204,6 +204,18 @@ const uiConfig = z
     showClassifierRisk: z.boolean().default(true),
     // -1 = sin timeout (ilimitado). Default 120000 = 2 min.
     modalTimeoutMs: z.number().int().default(120000),
+    // Timeout de los prompts que se renderizan en la UI del padre porque la
+    // sub-sesión no tiene UI propia (ver `noUiAsks`). INDEPENDIENTE de
+    // `modalTimeoutMs`: un sub-agente en background puede dejar el modal
+    // abierto indefinidamente y, mientras tanto, sostiene el lock de prompts
+    // del proceso. -1 = ilimitado.
+    subagentModalTimeoutMs: z.number().int().default(120000),
+    // Qué hacer con un ask cuando ESTA sesión no tiene UI (p. ej. una
+    // sub-sesión creada por pi-subagents, que nunca recibe `uiContext`).
+    //   'bubble' (default): renderizar el modal en la UI de la sesión padre
+    //     del proceso, si alguna vez publicó una (nunca en `pi -p`).
+    //   'deny': denegar sin preguntar (comportamiento histórico).
+    noUiAsks: z.enum(['bubble', 'deny']).default('bubble'),
     // Sonido al abrir el modal (opt-in). Ausente = silencioso.
     // `path` vacío → doble tono del sistema (sin archivos); con path → .wav.
     // `remindEveryMs` > 0 repite el aviso hasta decidir; 0 = un solo ding.
@@ -221,6 +233,8 @@ const uiConfig = z
     promptFieldMaxWidth: 120,
     showClassifierRisk: true,
     modalTimeoutMs: 120000,
+    subagentModalTimeoutMs: 120000,
+    noUiAsks: 'bubble',
   })
 
 // ─── Telemetry Config (SIN CAMBIOS) ──────────────────────────────────────────
@@ -296,6 +310,10 @@ const debugConfig = z
  *   explícita que vive dentro de un worktree registrado del repo actual cuenta
  *   como interno (no ask). Las reglas explícitas ganan siempre: un deny/ask que
  *   matchea el path del worktree se aplica. Ver permission/git-worktrees.ts.
+ *   Qué tools se validan: `externalDirectoryTools` lista los nombres de tool
+ *   (globs) sobre los que aplica el scope. Default `['*']` = todas. Una tool
+ *   fuera de la lista NO pasa por esta capa: si su cascada dijo allow, ese es
+ *   el veredicto, aunque toque rutas fuera de cwd. `[]` = no validar ninguna.
  *
  * DÓNDE ENTRA classifier.llm:
  *   Solo se consulta cuando la cascada de permissions resuelve final === 'ask'.
@@ -322,6 +340,15 @@ export const ConfigSchema = z
     // Reglas explícitas de external_directory SIEMPRE ganan: un deny/ask que
     // matchea el path del worktree se respeta igual.
     trustGitWorktrees: z.boolean().default(true),
+    // Qué tools evalúa la capa external_directory. Globs sobre el NOMBRE de la
+    // tool (mismo matcher que los patterns de `permissions.tools`).
+    //   ['*']                → todas (comportamiento histórico; default).
+    //   ['bash','write']     → solo esas; p. ej. `read` queda fuera de la capa
+    //                          y un allow suyo sigue siendo allow aunque lea
+    //                          fuera de cwd.
+    //   []                   → la capa no aplica a ninguna tool (apagada).
+    // Solo QUITA endurecimiento: nunca relaja una regla de `permissions.tools`.
+    externalDirectoryTools: z.array(z.string().min(1)).default(['*']),
     // Clasificador LLM
     classifier: classifierConfig,
     // Deny strategy (sin cambios)
@@ -402,6 +429,8 @@ export interface UiConfig {
   promptFieldMaxWidth: number
   showClassifierRisk: boolean
   modalTimeoutMs: number
+  subagentModalTimeoutMs: number
+  noUiAsks: 'bubble' | 'deny'
   sound?: SoundConfig
 }
 

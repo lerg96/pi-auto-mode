@@ -5,6 +5,7 @@ import { parseConfig } from '../../src/types/config.ts'
 import { normalizeToolCall } from '../../src/gate/normalize.ts'
 import {
   evaluateExternalDirectory,
+  externalScopeAppliesTo,
   extractBashPaths,
   isOutsideCwd,
   resolveFsPath,
@@ -17,6 +18,76 @@ const inside = (...parts: string[]): string => join(cwd, ...parts)
 function cfgWith(raw: unknown): ReturnType<typeof parseConfig> {
   return parseConfig(raw)
 }
+
+describe('externalDirectoryTools (qué tools pasa por la capa)', () => {
+  const abs = outside('probe.txt')
+  const intents: Array<{ surface: string; value: string }> = [
+    { surface: 'fs', value: abs },
+  ]
+
+  it("default ['*'] → se valida cualquier tool", () => {
+    const cfg = cfgWith({ confineToWorkingDirectory: true })
+    expect(
+      evaluateExternalDirectory(cfg, intents, { toolName: 'read' })?.action
+    ).toBe('ask')
+    expect(
+      evaluateExternalDirectory(cfg, intents, { toolName: 'write' })?.action
+    ).toBe('ask')
+  })
+
+  it('tool fuera de la lista → sin opinión, aunque toque fuera de cwd', () => {
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      externalDirectoryTools: ['write'],
+    })
+    // `read` no está: la capa opina undefined y el allow de su cascada manda.
+    expect(
+      evaluateExternalDirectory(cfg, intents, { toolName: 'read' })
+    ).toBeUndefined()
+    expect(
+      evaluateExternalDirectory(cfg, intents, { toolName: 'write' })?.action
+    ).toBe('ask')
+  })
+
+  it('sin toolName → se valida: un olvido no apaga la capa', () => {
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      externalDirectoryTools: ['write'],
+    })
+    expect(evaluateExternalDirectory(cfg, intents)?.action).toBe('ask')
+  })
+
+  it('[] → la capa queda apagada para todas las tools', () => {
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      externalDirectoryTools: [],
+    })
+    expect(
+      evaluateExternalDirectory(cfg, intents, { toolName: 'write' })
+    ).toBeUndefined()
+  })
+
+  it('acepta globs sobre el nombre de la tool', () => {
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      externalDirectoryTools: ['mcp__*'],
+    })
+    expect(
+      evaluateExternalDirectory(cfg, intents, { toolName: 'mcp__drive__ls' })
+        ?.action
+    ).toBe('ask')
+    expect(
+      evaluateExternalDirectory(cfg, intents, { toolName: 'bash' })
+    ).toBeUndefined()
+  })
+
+  it('externalScopeAppliesTo decide sin calcular paths', () => {
+    const cfg = cfgWith({ externalDirectoryTools: ['bash', 'write'] })
+    expect(externalScopeAppliesTo(cfg, 'bash')).toBe(true)
+    expect(externalScopeAppliesTo(cfg, 'read')).toBe(false)
+    expect(externalScopeAppliesTo(cfg, undefined)).toBe(true)
+  })
+})
 
 describe('external_directory scope', () => {
   it('flag off → undefined even for outside paths', () => {
@@ -501,7 +572,7 @@ describe('external_directory × git worktrees', () => {
     const verdict = evaluateExternalDirectory(
       cfg,
       [{ surface: 'fs', value: join(wt, 'src', 'a.ts') }],
-      repo
+      { cwd: repo }
     )
     expect(verdict?.action).toBe('allow')
     expect(verdict?.viaWorktree).toBe(true)
@@ -517,7 +588,7 @@ describe('external_directory × git worktrees', () => {
     const verdict = evaluateExternalDirectory(
       cfg,
       [{ surface: 'shell', value: `echo hi > ${rel}` }],
-      repo
+      { cwd: repo }
     )
     expect(verdict?.action).toBe('allow')
     expect(verdict?.viaWorktree).toBe(true)
@@ -533,7 +604,7 @@ describe('external_directory × git worktrees', () => {
     const verdict = evaluateExternalDirectory(
       cfg,
       [{ surface: 'fs', value: join(wt, 'a.ts') }],
-      repo
+      { cwd: repo }
     )
     expect(verdict?.action).toBe('ask')
     expect(verdict?.viaWorktree).toBeUndefined()
@@ -551,7 +622,7 @@ describe('external_directory × git worktrees', () => {
     const verdict = evaluateExternalDirectory(
       cfg,
       [{ surface: 'fs', value: join(wt, 'a.ts') }],
-      repo
+      { cwd: repo }
     )
     expect(verdict?.action).toBe('deny')
     expect(verdict?.absPath).toBe(join(wt, 'a.ts'))
@@ -569,7 +640,7 @@ describe('external_directory × git worktrees', () => {
     const verdict = evaluateExternalDirectory(
       cfg,
       [{ surface: 'fs', value: join(wt, 'a.ts') }],
-      repo
+      { cwd: repo }
     )
     expect(verdict?.action).toBe('ask')
   })
@@ -583,7 +654,7 @@ describe('external_directory × git worktrees', () => {
     const verdict = evaluateExternalDirectory(
       cfg,
       [{ surface: 'fs', value: join(wt, '.git', 'hooks', 'pre-commit') }],
-      repo
+      { cwd: repo }
     )
     expect(verdict?.action).toBe('ask')
   })
@@ -600,7 +671,7 @@ describe('external_directory × git worktrees', () => {
         { surface: 'fs', value: join(wt, 'a.ts') },
         { surface: 'fs', value: unrelated },
       ],
-      repo
+      { cwd: repo }
     )
     expect(verdict?.action).toBe('ask')
     expect(verdict?.absPath).toBe(unrelated)
@@ -616,7 +687,7 @@ describe('external_directory × git worktrees', () => {
     const verdict = evaluateExternalDirectory(
       cfg,
       [{ surface: 'fs', value: join(wt, 'a.ts') }],
-      repo
+      { cwd: repo }
     )
     expect(verdict?.action).toBe('ask')
   })
@@ -632,7 +703,7 @@ describe('external_directory × git worktrees', () => {
     const verdict = evaluateExternalDirectory(
       cfg,
       [{ surface: 'fs', value: join(repo, 'README.md') }],
-      cwd
+      { cwd: cwd }
     )
     expect(verdict?.action).toBe('allow')
     expect(verdict?.viaWorktree).toBe(true)
@@ -648,7 +719,7 @@ describe('external_directory × git worktrees', () => {
     const verdict = evaluateExternalDirectory(
       cfg,
       [{ surface: 'fs', value: join(tmp, 'somewhere-else.txt') }],
-      bare
+      { cwd: bare }
     )
     expect(verdict?.action).toBe('ask')
   })

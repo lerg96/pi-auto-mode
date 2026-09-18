@@ -52,6 +52,7 @@
   "mode": "default",
   "confineToWorkingDirectory": true,
   "trustGitWorktrees": true,
+  "externalDirectoryTools": ["bash", "write", "edit", "read"],
   "classifier": {
     "enabled": true,
     "llm": {
@@ -77,7 +78,9 @@
     "promptMaxRows": 10,
     "promptFieldMaxWidth": 80,
     "showClassifierRisk": true,
-    "modalTimeoutMs": 120000
+    "modalTimeoutMs": 120000,
+    "subagentModalTimeoutMs": 120000,
+    "noUiAsks": "bubble"
   },
   "telemetry": { "enabled": false, "path": "" }
 }

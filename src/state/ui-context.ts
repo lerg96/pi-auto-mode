@@ -1,4 +1,5 @@
 import type { ExtensionUI } from '../pi-sdk.ts'
+import { publishUi } from './ui-registry.ts'
 
 /**
  * Snapshot of the UI surface exposed on `ctx.ui` at the time the most recent
@@ -27,10 +28,14 @@ export function setUiContext(
   hasUI: boolean
 ): void {
   if (!ui || !hasUI) {
+    // A session without UI (print mode, or a child session whose harness never
+    // passed a `uiContext`) must not erase the parent's published UI: that
+    // handle is what lets an ask raised here still reach the human.
     current = null
     return
   }
   current = { ui, hasUI }
+  publishUi(ui)
 }
 
 /**

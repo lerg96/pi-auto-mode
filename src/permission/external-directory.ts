@@ -386,21 +386,51 @@ export function selectPathCandidates(rawTokens: string[]): string[] {
   return out
 }
 
+export interface ExternalScopeOptions {
+  /** Base for relative paths; defaults to process.cwd(). */
+  cwd?: string
+  /**
+   * Tool being gated. Checked against `externalDirectoryTools`: a tool that
+   * is not listed has NO opinion from this layer (its cascade verdict stands,
+   * even when it touches paths outside cwd).
+   */
+  toolName?: string
+}
+
+/**
+ * Does the external_directory layer apply to this tool? `externalDirectoryTools`
+ * holds globs over the tool NAME (`*` = todas, default).
+ *
+ * An unknown tool name keeps being validated: treating `undefined` as "not
+ * listed" would switch the whole layer off on any caller that forgot to pass
+ * the name, which is the opposite of fail-closed.
+ */
+export function externalScopeAppliesTo(
+  cfg: Config,
+  toolName?: string
+): boolean {
+  if (toolName === undefined) return true
+  const patterns = cfg.externalDirectoryTools ?? ['*']
+  return patterns.some((pattern) => wildcardMatch(pattern, toolName))
+}
+
 /**
  * Evaluates the external_directory scope. Returns undefined (no opinion) when
- * the flag is off, when no intent touches a path outside cwd, or when all
- * values are internal. Otherwise returns the explicit glob match (last match
- * across sources, last matching key within a map) or a default 'ask'.
+ * the flag is off, when the tool is outside `externalDirectoryTools`, when no
+ * intent touches a path outside cwd, or when all values are internal.
+ * Otherwise returns the explicit glob match (last match across sources, last
+ * matching key within a map) or a default 'ask'.
  * Never throws: any evaluation error resolves to a fail-closed deny.
  */
 export function evaluateExternalDirectory(
   cfg: Config,
   intents: ExternalIntent[],
-  cwd?: string
+  opts?: ExternalScopeOptions
 ): ExternalVerdict | undefined {
   try {
     if (cfg.confineToWorkingDirectory !== true) return undefined
-    const base = cwd ?? process.cwd()
+    if (!externalScopeAppliesTo(cfg, opts?.toolName)) return undefined
+    const base = opts?.cwd ?? process.cwd()
     const outside: Array<{
       abs: string
       value: string

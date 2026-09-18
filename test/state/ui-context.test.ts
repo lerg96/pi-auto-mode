@@ -3,6 +3,7 @@ import {
   getUiContext,
   notifyUi,
 } from '../../src/state/ui-context.ts'
+import { borrowUi, resetUiRegistry } from '../../src/state/ui-registry.ts'
 
 function makeFakeUi() {
   return {
@@ -17,9 +18,11 @@ function makeFakeUi() {
 
 describe('ui-context holder', () => {
   // Always start each test from a clean holder so leakage across cases
-  // cannot mask a regression.
+  // cannot mask a regression. The process registry is separate state (it
+  // survives a UI-less on purpose), so it needs its own reset.
   afterEach(() => {
     setUiContext(undefined, false)
+    resetUiRegistry()
   })
 
   it('returns null when no UI has been bound', () => {
@@ -64,6 +67,27 @@ describe('ui-context holder', () => {
     expect(getUiContext()?.ui).toBe(a)
     setUiContext(b as never, true)
     expect(getUiContext()?.ui).toBe(b)
+  })
+
+  it('publica en el registro de proceso solo cuando hasUI es true', () => {
+    const ui = makeFakeUi()
+    setUiContext(ui as never, false)
+    // El no-op de pi nunca es un objetivo de prompt: publicarlo fabricaría
+    // decisiones humanas en sesiones headless.
+    expect(borrowUi()).toBeUndefined()
+    setUiContext(ui as never, true)
+    expect(borrowUi()).toBe(ui)
+  })
+
+  it('un evento sin UI NO borra la UI publicada por la sesión padre', () => {
+    // Caso real: la sub-sesión de pi-subagents recibe todos sus eventos con
+    // hasUI === false; si eso limpiara el registro, el modal del padre no
+    // tendría dónde renderizarse.
+    const parent = makeFakeUi()
+    setUiContext(parent as never, true)
+    setUiContext(undefined, false)
+    expect(getUiContext()).toBeNull()
+    expect(borrowUi()).toBe(parent)
   })
 })
 

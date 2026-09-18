@@ -15,7 +15,7 @@ import { evaluatePermission } from '../permission/visibility.ts'
 import { evaluateExternalDirectory } from '../permission/external-directory.ts'
 import { wildcardMatch } from '../permission/wildcard-matcher.ts'
 import { normalizeToolCall, type AccessIntent } from './normalize.ts'
-import { getAskResolver } from './ask.ts'
+import { getAskResolver, normalizeAskDecision, type AskVia } from './ask.ts'
 import { BUS_CHANNEL_DECISION } from '../events.ts'
 import { redactSecretsForModel } from '../classifier/secret-guard.ts'
 import { redact } from '../telemetry/telemetry.ts'
@@ -125,8 +125,14 @@ export interface GateDeps {
 
 interface AskAudit {
   requestId?: string
-  decidedBy: 'user' | 'session'
-  via: 'modal' | 'session-rules'
+  // 'no-ui' = no se mostró ningún modal: no hubo humano que decidiera. Darlo
+  // como 'user' falsea la auditoría (y entrena al modelo con datos falsos).
+  // 'timeout' = se mostró, pero nadie respondió antes de expirar.
+  decidedBy: 'user' | 'session' | 'no-ui' | 'timeout'
+  // 'parent-modal' = el modal se renderizó en la UI de otra sesión del
+  // proceso (sub-sesión sin UI propia). Derivado de AskVia para que el gate no
+  // pueda quedarse atrás cuando ask.ts añade un origen nuevo.
+  via: AskVia | 'session-rules'
   matchedPattern?: string
   denialReason?: string
 }
@@ -149,6 +155,23 @@ function emit(
     })
   } catch {
     /* fire-and-forget */
+  }
+}
+
+// Quién hay detrás de la decisión de un ask. `no-ui` nunca es un usuario: no
+// se mostró ningún prompt, así que atribuirla a una persona falsea la
+// auditoría y el mensaje que recibe el modelo. Lo mismo con `timeout` (nadie
+// respondió) y `session-rules` (quién decidió fue una aprobación previa).
+function askActor(via: AskAudit['via']): AskAudit['decidedBy'] {
+  switch (via) {
+    case 'no-ui':
+      return 'no-ui'
+    case 'timeout':
+      return 'timeout'
+    case 'session-rules':
+      return 'session'
+    default:
+      return 'user'
   }
 }
 
@@ -231,8 +254,9 @@ async function handleClassifierBlock(
   // action === 'ask-user'
   let requestId: string
   let verdict: AskVerdict = 'allow'
+  let via: AskAudit['via'] = 'modal'
   try {
-    ;({ requestId, verdict } = await resolveAsk(
+    ;({ requestId, verdict, via } = await resolveAsk(
       surface,
       value,
       risk,
@@ -246,8 +270,8 @@ async function handleClassifierBlock(
     if (err instanceof AskDeniedError) {
       emit(deps.hooks, surface, value, 'deny', 'classifier_block_override', {
         requestId: err.audit.requestId,
-        decidedBy: 'user',
-        via: 'modal',
+        decidedBy: err.audit.decidedBy,
+        via: err.audit.via,
         userVerdict: 'deny',
         ...detail('ask-user'),
       })
@@ -260,8 +284,8 @@ async function handleClassifierBlock(
   }
   emit(deps.hooks, surface, value, 'allow', 'classifier_block_override', {
     requestId,
-    decidedBy: 'user',
-    via: 'modal',
+    decidedBy: askActor(via),
+    via,
     ...verdictExtra(verdict),
     ...detail('ask-user'),
   })
@@ -368,6 +392,32 @@ function verdictExtra(verdict: AskVerdict): {
   return verdict === 'session' ? {} : { userVerdict: verdict }
 }
 
+// El mensaje al modelo tiene que decir la verdad: si no hubo UI nadie negó la
+// llamada, y un prompt expirado tampoco es una decisión de una persona.
+function askDenial(
+  via: AskAudit['via'],
+  requestId: string,
+  denialReason?: string
+): AskDeniedError {
+  const suffix = denialReason ? ` (${denialReason})` : ''
+  if (via === 'no-ui') {
+    return new AskDeniedError(
+      `Permission denied without asking: this session has no UI, so no user could approve it${suffix}. Run pi interactively, or allow the action in config.`,
+      { requestId, decidedBy: 'no-ui', via, denialReason }
+    )
+  }
+  if (via === 'timeout') {
+    return new AskDeniedError(
+      `Permission denied: the confirmation prompt expired without an answer${suffix}. Nothing ran; ask the user to approve it, or allow it in the config.`,
+      { requestId, decidedBy: 'timeout', via, denialReason }
+    )
+  }
+  return new AskDeniedError(
+    `Permission denied by user${denialReason ? `: ${denialReason}` : ''}`,
+    { requestId, decidedBy: 'user', via, denialReason }
+  )
+}
+
 async function resolveAsk(
   surface: string,
   value: string,
@@ -377,7 +427,7 @@ async function resolveAsk(
   toolName?: string,
   fullCommand?: string,
   startedAt?: number
-): Promise<{ requestId: string; verdict: AskVerdict }> {
+): Promise<{ requestId: string; verdict: AskVerdict; via: AskAudit['via'] }> {
   const requestId =
     globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)
 
@@ -408,7 +458,7 @@ async function resolveAsk(
       }),
     })
     deps.denyService?.onContinueSucceeded()
-    return { requestId, verdict: 'session' }
+    return { requestId, verdict: 'session', via: 'session-rules' }
   }
 
   const ruleForResolver = matchedRule
@@ -429,28 +479,24 @@ async function resolveAsk(
     tool: toolName,
     fullCommand,
   })
-  const decision = typeof res === 'string' ? res : res.decision
-  const reason = typeof res === 'string' ? undefined : res.reason
+  const { decision, reason, via } = normalizeAskDecision(res)
 
   if (decision === 'allow') {
     deps.denyService?.onContinueSucceeded()
-    return { requestId, verdict: 'allow' }
+    return { requestId, verdict: 'allow', via }
   }
   if (decision === 'allow_session') {
     deps.denyService?.onContinueSucceeded()
     // Persist exact value for catch-all patterns
     const safePattern = value
     deps.sessionRules.approveForSession(surface, safePattern, 'allow')
-    return { requestId, verdict: 'allow_session' }
+    return { requestId, verdict: 'allow_session', via }
   }
   // Plain 'deny' carries no user-typed reason: inherit the reason shown in
   // the modal header (permission-rule reason first, classifier risk
   // second) so the model still learns why it was denied.
   const denialReason = reason ?? matchedRule?.reason ?? risk?.reason
-  throw new AskDeniedError(
-    `Permission denied by user${denialReason ? `: ${denialReason}` : ''}`,
-    { requestId, decidedBy: 'user', via: 'modal', denialReason }
-  )
+  throw askDenial(via, requestId, denialReason)
 }
 
 async function aggregateClassify(
@@ -526,7 +572,7 @@ export async function gateToolCall(
   const deniedIntent = intents.find((i) => i.surface === 'denied')
   if (deniedIntent) {
     try {
-      const { requestId, verdict } = await resolveAsk(
+      const { requestId, verdict, via } = await resolveAsk(
         toolName,
         deniedIntent.value,
         undefined,
@@ -544,8 +590,8 @@ export async function gateToolCall(
         'unknown_tool_ask',
         {
           requestId,
-          decidedBy: 'user',
-          via: 'modal',
+          decidedBy: askActor(via),
+          via,
           ...verdictExtra(verdict),
           ...buildDecisionDetail({
             toolName,
@@ -641,7 +687,7 @@ export async function gateToolCall(
   // Only tightens: overwrite permAction ONLY when strictly more restrictive
   // (deny > ask > allow), so an explicit tool deny always beats an explicit
   // external allow. Reporting follows the triggering intent (not intent[0]).
-  const externalVerdict = evaluateExternalDirectory(cfg, intents)
+  const externalVerdict = evaluateExternalDirectory(cfg, intents, { toolName })
   if (externalVerdict !== undefined) {
     const rank = { allow: 0, ask: 1, deny: 2 } as const
     if (rank[externalVerdict.action] > rank[permAction]) {
@@ -849,7 +895,7 @@ export async function gateToolCall(
     reason: ruleReason,
   }
   try {
-    const { requestId, verdict } = await resolveAsk(
+    const { requestId, verdict, via } = await resolveAsk(
       askSurface,
       askValue,
       agg.risk,
@@ -861,8 +907,8 @@ export async function gateToolCall(
     )
     emit(deps.hooks, askSurface, askValue, 'allow', resolution, {
       requestId,
-      decidedBy: 'user',
-      via: 'modal',
+      decidedBy: askActor(via),
+      via,
       ...verdictExtra(verdict),
       ...buildDecisionDetail({
         toolName,

@@ -85,6 +85,83 @@ describe('ui.modalTimeoutMs', () => {
   })
 })
 
+describe('externalDirectoryTools', () => {
+  it("defaults to ['*'] (todas las tools) para no perder validación al subir de versión", () => {
+    expect(parseConfig({}).externalDirectoryTools).toEqual(['*'])
+    expect(DEFAULT_CONFIG.externalDirectoryTools).toEqual(['*'])
+  })
+
+  it('acepta una lista de nombres y globs', () => {
+    const cfg = parseConfig({
+      externalDirectoryTools: ['bash', 'write', 'mcp__*'],
+    })
+    expect(cfg.externalDirectoryTools).toEqual(['bash', 'write', 'mcp__*'])
+  })
+
+  it('acepta [] explícito (capa apagada para todas las tools)', () => {
+    expect(
+      parseConfig({ externalDirectoryTools: [] }).externalDirectoryTools
+    ).toEqual([])
+  })
+
+  it('rechaza strings vacíos y valores que no son strings', () => {
+    expect(() => parseConfig({ externalDirectoryTools: [''] })).toThrow()
+    expect(() => parseConfig({ externalDirectoryTools: [42] })).toThrow()
+    expect(() => parseConfig({ externalDirectoryTools: 'bash' })).toThrow()
+  })
+
+  it('config.example.json lista bash, write y read', () => {
+    const raw = JSON.parse(readFileSync(EXAMPLE_PATH, 'utf8'))
+    expect(parseConfig(raw).externalDirectoryTools).toEqual([
+      'bash',
+      'write',
+      'read',
+    ])
+  })
+})
+
+describe('ui.subagentModalTimeoutMs', () => {
+  it('defaults to 120000 (2 min) when omitted', () => {
+    expect(parseConfig({}).ui.subagentModalTimeoutMs).toBe(120000)
+  })
+
+  it('acepta -1 (ilimitado) y valores distintos a modalTimeoutMs', () => {
+    const cfg = parseConfig({
+      ui: { modalTimeoutMs: -1, subagentModalTimeoutMs: 30000 },
+    })
+    expect(cfg.ui.modalTimeoutMs).toBe(-1)
+    expect(cfg.ui.subagentModalTimeoutMs).toBe(30000)
+  })
+
+  it('rechaza no-enteros (mismo contrato que modalTimeoutMs)', () => {
+    expect(() => parseConfig({ ui: { subagentModalTimeoutMs: 1.5 } })).toThrow()
+  })
+
+  it('config.example.json trae la clave explícita', () => {
+    const raw = JSON.parse(readFileSync(EXAMPLE_PATH, 'utf8'))
+    expect(parseConfig(raw).ui.subagentModalTimeoutMs).toBe(120000)
+  })
+})
+
+describe('ui.noUiAsks', () => {
+  it("defaults to 'bubble' (sub-sesiones sin UI usan la UI del padre)", () => {
+    expect(parseConfig({}).ui.noUiAsks).toBe('bubble')
+  })
+
+  it("acepta 'deny' (comportamiento histórico: denegar sin preguntar)", () => {
+    expect(parseConfig({ ui: { noUiAsks: 'deny' } }).ui.noUiAsks).toBe('deny')
+  })
+
+  it('rechaza valores desconocidos (fail-closed en la carga de config)', () => {
+    expect(() => parseConfig({ ui: { noUiAsks: 'yolo' } })).toThrow()
+  })
+
+  it('config.example.json sigue parseando con la clave nueva', () => {
+    const raw = JSON.parse(readFileSync(EXAMPLE_PATH, 'utf8'))
+    expect(parseConfig(raw).ui.noUiAsks).toBe('bubble')
+  })
+})
+
 describe('telemetry default path', () => {
   it('defaults telemetry.path to ~/.pi/pi-auto-mode.jsonl when the field is missing', () => {
     const cfg = parseConfig({})
@@ -183,7 +260,7 @@ describe('permissionSets use permissions block (no priority, no rules)', () => {
     expect(() =>
       parseConfig({
         permissionSets: {
-          // @ts-expect-error: invalid action
+          // Rechazado en runtime (zod), no por el typechecker: invalid action
           a: { permissions: { tools: { bash: 'permit' } } },
         },
       })
@@ -193,7 +270,7 @@ describe('permissionSets use permissions block (no priority, no rules)', () => {
   it('rejects priority field (removed in Phase 1)', () => {
     expect(() =>
       parseConfig({
-        // @ts-expect-error: testing runtime rejection
+        // Rechazado en runtime (zod), no por el typechecker: testing runtime rejection
         permissionSets: { a: { priority: 0, permissions: {} } },
       })
     ).toThrow()
@@ -202,7 +279,7 @@ describe('permissionSets use permissions block (no priority, no rules)', () => {
   it('rejects rules field (removed in Phase 1)', () => {
     expect(() =>
       parseConfig({
-        // @ts-expect-error: testing runtime rejection
+        // Rechazado en runtime (zod), no por el typechecker: testing runtime rejection
         permissionSets: { a: { rules: [], permissions: {} } },
       })
     ).toThrow()
@@ -386,19 +463,19 @@ describe('classifier.onBlockUserOverride', () => {
   it('rejects non-boolean values (string, number, null)', () => {
     expect(() =>
       parseConfig({
-        // @ts-expect-error: invalid type
+        // Rechazado en runtime (zod), no por el typechecker: invalid type
         classifier: { onBlockUserOverride: 'yes' },
       })
     ).toThrow()
     expect(() =>
       parseConfig({
-        // @ts-expect-error: invalid type
+        // Rechazado en runtime (zod), no por el typechecker: invalid type
         classifier: { onBlockUserOverride: 1 },
       })
     ).toThrow()
     expect(() =>
       parseConfig({
-        // @ts-expect-error: invalid type
+        // Rechazado en runtime (zod), no por el typechecker: invalid type
         classifier: { onBlockUserOverride: null },
       })
     ).toThrow()
@@ -415,7 +492,7 @@ describe('root-level tools map (removed in Phase 1)', () => {
   it('rejects root-level tools field', () => {
     expect(() =>
       parseConfig({
-        // @ts-expect-error: testing runtime rejection of removed field
+        // Rechazado en runtime (zod), no por el typechecker: testing runtime rejection of removed field
         tools: { agent_send_message: 'agent' },
       })
     ).toThrow()
@@ -441,7 +518,7 @@ describe('trustGitWorktrees (external_directory × git worktrees)', () => {
     for (const bad of ['true', 1, null, {}]) {
       expect(() =>
         parseConfig({
-          // @ts-expect-error: testing runtime rejection of non-boolean
+          // Rechazado en runtime (zod), no por el typechecker: testing runtime rejection of non-boolean
           trustGitWorktrees: bad,
         })
       ).toThrow()

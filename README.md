@@ -164,6 +164,28 @@ Opt-in via `confineToWorkingDirectory` (default `false` = no change). When activ
 }
 ```
 
+#### Which tools get validated (`externalDirectoryTools`)
+
+The scope is a **path** check, so by default it runs for every tool that can name a path. `externalDirectoryTools` narrows that to a list of tool-name globs (`*` and `?`, the same matcher as `permissions.tools` patterns). Default `['*']`.
+
+```json
+{
+  "confineToWorkingDirectory": true,
+  "externalDirectoryTools": ["bash", "write", "read"],
+  "permissions": {
+    "tools": { "read": "allow", "write": "ask" },
+    "external_directory": { "~/secrets/*": "deny" }
+  }
+}
+```
+
+With that config, `write` still asks for anything outside cwd and both tools are stopped by `~/secrets/*`, but a tool that is **not** listed (say `edit`) never reaches this layer: its cascaded verdict stands, so an `allow` for `edit` reads and writes anywhere on disk. This is deliberate — it lets you pay the path check only where you want it — but it is a **removal of hardening**, not an addition:
+
+- The list only takes away the external-directory opinion. It never relaxes a `deny`/`ask` coming from `permissions.tools`.
+- `[]` disables the layer for every tool (equivalent to leaving `confineToWorkingDirectory` off, except the rules stay written down).
+- Keep every tool that can touch the filesystem in the list. In this runtime that is `read`, `write`, `edit`, `bash` (plus `find`/`grep`/`ls` and any `mcp__*` tool with path arguments) — add them if you use them, or use a glob like `"mcp__*"`.
+- A tool call whose name is unknown to the gate is still validated: a missing name never switches the layer off.
+
 #### Git worktrees (`trustGitWorktrees`)
 
 `git worktree add ../feature-wt` puts a second checkout of the **same repository** outside `process.cwd()`, and a sub-agent working there (cwd is still the original checkout) used to hit an `ask` on every write. With `trustGitWorktrees: true` (default, only consulted when `confineToWorkingDirectory` is on), a path that matches **no** `external_directory` rule and lives under one of the repository's registered worktrees counts as internal.

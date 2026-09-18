@@ -52,6 +52,7 @@
   "mode": "default",
   "confineToWorkingDirectory": true,
   "trustGitWorktrees": true,
+  "externalDirectoryTools": ["bash", "write", "read"],
   "classifier": {
     "enabled": true,
     "llm": {

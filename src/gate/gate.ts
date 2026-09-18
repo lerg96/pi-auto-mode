@@ -687,7 +687,7 @@ export async function gateToolCall(
   // Only tightens: overwrite permAction ONLY when strictly more restrictive
   // (deny > ask > allow), so an explicit tool deny always beats an explicit
   // external allow. Reporting follows the triggering intent (not intent[0]).
-  const externalVerdict = evaluateExternalDirectory(cfg, intents)
+  const externalVerdict = evaluateExternalDirectory(cfg, intents, { toolName })
   if (externalVerdict !== undefined) {
     const rank = { allow: 0, ask: 1, deny: 2 } as const
     if (rank[externalVerdict.action] > rank[permAction]) {

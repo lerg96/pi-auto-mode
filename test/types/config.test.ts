@@ -85,6 +85,41 @@ describe('ui.modalTimeoutMs', () => {
   })
 })
 
+describe('externalDirectoryTools', () => {
+  it("defaults to ['*'] (todas las tools) para no perder validación al subir de versión", () => {
+    expect(parseConfig({}).externalDirectoryTools).toEqual(['*'])
+    expect(DEFAULT_CONFIG.externalDirectoryTools).toEqual(['*'])
+  })
+
+  it('acepta una lista de nombres y globs', () => {
+    const cfg = parseConfig({
+      externalDirectoryTools: ['bash', 'write', 'mcp__*'],
+    })
+    expect(cfg.externalDirectoryTools).toEqual(['bash', 'write', 'mcp__*'])
+  })
+
+  it('acepta [] explícito (capa apagada para todas las tools)', () => {
+    expect(
+      parseConfig({ externalDirectoryTools: [] }).externalDirectoryTools
+    ).toEqual([])
+  })
+
+  it('rechaza strings vacíos y valores que no son strings', () => {
+    expect(() => parseConfig({ externalDirectoryTools: [''] })).toThrow()
+    expect(() => parseConfig({ externalDirectoryTools: [42] })).toThrow()
+    expect(() => parseConfig({ externalDirectoryTools: 'bash' })).toThrow()
+  })
+
+  it('config.example.json lista bash, write y read', () => {
+    const raw = JSON.parse(readFileSync(EXAMPLE_PATH, 'utf8'))
+    expect(parseConfig(raw).externalDirectoryTools).toEqual([
+      'bash',
+      'write',
+      'read',
+    ])
+  })
+})
+
 describe('ui.subagentModalTimeoutMs', () => {
   it('defaults to 120000 (2 min) when omitted', () => {
     expect(parseConfig({}).ui.subagentModalTimeoutMs).toBe(120000)

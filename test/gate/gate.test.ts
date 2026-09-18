@@ -3,7 +3,12 @@ import type { GateDeps } from '../../src/gate/gate.ts'
 import { configState } from '../../src/state/config-state.ts'
 import { SessionRules } from '../../src/permission/session-rules.ts'
 import { DenyAndContinueService } from '../../src/deny/deny-service.ts'
-import { setAskResolver, getAskResolver } from '../../src/gate/ask.ts'
+import { resolve } from 'node:path'
+import {
+  setAskResolver,
+  getAskResolver,
+  defaultAskResolver,
+} from '../../src/gate/ask.ts'
 import type { Config } from '../../src/types/config.ts'
 import type {
   ClassifierInput,
@@ -1198,5 +1203,49 @@ describe('decision training fields: ruleId, strategy, userVerdict', () => {
     // The service routes mode 'auto-retry' to the 'deny-and-continue'
     // action: strategy records the outcome, not the mode.
     expect(detailOf(ev).strategy).toBe('deny-and-continue')
+  })
+})
+
+describe('externalDirectoryTools × gate', () => {
+  const outsidePath = resolve(process.cwd(), '..', 'pi-auto-mode-probe.txt')
+
+  beforeEach(() => {
+    configState.set(config)
+  })
+  afterEach(() => {
+    setAskResolver(defaultAskResolver)
+  })
+
+  it('una tool fuera de la lista no se endurece por external_directory', async () => {
+    configState.set({
+      ...config,
+      confineToWorkingDirectory: true,
+      externalDirectoryTools: ['write'],
+      permissions: { tools: { read: 'allow', write: 'allow' } },
+    })
+    // `read` tiene allow en su cascada y NO está en la lista: la capa de
+    // external_directory opina undefined y el allow manda.
+    await expect(
+      gateToolCall('read', { path: outsidePath }, makeDeps())
+    ).resolves.toBeUndefined()
+
+    // `write` sí está: el ask por defecto de un path externo se materializa.
+    setAskResolver(async () => 'deny')
+    await expect(
+      gateToolCall('write', { path: outsidePath }, makeDeps())
+    ).rejects.toThrow(/denied by user/)
+  })
+
+  it("default ['*'] sigue endureciendo cualquier tool", async () => {
+    configState.set({
+      ...config,
+      confineToWorkingDirectory: true,
+      externalDirectoryTools: ['*'],
+      permissions: { tools: { read: 'allow' } },
+    })
+    setAskResolver(async () => 'deny')
+    await expect(
+      gateToolCall('read', { path: outsidePath }, makeDeps())
+    ).rejects.toThrow()
   })
 })

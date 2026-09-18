@@ -15,7 +15,7 @@ import { evaluatePermission } from '../permission/visibility.ts'
 import { evaluateExternalDirectory } from '../permission/external-directory.ts'
 import { wildcardMatch } from '../permission/wildcard-matcher.ts'
 import { normalizeToolCall, type AccessIntent } from './normalize.ts'
-import { getAskResolver, normalizeAskDecision } from './ask.ts'
+import { getAskResolver, normalizeAskDecision, type AskVia } from './ask.ts'
 import { BUS_CHANNEL_DECISION } from '../events.ts'
 import { redactSecretsForModel } from '../classifier/secret-guard.ts'
 import { redact } from '../telemetry/telemetry.ts'
@@ -127,10 +127,12 @@ interface AskAudit {
   requestId?: string
   // 'no-ui' = no se mostró ningún modal: no hubo humano que decidiera. Darlo
   // como 'user' falsea la auditoría (y entrena al modelo con datos falsos).
-  decidedBy: 'user' | 'session' | 'no-ui'
+  // 'timeout' = se mostró, pero nadie respondió antes de expirar.
+  decidedBy: 'user' | 'session' | 'no-ui' | 'timeout'
   // 'parent-modal' = el modal se renderizó en la UI de otra sesión del
-  // proceso (sub-sesión sin UI propia).
-  via: 'modal' | 'parent-modal' | 'no-ui' | 'session-rules'
+  // proceso (sub-sesión sin UI propia). Derivado de AskVia para que el gate no
+  // pueda quedarse atrás cuando ask.ts añade un origen nuevo.
+  via: AskVia | 'session-rules'
   matchedPattern?: string
   denialReason?: string
 }
@@ -158,9 +160,19 @@ function emit(
 
 // Quién hay detrás de la decisión de un ask. `no-ui` nunca es un usuario: no
 // se mostró ningún prompt, así que atribuirla a una persona falsea la
-// auditoría y el mensaje que recibe el modelo.
-function askActor(via: AskAudit['via']): 'user' | 'no-ui' {
-  return via === 'no-ui' ? 'no-ui' : 'user'
+// auditoría y el mensaje que recibe el modelo. Lo mismo con `timeout` (nadie
+// respondió) y `session-rules` (quién decidió fue una aprobación previa).
+function askActor(via: AskAudit['via']): AskAudit['decidedBy'] {
+  switch (via) {
+    case 'no-ui':
+      return 'no-ui'
+    case 'timeout':
+      return 'timeout'
+    case 'session-rules':
+      return 'session'
+    default:
+      return 'user'
+  }
 }
 
 const RISK_RANK: Record<RiskLevel, number> = { low: 0, medium: 1, high: 2 }
@@ -380,6 +392,32 @@ function verdictExtra(verdict: AskVerdict): {
   return verdict === 'session' ? {} : { userVerdict: verdict }
 }
 
+// El mensaje al modelo tiene que decir la verdad: si no hubo UI nadie negó la
+// llamada, y un prompt expirado tampoco es una decisión de una persona.
+function askDenial(
+  via: AskAudit['via'],
+  requestId: string,
+  denialReason?: string
+): AskDeniedError {
+  const suffix = denialReason ? ` (${denialReason})` : ''
+  if (via === 'no-ui') {
+    return new AskDeniedError(
+      `Permission denied without asking: this session has no UI, so no user could approve it${suffix}. Run pi interactively, or allow the action in config.`,
+      { requestId, decidedBy: 'no-ui', via, denialReason }
+    )
+  }
+  if (via === 'timeout') {
+    return new AskDeniedError(
+      `Permission denied: the confirmation prompt expired without an answer${suffix}. Nothing ran; ask the user to approve it, or allow it in the config.`,
+      { requestId, decidedBy: 'timeout', via, denialReason }
+    )
+  }
+  return new AskDeniedError(
+    `Permission denied by user${denialReason ? `: ${denialReason}` : ''}`,
+    { requestId, decidedBy: 'user', via, denialReason }
+  )
+}
+
 async function resolveAsk(
   surface: string,
   value: string,
@@ -458,18 +496,7 @@ async function resolveAsk(
   // the modal header (permission-rule reason first, classifier risk
   // second) so the model still learns why it was denied.
   const denialReason = reason ?? matchedRule?.reason ?? risk?.reason
-  // El mensaje al modelo tiene que decir la verdad: si no hubo UI, nadie
-  // denegó — la llamada se bloqueó porque no había a quién preguntarle.
-  if (via === 'no-ui') {
-    throw new AskDeniedError(
-      `Permission denied without asking: this session has no UI, so no user could approve it${denialReason ? ` (${denialReason})` : ''}. Run pi interactively, or allow the action in config.`,
-      { requestId, decidedBy: 'no-ui', via, denialReason }
-    )
-  }
-  throw new AskDeniedError(
-    `Permission denied by user${denialReason ? `: ${denialReason}` : ''}`,
-    { requestId, decidedBy: 'user', via, denialReason }
-  )
+  throw askDenial(via, requestId, denialReason)
 }
 
 async function aggregateClassify(

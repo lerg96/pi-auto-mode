@@ -204,6 +204,12 @@ const uiConfig = z
     showClassifierRisk: z.boolean().default(true),
     // -1 = sin timeout (ilimitado). Default 120000 = 2 min.
     modalTimeoutMs: z.number().int().default(120000),
+    // Timeout de los prompts que se renderizan en la UI del padre porque la
+    // sub-sesión no tiene UI propia (ver `noUiAsks`). INDEPENDIENTE de
+    // `modalTimeoutMs`: un sub-agente en background puede dejar el modal
+    // abierto indefinidamente y, mientras tanto, sostiene el lock de prompts
+    // del proceso. -1 = ilimitado.
+    subagentModalTimeoutMs: z.number().int().default(120000),
     // Qué hacer con un ask cuando ESTA sesión no tiene UI (p. ej. una
     // sub-sesión creada por pi-subagents, que nunca recibe `uiContext`).
     //   'bubble' (default): renderizar el modal en la UI de la sesión padre
@@ -227,6 +233,7 @@ const uiConfig = z
     promptFieldMaxWidth: 120,
     showClassifierRisk: true,
     modalTimeoutMs: 120000,
+    subagentModalTimeoutMs: 120000,
     noUiAsks: 'bubble',
   })
 
@@ -409,6 +416,7 @@ export interface UiConfig {
   promptFieldMaxWidth: number
   showClassifierRisk: boolean
   modalTimeoutMs: number
+  subagentModalTimeoutMs: number
   noUiAsks: 'bubble' | 'deny'
   sound?: SoundConfig
 }

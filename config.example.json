@@ -78,6 +78,7 @@
     "promptFieldMaxWidth": 80,
     "showClassifierRisk": true,
     "modalTimeoutMs": 120000,
+    "subagentModalTimeoutMs": 120000,
     "noUiAsks": "bubble"
   },
   "telemetry": { "enabled": false, "path": "" }

@@ -318,11 +318,14 @@ export function createModalAskResolver(
     // and a second modal rendered over the first orphans the first promise.
     const verdict = await withPromptLock(() => runPrompt(req, ui, via))
     // Contrato: `via` solo se declara cuando NO es el caso normal ('modal'),
-    // así que los resolvers que devuelven strings simples siguen valiendo.
-    if (via === 'modal') return verdict
-    return typeof verdict === 'string'
-      ? { decision: verdict, via }
-      : { ...verdict, via }
+    // así que los resolvers que devuelven strings simples siguen valiendo. Un
+    // veredicto que ya traiga `via` (el timeout) manda: describe mejor qué
+    // pasó que el simple «se renderizó aquí».
+    if (typeof verdict === 'string') {
+      return via === 'modal' ? verdict : { decision: verdict, via }
+    }
+    if (via === 'modal' || verdict.via) return verdict
+    return { ...verdict, via }
   }
 
   async function runPrompt(
@@ -371,9 +374,21 @@ export function createModalAskResolver(
 
       // H2: fail-closed timeout driven by config. -1 = unlimited (no timeout);
       // any other value pauses and, on expiry, resolves `deny`.
-      const ms = cfgState.get().ui.modalTimeoutMs
+      // Los prompts que se renderizan en la UI del padre (sub-sesión sin UI)
+      // usan su propio plazo: quien espera es un agente en segundo plano, no la
+      // persona que tiene la terminal delante.
+      const uiCfg = cfgState.get().ui
+      const ms =
+        via === 'parent-modal'
+          ? uiCfg.subagentModalTimeoutMs
+          : uiCfg.modalTimeoutMs
       if (ms !== -1) {
-        timer = setTimeout(() => finish('deny'), ms)
+        // Nadie respondió: no es una decisión del usuario, así que se marca
+        // `via: 'timeout'` en lugar de dejar que se audite como un deny humano.
+        timer = setTimeout(
+          () => finish({ decision: 'deny', via: 'timeout' }),
+          ms
+        )
       }
 
       try {

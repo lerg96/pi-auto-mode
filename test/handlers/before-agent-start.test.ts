@@ -39,6 +39,7 @@ function cfg(partial: Partial<Config>): Config {
       showClassifierRisk: true,
       modalTimeoutMs: 120000,
       noUiAsks: 'bubble',
+      subagentModalTimeoutMs: 120000,
     },
     telemetry: { enabled: false, path: '/tmp/x.jsonl' },
     ...partial,

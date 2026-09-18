@@ -50,9 +50,12 @@ type RenderFn = (
 
 function makeConfigState(
   modalTimeoutMs = 120_000,
-  noUiAsks: 'bubble' | 'deny' = 'bubble'
+  noUiAsks: 'bubble' | 'deny' = 'bubble',
+  subagentModalTimeoutMs = 120_000
 ): typeof configState {
-  const cfg = parseConfig({ ui: { modalTimeoutMs, noUiAsks } })
+  const cfg = parseConfig({
+    ui: { modalTimeoutMs, noUiAsks, subagentModalTimeoutMs },
+  })
   return {
     get: () => cfg,
     set: () => {},
@@ -151,13 +154,24 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
   function makeResolver(
     sessionRules = new SessionRules(),
     modalTimeoutMs = 120_000,
-    pi: ExtensionAPI = makePi()
+    pi: ExtensionAPI = makePi(),
+    subagentModalTimeoutMs = 120_000
   ): ReturnType<typeof createModalAskResolver> {
     return createModalAskResolver(
       pi,
       sessionRules,
-      makeConfigState(modalTimeoutMs)
+      makeConfigState(modalTimeoutMs, 'bubble', subagentModalTimeoutMs)
     )
+  }
+
+  // Publica una UI de proceso y deja la sesión actual SIN UI, que es la forma
+  // real en que llega un ask de una sub-sesión (pi-subagents no pasa
+  // `uiContext`). Devuelve la UI prestada para poder inspeccionarla.
+  function asBorrowedSession(ui: { custom: jest.Mock }): void {
+    setUiContext(ui as never, true)
+    resetUiRegistry()
+    publishUi(ui as never)
+    setUiContext(undefined, false)
   }
 
   // Drive the modal: invoke the captured render to wire up the SettingsList,
@@ -492,7 +506,8 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       const promise = resolver({ surface: 'fs', value: '/tmp/x' })
       expect(renderCapture).toBeUndefined()
       await jest.advanceTimersByTimeAsync(120_000 + 10)
-      expect(await promise).toBe('deny')
+      // Nadie respondió: no se audita como decisión de un usuario.
+      expect(await promise).toEqual({ decision: 'deny', via: 'timeout' })
     } finally {
       jest.useRealTimers()
     }
@@ -752,6 +767,57 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
     expect(typeof onChange).toBe('function')
     onChange!('allow', '❯')
     expect(await promise).toEqual({ decision: 'allow', via: 'parent-modal' })
+  })
+
+  // ─── Plazo propio para prompts de sub-sesión ─────────────────
+  it('uses subagentModalTimeoutMs (not modalTimeoutMs) for a borrowed prompt', async () => {
+    jest.useFakeTimers()
+    try {
+      const pending = makeFakeUi(
+        jest.fn(() => new Promise<undefined>(() => {}))
+      )
+      asBorrowedSession(pending)
+      // modalTimeoutMs ilimitado: si el prompt prestado usara ese valor, esto
+      // no resolvería nunca y el test fallaría por timeout.
+      const resolver = makeResolver(new SessionRules(), -1, makePi(), 500)
+      const promise = resolver({ surface: 'fs', value: '/tmp/x' })
+
+      await jest.advanceTimersByTimeAsync(490)
+      let settled = false
+      void promise.then(() => {
+        settled = true
+      })
+      await Promise.resolve()
+      expect(settled).toBe(false)
+
+      await jest.advanceTimersByTimeAsync(20)
+      expect(await promise).toEqual({ decision: 'deny', via: 'timeout' })
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
+  it('does not apply subagentModalTimeoutMs to the session own prompt', async () => {
+    jest.useFakeTimers()
+    try {
+      // UI propia + plazo de sub-agente cortísimo: el modal normal no debe
+      // cortarse por él (mandan los -1 de modalTimeoutMs).
+      const resolver = makeResolver(new SessionRules(), -1, makePi(), 100)
+      const promise = resolver({ surface: 'fs', value: '/tmp/x' })
+      await jest.advanceTimersByTimeAsync(60_000)
+      let settled = false
+      void promise.then(() => {
+        settled = true
+      })
+      await Promise.resolve()
+      expect(settled).toBe(false)
+
+      renderCapture!(undefined, fakeGlobalTheme, undefined, () => {})
+      captures.onChange!('allow', '❯')
+      expect(await promise).toBe('allow')
+    } finally {
+      jest.useRealTimers()
+    }
   })
 
   // ─── Defensive: ctx.ui.custom() rejection → fail-closed ───────

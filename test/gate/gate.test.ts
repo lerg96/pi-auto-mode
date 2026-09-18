@@ -57,6 +57,7 @@ const config: Config = {
     showClassifierRisk: true,
     modalTimeoutMs: 120000,
     noUiAsks: 'bubble',
+    subagentModalTimeoutMs: 120000,
   },
   telemetry: { enabled: false, path: '' },
 }
@@ -447,6 +448,46 @@ describe('gateToolCall', () => {
     const denial = events.find((e) => e.result === 'deny')
     expect(denial?.via).toBe('no-ui')
     expect(denial?.decidedBy).toBe('no-ui')
+  })
+
+  it('timeout: se audita como timeout, no como decisión de un usuario', async () => {
+    // El prompt se mostró pero nadie respondió: decir «denied by user» sería
+    // otra mentira de auditoría, igual que el caso no-ui.
+    configState.set({
+      ...config,
+      permissions: {
+        tools: {
+          bash: [{ pattern: 'sleep *', action: 'ask', reason: 'lento' }],
+        },
+      },
+    })
+    const events: Array<Record<string, unknown>> = []
+    const deps: GateDeps = {
+      configState,
+      sessionRules: new SessionRules(),
+      hooks: {
+        emit: (_channel: string, data: unknown) => {
+          events.push(data as Record<string, unknown>)
+        },
+      },
+      classify: async (): Promise<ClassifierResult> => ({
+        decision: 'allow',
+      }),
+    }
+    setAskResolver(async () => ({ decision: 'deny', via: 'timeout' }))
+    let message = ''
+    try {
+      await gateToolCall('bash', { command: 'sleep 5' }, deps)
+    } catch (err) {
+      message = (err as Error).message
+    }
+    setAskResolver(getAskResolver())
+
+    expect(message).toContain('expired without an answer')
+    expect(message).not.toMatch(/denied by user/i)
+    const denial = events.find((e) => e.result === 'deny')
+    expect(denial?.via).toBe('timeout')
+    expect(denial?.decidedBy).toBe('timeout')
   })
 
   it('parent-modal: la decisión del padre se audita como decisión humana real', async () => {

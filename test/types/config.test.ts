@@ -85,6 +85,29 @@ describe('ui.modalTimeoutMs', () => {
   })
 })
 
+describe('ui.subagentModalTimeoutMs', () => {
+  it('defaults to 120000 (2 min) when omitted', () => {
+    expect(parseConfig({}).ui.subagentModalTimeoutMs).toBe(120000)
+  })
+
+  it('acepta -1 (ilimitado) y valores distintos a modalTimeoutMs', () => {
+    const cfg = parseConfig({
+      ui: { modalTimeoutMs: -1, subagentModalTimeoutMs: 30000 },
+    })
+    expect(cfg.ui.modalTimeoutMs).toBe(-1)
+    expect(cfg.ui.subagentModalTimeoutMs).toBe(30000)
+  })
+
+  it('rechaza no-enteros (mismo contrato que modalTimeoutMs)', () => {
+    expect(() => parseConfig({ ui: { subagentModalTimeoutMs: 1.5 } })).toThrow()
+  })
+
+  it('config.example.json trae la clave explícita', () => {
+    const raw = JSON.parse(readFileSync(EXAMPLE_PATH, 'utf8'))
+    expect(parseConfig(raw).ui.subagentModalTimeoutMs).toBe(120000)
+  })
+})
+
 describe('ui.noUiAsks', () => {
   it("defaults to 'bubble' (sub-sesiones sin UI usan la UI del padre)", () => {
     expect(parseConfig({}).ui.noUiAsks).toBe('bubble')

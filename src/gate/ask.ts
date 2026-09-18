@@ -27,8 +27,9 @@ export interface AskRequest {
 // semántica.
 // Dónde se materializó la decisión. `parent-modal` = el modal se renderizó en
 // la UI de otra sesión del proceso (sub-sesión sin UI propia); `no-ui` = no se
-// mostró nada a nadie, así que NADIE decidió (no debe auditarse como usuario).
-export type AskVia = 'modal' | 'parent-modal' | 'no-ui'
+// mostró nada a nadie, así que NADIE decidió (no debe auditarse como usuario);
+// `timeout` = el prompt se mostró pero nadie respondió antes de expirar.
+export type AskVia = 'modal' | 'parent-modal' | 'no-ui' | 'timeout'
 
 export type AskDecision =
   | 'allow'

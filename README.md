@@ -123,7 +123,7 @@ The main blocks of `config.example.json`:
 - **`mode`** (top-level, Layer 1) — global visibility mode: `default` (honors the maps as-is), `strict` (collapses `ask` → `deny`), `yolo` (collapses `ask` → `allow`, keeps explicit `deny`s). Switchable live via `/auto-mode:mode`.
 - **`classifier`** — optional LLM layer (`llm`: provider/model/apiKey). **`provider` is a free-form string** (any Pi modelRegistry ID). `ruleBased` block **removed** (trust boundary, allow-exceptions, block rules live in Layer 2). The `fallback` block defines behavior on `onTimeout` / `onError`: `ask-user` (default, fail-closed), `deny` (fail-closed, silent block) or `allow` (opt-in fail-open, rejected by `isSecurityWeakening()` on reload). `onBlock` and `onBlockUserOverride` control what happens after a classifier block.
 - **`denyStrategy`** — post-block strategy (Layer 4): `auto-retry` (canonical, formerly `deny-and-continue`), `ask-user` (immediate modal) or `both` (auto-retry with escalation). See [Deny strategy](#deny-strategy).
-- **`ui`** — confirmation UI behavior (`promptMaxRows`, `promptFieldMaxWidth`, `showClassifierRisk`, `modalTimeoutMs`). **`doublePressToConfirm` removed** (deprecated).
+- **`ui`** — confirmation UI behavior (`promptMaxRows`, `promptFieldMaxWidth`, `showClassifierRisk`, `modalTimeoutMs`, `noUiAsks`). **`doublePressToConfirm` removed** (deprecated).
 - **`telemetry`** — event logging (enableable with optional path; see [Telemetry with default path](#telemetry-with-default-path)).
 
 ### Global modes
@@ -214,12 +214,13 @@ Limits are controlled in `denyStrategy.escalation`: `consecutive` (run of consec
 
 ### `ui` block
 
-| Field                 | Type      | Default  | Description                                                                                               |
-| --------------------- | --------- | -------- | --------------------------------------------------------------------------------------------------------- |
-| `promptMaxRows`       | `number`  | `10`     | Max visible rows in the tool-call preview inside the modal.                                               |
-| `promptFieldMaxWidth` | `number`  | `80`     | Max width of the value field shown in the modal.                                                          |
-| `showClassifierRisk`  | `boolean` | `true`   | Shows the classifier risk level (`low`/`medium`/`high`) and reason in the description.                    |
-| `modalTimeoutMs`      | `number`  | `120000` | Max time (ms) the modal waits for a decision before resolving to `deny` (fail-closed). `-1` = no timeout. |
+| Field                 | Type      | Default  | Description                                                                                                                                                                                                                                                                                                                    |
+| --------------------- | --------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `promptMaxRows`       | `number`  | `10`     | Max visible rows in the tool-call preview inside the modal.                                                                                                                                                                                                                                                                    |
+| `promptFieldMaxWidth` | `number`  | `80`     | Max width of the value field shown in the modal.                                                                                                                                                                                                                                                                               |
+| `showClassifierRisk`  | `boolean` | `true`   | Shows the classifier risk level (`low`/`medium`/`high`) and reason in the description.                                                                                                                                                                                                                                         |
+| `modalTimeoutMs`      | `number`  | `120000` | Max time (ms) the modal waits for a decision before resolving to `deny` (fail-closed). `-1` = no timeout.                                                                                                                                                                                                                      |
+| `noUiAsks`            | `string`  | `bubble` | What an `ask` does when **this session** has no UI (e.g. a sub-agent session created by another extension, which never receives a `uiContext`). `bubble` renders the modal on the parent session's UI if this process has one; `deny` rejects without asking. Has no effect in headless `pi -p`, where nothing publishes a UI. |
 
 > Any live config reload that would **weaken** security (disabling the classifier, relaxing the deny, introducing fail-opens, or allows over restricted surfaces) is rejected and the previous config is kept.
 
@@ -281,11 +282,25 @@ The modal has a fail-closed timer controlled by `ui.modalTimeoutMs`:
 
 The timeout is read from the live config (not a snapshot), so a mid-session reload changes behavior without restarting.
 
+### Sub-sessions without a UI (`ui.noUiAsks`)
+
+Pi binds a session's extension runner to a real UI only when the harness hands one over: interactive TUI and RPC do, `pi -p` (print/JSON) does not. A session created **inside** the process by another extension inherits whatever the creator passed — `@tintinweb/pi-subagents`, for example, binds child sessions with no `uiContext`, so every one of their events reports `ctx.hasUI === false` and an `ask` raised there has nowhere to render.
+
+With `ui.noUiAsks: "bubble"` (default) the extension keeps a process-wide handle on the last UI that reported itself dialog-capable (`Symbol.for('pi-auto-mode:ui-registry')`, because Pi re-evaluates extension modules per session and a child session with another working directory does not share module state) and renders the modal there. The prompt says it was `raised by a child session`, since it is not about the session in front of you.
+
+Rules of that path:
+
+- A UI is published **only** when `ctx.hasUI` was true. Pi's no-op context is never published: it answers `select() → undefined` / `confirm() → false`, which would be a fabricated human decision.
+- Nothing is published in `pi -p` / JSON mode, so headless runs keep denying — `hasUI` stays false exactly as in the parent.
+- Prompts take a process-wide lock: Pi owns a single extension selector, and a second modal rendered over the first would orphan the first promise (a sub-agent hanging forever, especially with `modalTimeoutMs: -1`).
+- `ui.noUiAsks: "deny"` restores the historical behavior: no UI, no question, deny.
+- This is a workaround for those child sessions only. Extensions that prompt through their own `ui.confirm()` inside a UI-less session are still denied, because their `ctx.hasUI` is still false — the real fix is passing `uiContext` when the session is bound (upstream).
+
 ### Modal fail-closed invariants
 
 The modal preserves the extension's **fail-closed** principle. Any exit path that isn't an explicit user decision ends in `'deny'`:
 
-- `!pi.ui` → `'deny'` (no TUI, no asking).
+- No UI bound for this session **and** nothing borrowable in the process (`pi -p`, or `ui.noUiAsks: "deny"`) → `{ decision: 'deny', via: 'no-ui' }`, with no modal and no user attribution.
 - `pi.ui.custom(...).catch(...)` → `'deny'` (any UI error).
 - `try { ... } catch { settleDeny() }` → `'deny'` (sync exception while building the modal).
 - Overlay `onExit` → `'deny'` (the user closes the overlay with another key).
@@ -342,8 +357,8 @@ Emitted when **resolving** each tool call. The base shape is always `{ surface, 
     | 'unknown_tool',
   // Only when resolution is 'permission_ask' or 'classifier_ask':
   requestId?: string,
-  decidedBy?: 'user',
-  via?: 'modal',
+  decidedBy?: 'user' | 'no-ui',
+  via?: 'modal' | 'parent-modal' | 'no-ui' | 'session-rules',
   matchedPattern?: string,     // pattern of the rule that triggered the ask
   denialReason?: string       // present only if the user picked "Deny with reason" and typed something
 }
@@ -354,6 +369,7 @@ Notes:
 - `denialReason` travels **only** on the ask path (not on automatic classifier or trust-boundary denials).
 - `matchedPattern` identifies which rule (permission or classifier) was the representative for the ask — useful to understand why the user had to decide.
 - `result: 'deny'` + `resolution: 'permission_ask'` + `denialReason` is the canonical signal that the model is about to receive `Permission denied by user: <reason>`.
+- `via: 'parent-modal'` means the modal was rendered on another session's UI (a sub-session asked, the human answered in the parent window) — it is still a real human decision. `via: 'no-ui'` / `decidedBy: 'no-ui'` means **nobody was asked**: the call was blocked because no prompt could be shown, and the model receives `Permission denied without asking: ...` instead of a claim about what the user decided.
 
 ### Minimal config example (config.example.json)
 
@@ -429,7 +445,8 @@ Notes:
     "promptMaxRows": 10,
     "promptFieldMaxWidth": 80,
     "showClassifierRisk": true,
-    "modalTimeoutMs": 120000
+    "modalTimeoutMs": 120000,
+    "noUiAsks": "bubble"
   },
   "telemetry": { "enabled": false, "path": "" }
 }

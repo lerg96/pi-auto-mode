@@ -1,12 +1,18 @@
-import type { AskDecision, AskResolver, AskRequest } from '../gate/ask.ts'
+import type {
+  AskDecision,
+  AskResolver,
+  AskRequest,
+  AskVia,
+} from '../gate/ask.ts'
 import {
   SettingsList,
   type SettingItem,
   type SettingsListTheme,
 } from '@earendil-works/pi-tui'
-import type { CustomComponent } from '../pi-sdk.ts'
+import type { CustomComponent, ExtensionUI } from '../pi-sdk.ts'
 import { emitUiPrompt } from './ui-prompt.ts'
 import { getUiContext } from '../state/ui-context.ts'
+import { borrowUi, withPromptLock } from '../state/ui-registry.ts'
 import { playNotificationSound, type SoundPlayer } from './sound.ts'
 import type { configState } from '../state/config-state.ts'
 import type { SessionRules } from '../permission/session-rules.ts'
@@ -133,8 +139,15 @@ function headerRow(
  * second, '—' when neither exists). A `risk` row with score/level is
  * appended only when classifier risk is present.
  */
-function buildHeader(req: AskRequest, slTheme: SettingsListTheme): string[] {
+function buildHeader(
+  req: AskRequest,
+  slTheme: SettingsListTheme,
+  subtitle?: string
+): string[] {
   const lines = [slTheme.label('Permission Required', true)]
+  // A prompt borrowed into the parent session must say so: the user is being
+  // asked about a tool call that is NOT from the session in front of them.
+  if (subtitle) lines.push(slTheme.hint(subtitle))
   lines.push(
     headerRow(slTheme.hint, 'tool', sanitizeForLabel(req.tool ?? req.surface))
   )
@@ -280,14 +293,43 @@ export function createModalAskResolver(
     // after the user selects 'allow'. Accept the arg for symmetry / future use.
 
     const bound = getUiContext()
-    if (!bound || !bound.hasUI) {
-      // Fail-closed: there is no UI to ask the user. This branch is the
-      // primary fix for the invisible-modal bug — previously it returned
-      // 'deny' silently because `pi.ui` was undefined at runtime; now it
-      // also returns 'deny' for legitimate no-UI runtimes (print / RPC).
-      return 'deny'
+    let ui: ExtensionUI
+    let via: AskVia
+    if (bound?.hasUI) {
+      ui = bound.ui
+      via = 'modal'
+    } else {
+      // This session cannot prompt. Either deny (fail-closed, the historical
+      // behaviour) or borrow the UI another session in this process published
+      // — see state/ui-registry.ts for why that handle exists and when it is
+      // legitimately absent (headless `pi -p` never publishes).
+      const borrowed =
+        cfgState.get().ui.noUiAsks === 'bubble' ? borrowUi() : undefined
+      if (!borrowed) {
+        // Nobody was asked. Reported as `via: 'no-ui'` so telemetry and the
+        // model-facing message never claim a human denial.
+        return { decision: 'deny', via: 'no-ui' }
+      }
+      ui = borrowed
+      via = 'parent-modal'
     }
-    const ui = bound.ui
+
+    // One prompt at a time per process: pi owns a single extension selector,
+    // and a second modal rendered over the first orphans the first promise.
+    const verdict = await withPromptLock(() => runPrompt(req, ui, via))
+    // Contrato: `via` solo se declara cuando NO es el caso normal ('modal'),
+    // así que los resolvers que devuelven strings simples siguen valiendo.
+    if (via === 'modal') return verdict
+    return typeof verdict === 'string'
+      ? { decision: verdict, via }
+      : { ...verdict, via }
+  }
+
+  async function runPrompt(
+    req: AskRequest,
+    ui: ExtensionUI,
+    via: AskVia
+  ): Promise<AskDecision> {
     let remindTimer: ReturnType<typeof setInterval> | undefined
 
     // Sound notification (opt-in via ui.sound): chime on open + reminders
@@ -340,7 +382,13 @@ export function createModalAskResolver(
             close = closeOverlay
             const slTheme = buildSettingsListTheme(theme as GlobalTheme)
             const view = new ModalView(
-              buildHeader(req, slTheme),
+              buildHeader(
+                req,
+                slTheme,
+                via === 'parent-modal'
+                  ? 'raised by a child session (this one has no UI)'
+                  : undefined
+              ),
               buildFooter(slTheme),
               new SettingsList(
                 buildDecisionItems(),

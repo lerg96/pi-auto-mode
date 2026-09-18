@@ -35,6 +35,7 @@ function cfg(partial: Partial<Config>): Config {
       promptFieldMaxWidth: 120,
       showClassifierRisk: true,
       modalTimeoutMs: 120000,
+      noUiAsks: 'bubble',
     },
     telemetry: { enabled: false, path: '/tmp/x.jsonl' },
     permissions: {},

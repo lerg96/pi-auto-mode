@@ -2,6 +2,7 @@ import {
   defaultAskResolver,
   getAskResolver,
   setAskResolver,
+  normalizeAskDecision,
   type AskDecision,
   type AskRequest,
 } from '../../src/gate/ask.ts'
@@ -27,7 +28,34 @@ describe('ask', () => {
       value: 'rm -rf /',
     })
     expect(isAskDecision(result)).toBe(true)
-    expect(result).toBe('deny')
+    // Sin resolver no hay nadie a quién preguntar: se deniega y así se
+    // declara (`via: 'no-ui'`), nunca como decisión de un usuario.
+    expect(result).toEqual({ decision: 'deny', via: 'no-ui' })
+  })
+
+  it('normalizeAskDecision canónica: string => via modal', () => {
+    expect(normalizeAskDecision('allow')).toEqual({
+      decision: 'allow',
+      via: 'modal',
+    })
+    expect(normalizeAskDecision('deny')).toEqual({
+      decision: 'deny',
+      via: 'modal',
+    })
+  })
+
+  it('normalizeAskDecision respeta el via del resolver y su reason', () => {
+    expect(
+      normalizeAskDecision({ decision: 'deny', reason: 'nope', via: 'no-ui' })
+    ).toEqual({ decision: 'deny', reason: 'nope', via: 'no-ui' })
+    expect(
+      normalizeAskDecision({ decision: 'allow', via: 'parent-modal' })
+    ).toEqual({ decision: 'allow', via: 'parent-modal' })
+    // Object-form sin via sigue siendo una decisión humana mostrada en modal.
+    expect(normalizeAskDecision({ decision: 'allow_session' })).toEqual({
+      decision: 'allow_session',
+      via: 'modal',
+    })
   })
 
   it('setAskResolver/getAskResolver permiten inyectar un resolver', async () => {

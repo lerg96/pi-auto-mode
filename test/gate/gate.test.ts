@@ -56,6 +56,7 @@ const config: Config = {
     promptFieldMaxWidth: 120,
     showClassifierRisk: true,
     modalTimeoutMs: 120000,
+    noUiAsks: 'bubble',
   },
   telemetry: { enabled: false, path: '' },
 }
@@ -405,6 +406,78 @@ describe('gateToolCall', () => {
     }
     expect(capturedAudit?.denialReason).toBeDefined()
     setAskResolver(getAskResolver())
+  })
+
+  it('no-UI denial: se audita como no-ui y el mensaje no culpa a un usuario', async () => {
+    // Regresión del bug de sub-agentes: un ask sin UI se denegaba y se
+    // registraba como `decidedBy: 'user', via: 'modal'`, o sea: un humano que
+    // nunca existió vetando la llamada.
+    configState.set({
+      ...config,
+      permissions: {
+        tools: {
+          bash: [{ pattern: 'cat *.env', action: 'ask', reason: 'secretos' }],
+        },
+      },
+    })
+    const events: Array<Record<string, unknown>> = []
+    const deps: GateDeps = {
+      configState,
+      sessionRules: new SessionRules(),
+      hooks: {
+        emit: (_channel: string, data: unknown) => {
+          events.push(data as Record<string, unknown>)
+        },
+      },
+      classify: async (): Promise<ClassifierResult> => ({
+        decision: 'allow',
+      }),
+    }
+    setAskResolver(async () => ({ decision: 'deny', via: 'no-ui' }))
+    let message = ''
+    try {
+      await gateToolCall('bash', { command: 'cat .env' }, deps)
+    } catch (err) {
+      message = (err as Error).message
+    }
+    setAskResolver(getAskResolver())
+
+    expect(message).toContain('without asking')
+    expect(message).not.toMatch(/denied by user/i)
+    const denial = events.find((e) => e.result === 'deny')
+    expect(denial?.via).toBe('no-ui')
+    expect(denial?.decidedBy).toBe('no-ui')
+  })
+
+  it('parent-modal: la decisión del padre se audita como decisión humana real', async () => {
+    configState.set({
+      ...config,
+      permissions: {
+        tools: {
+          bash: [{ pattern: 'safe-parent', action: 'ask' }],
+        },
+      },
+    })
+    const events: Array<Record<string, unknown>> = []
+    const deps: GateDeps = {
+      configState,
+      sessionRules: new SessionRules(),
+      hooks: {
+        emit: (_channel: string, data: unknown) => {
+          events.push(data as Record<string, unknown>)
+        },
+      },
+      classify: async (): Promise<ClassifierResult> => ({
+        decision: 'allow',
+      }),
+    }
+    setAskResolver(async () => ({ decision: 'allow', via: 'parent-modal' }))
+    await gateToolCall('bash', { command: 'safe-parent' }, deps)
+    setAskResolver(getAskResolver())
+
+    const approval = events.find((e) => e.result === 'allow')
+    expect(approval?.via).toBe('parent-modal')
+    expect(approval?.decidedBy).toBe('user')
   })
 
   it('ask audit enrichment: allow includes requestId, decidedBy, via; plain allow does NOT persist', async () => {

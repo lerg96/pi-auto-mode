@@ -204,6 +204,12 @@ const uiConfig = z
     showClassifierRisk: z.boolean().default(true),
     // -1 = sin timeout (ilimitado). Default 120000 = 2 min.
     modalTimeoutMs: z.number().int().default(120000),
+    // Qué hacer con un ask cuando ESTA sesión no tiene UI (p. ej. una
+    // sub-sesión creada por pi-subagents, que nunca recibe `uiContext`).
+    //   'bubble' (default): renderizar el modal en la UI de la sesión padre
+    //     del proceso, si alguna vez publicó una (nunca en `pi -p`).
+    //   'deny': denegar sin preguntar (comportamiento histórico).
+    noUiAsks: z.enum(['bubble', 'deny']).default('bubble'),
     // Sonido al abrir el modal (opt-in). Ausente = silencioso.
     // `path` vacío → doble tono del sistema (sin archivos); con path → .wav.
     // `remindEveryMs` > 0 repite el aviso hasta decidir; 0 = un solo ding.
@@ -221,6 +227,7 @@ const uiConfig = z
     promptFieldMaxWidth: 120,
     showClassifierRisk: true,
     modalTimeoutMs: 120000,
+    noUiAsks: 'bubble',
   })
 
 // ─── Telemetry Config (SIN CAMBIOS) ──────────────────────────────────────────
@@ -402,6 +409,7 @@ export interface UiConfig {
   promptFieldMaxWidth: number
   showClassifierRisk: boolean
   modalTimeoutMs: number
+  noUiAsks: 'bubble' | 'deny'
   sound?: SoundConfig
 }
 

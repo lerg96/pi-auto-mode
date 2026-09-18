@@ -15,7 +15,7 @@ import { evaluatePermission } from '../permission/visibility.ts'
 import { evaluateExternalDirectory } from '../permission/external-directory.ts'
 import { wildcardMatch } from '../permission/wildcard-matcher.ts'
 import { normalizeToolCall, type AccessIntent } from './normalize.ts'
-import { getAskResolver } from './ask.ts'
+import { getAskResolver, normalizeAskDecision } from './ask.ts'
 import { BUS_CHANNEL_DECISION } from '../events.ts'
 import { redactSecretsForModel } from '../classifier/secret-guard.ts'
 import { redact } from '../telemetry/telemetry.ts'
@@ -125,8 +125,12 @@ export interface GateDeps {
 
 interface AskAudit {
   requestId?: string
-  decidedBy: 'user' | 'session'
-  via: 'modal' | 'session-rules'
+  // 'no-ui' = no se mostró ningún modal: no hubo humano que decidiera. Darlo
+  // como 'user' falsea la auditoría (y entrena al modelo con datos falsos).
+  decidedBy: 'user' | 'session' | 'no-ui'
+  // 'parent-modal' = el modal se renderizó en la UI de otra sesión del
+  // proceso (sub-sesión sin UI propia).
+  via: 'modal' | 'parent-modal' | 'no-ui' | 'session-rules'
   matchedPattern?: string
   denialReason?: string
 }
@@ -150,6 +154,13 @@ function emit(
   } catch {
     /* fire-and-forget */
   }
+}
+
+// Quién hay detrás de la decisión de un ask. `no-ui` nunca es un usuario: no
+// se mostró ningún prompt, así que atribuirla a una persona falsea la
+// auditoría y el mensaje que recibe el modelo.
+function askActor(via: AskAudit['via']): 'user' | 'no-ui' {
+  return via === 'no-ui' ? 'no-ui' : 'user'
 }
 
 const RISK_RANK: Record<RiskLevel, number> = { low: 0, medium: 1, high: 2 }
@@ -231,8 +242,9 @@ async function handleClassifierBlock(
   // action === 'ask-user'
   let requestId: string
   let verdict: AskVerdict = 'allow'
+  let via: AskAudit['via'] = 'modal'
   try {
-    ;({ requestId, verdict } = await resolveAsk(
+    ;({ requestId, verdict, via } = await resolveAsk(
       surface,
       value,
       risk,
@@ -246,8 +258,8 @@ async function handleClassifierBlock(
     if (err instanceof AskDeniedError) {
       emit(deps.hooks, surface, value, 'deny', 'classifier_block_override', {
         requestId: err.audit.requestId,
-        decidedBy: 'user',
-        via: 'modal',
+        decidedBy: err.audit.decidedBy,
+        via: err.audit.via,
         userVerdict: 'deny',
         ...detail('ask-user'),
       })
@@ -260,8 +272,8 @@ async function handleClassifierBlock(
   }
   emit(deps.hooks, surface, value, 'allow', 'classifier_block_override', {
     requestId,
-    decidedBy: 'user',
-    via: 'modal',
+    decidedBy: askActor(via),
+    via,
     ...verdictExtra(verdict),
     ...detail('ask-user'),
   })
@@ -377,7 +389,7 @@ async function resolveAsk(
   toolName?: string,
   fullCommand?: string,
   startedAt?: number
-): Promise<{ requestId: string; verdict: AskVerdict }> {
+): Promise<{ requestId: string; verdict: AskVerdict; via: AskAudit['via'] }> {
   const requestId =
     globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)
 
@@ -408,7 +420,7 @@ async function resolveAsk(
       }),
     })
     deps.denyService?.onContinueSucceeded()
-    return { requestId, verdict: 'session' }
+    return { requestId, verdict: 'session', via: 'session-rules' }
   }
 
   const ruleForResolver = matchedRule
@@ -429,27 +441,34 @@ async function resolveAsk(
     tool: toolName,
     fullCommand,
   })
-  const decision = typeof res === 'string' ? res : res.decision
-  const reason = typeof res === 'string' ? undefined : res.reason
+  const { decision, reason, via } = normalizeAskDecision(res)
 
   if (decision === 'allow') {
     deps.denyService?.onContinueSucceeded()
-    return { requestId, verdict: 'allow' }
+    return { requestId, verdict: 'allow', via }
   }
   if (decision === 'allow_session') {
     deps.denyService?.onContinueSucceeded()
     // Persist exact value for catch-all patterns
     const safePattern = value
     deps.sessionRules.approveForSession(surface, safePattern, 'allow')
-    return { requestId, verdict: 'allow_session' }
+    return { requestId, verdict: 'allow_session', via }
   }
   // Plain 'deny' carries no user-typed reason: inherit the reason shown in
   // the modal header (permission-rule reason first, classifier risk
   // second) so the model still learns why it was denied.
   const denialReason = reason ?? matchedRule?.reason ?? risk?.reason
+  // El mensaje al modelo tiene que decir la verdad: si no hubo UI, nadie
+  // denegó — la llamada se bloqueó porque no había a quién preguntarle.
+  if (via === 'no-ui') {
+    throw new AskDeniedError(
+      `Permission denied without asking: this session has no UI, so no user could approve it${denialReason ? ` (${denialReason})` : ''}. Run pi interactively, or allow the action in config.`,
+      { requestId, decidedBy: 'no-ui', via, denialReason }
+    )
+  }
   throw new AskDeniedError(
     `Permission denied by user${denialReason ? `: ${denialReason}` : ''}`,
-    { requestId, decidedBy: 'user', via: 'modal', denialReason }
+    { requestId, decidedBy: 'user', via, denialReason }
   )
 }
 
@@ -526,7 +545,7 @@ export async function gateToolCall(
   const deniedIntent = intents.find((i) => i.surface === 'denied')
   if (deniedIntent) {
     try {
-      const { requestId, verdict } = await resolveAsk(
+      const { requestId, verdict, via } = await resolveAsk(
         toolName,
         deniedIntent.value,
         undefined,
@@ -544,8 +563,8 @@ export async function gateToolCall(
         'unknown_tool_ask',
         {
           requestId,
-          decidedBy: 'user',
-          via: 'modal',
+          decidedBy: askActor(via),
+          via,
           ...verdictExtra(verdict),
           ...buildDecisionDetail({
             toolName,
@@ -849,7 +868,7 @@ export async function gateToolCall(
     reason: ruleReason,
   }
   try {
-    const { requestId, verdict } = await resolveAsk(
+    const { requestId, verdict, via } = await resolveAsk(
       askSurface,
       askValue,
       agg.risk,
@@ -861,8 +880,8 @@ export async function gateToolCall(
     )
     emit(deps.hooks, askSurface, askValue, 'allow', resolution, {
       requestId,
-      decidedBy: 'user',
-      via: 'modal',
+      decidedBy: askActor(via),
+      via,
       ...verdictExtra(verdict),
       ...buildDecisionDetail({
         toolName,

@@ -110,11 +110,12 @@ describe('externalDirectoryTools', () => {
     expect(() => parseConfig({ externalDirectoryTools: 'bash' })).toThrow()
   })
 
-  it('config.example.json lista bash, write y read', () => {
+  it('config.example.json lista bash, write, edit y read', () => {
     const raw = JSON.parse(readFileSync(EXAMPLE_PATH, 'utf8'))
     expect(parseConfig(raw).externalDirectoryTools).toEqual([
       'bash',
       'write',
+      'edit',
       'read',
     ])
   })

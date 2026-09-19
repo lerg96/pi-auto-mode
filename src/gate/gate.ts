@@ -426,7 +426,8 @@ async function resolveAsk(
   matchedRule?: { surface: string; pattern: string; reason?: string },
   toolName?: string,
   fullCommand?: string,
-  startedAt?: number
+  startedAt?: number,
+  externalDir?: { isExternalDir: boolean; externalDirPath?: string }
 ): Promise<{ requestId: string; verdict: AskVerdict; via: AskAudit['via'] }> {
   const requestId =
     globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)
@@ -478,6 +479,8 @@ async function resolveAsk(
     requestId,
     tool: toolName,
     fullCommand,
+    type: externalDir?.isExternalDir ? 'external-directory' : 'tool-permission',
+    externalDir: externalDir?.externalDirPath,
   })
   const { decision, reason, via } = normalizeAskDecision(res)
 
@@ -687,7 +690,14 @@ export async function gateToolCall(
   // Only tightens: overwrite permAction ONLY when strictly more restrictive
   // (deny > ask > allow), so an explicit tool deny always beats an explicit
   // external allow. Reporting follows the triggering intent (not intent[0]).
-  const externalVerdict = evaluateExternalDirectory(cfg, intents, { toolName })
+  // Track whether this ask came from the external-directory layer so the
+  // resolver can render the correct modal variant.
+  const externalVerdict = evaluateExternalDirectory(cfg, intents, {
+    toolName,
+    sessionRules: deps.sessionRules,
+  })
+  const externalDirPath =
+    externalVerdict === undefined ? undefined : externalVerdict.absPath
   if (externalVerdict !== undefined) {
     const rank = { allow: 0, ask: 1, deny: 2 } as const
     if (rank[externalVerdict.action] > rank[permAction]) {
@@ -700,6 +710,8 @@ export async function gateToolCall(
       }
     }
   }
+
+  const isExternalDirAsk = permAction === 'ask' && externalDirPath !== undefined
 
   if (permAction === 'deny') {
     const action = applyDenyStrategy(
@@ -903,7 +915,8 @@ export async function gateToolCall(
       matchedRuleForAsk,
       toolName,
       fullCommand,
-      startedAt
+      startedAt,
+      isExternalDirAsk ? { isExternalDir: true, externalDirPath } : undefined
     )
     emit(deps.hooks, askSurface, askValue, 'allow', resolution, {
       requestId,

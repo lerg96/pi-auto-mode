@@ -7,6 +7,8 @@ import {
   discoverWorktreeRoots,
   isInsideTrustedWorktree,
 } from './git-worktrees.ts'
+import { isExternalDirAllowed } from '../state/external-dir-allowlist.ts'
+import type { SessionRules } from './session-rules.ts'
 
 // Local structural intent — deliberately NOT imported from gate/normalize.ts
 // to avoid an import cycle (gate imports this module).
@@ -395,6 +397,11 @@ export interface ExternalScopeOptions {
    * even when it touches paths outside cwd).
    */
   toolName?: string
+  /**
+   * Session rules (populated by "Allow directory" choices). When present,
+   * session-approved paths short-circuit the layer.
+   */
+  sessionRules?: SessionRules
 }
 
 /**
@@ -430,6 +437,31 @@ export function evaluateExternalDirectory(
   try {
     if (cfg.confineToWorkingDirectory !== true) return undefined
     if (!externalScopeAppliesTo(cfg, opts?.toolName)) return undefined
+    // Session rules (from "Allow directory" choices) — checked before any
+    // other logic so the user's approval always wins.
+    if (opts?.sessionRules) {
+      const sessionRules = opts.sessionRules
+      const rules = sessionRules.snapshot()
+      for (const intent of intents) {
+        for (const rule of rules) {
+          if (
+            rule.surface === 'external_directory' &&
+            rule.action === 'allow'
+          ) {
+            const expandedKey = normalize(
+              expandHomePrefix(expandMsysDrive(rule.pattern))
+            )
+            const candidate =
+              intent.surface === 'fs'
+                ? resolveFsPath(intent.value, opts?.cwd ?? process.cwd())
+                : (opts?.cwd ?? process.cwd())
+            if (wildcardMatch(expandedKey, candidate)) {
+              return undefined
+            }
+          }
+        }
+      }
+    }
     const base = opts?.cwd ?? process.cwd()
     const outside: Array<{
       abs: string

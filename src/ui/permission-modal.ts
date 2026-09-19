@@ -3,6 +3,7 @@ import type {
   AskResolver,
   AskRequest,
   AskVia,
+  AskType,
 } from '../gate/ask.ts'
 import {
   SettingsList,
@@ -17,6 +18,7 @@ import { playNotificationSound, type SoundPlayer } from './sound.ts'
 import type { configState } from '../state/config-state.ts'
 import type { SessionRules } from '../permission/session-rules.ts'
 import type { ExtensionAPI } from '../pi-sdk.ts'
+import { addExternalDirAllow } from '../state/external-dir-allowlist.ts'
 
 /**
  * Sanitize a value for TUI label display (H5).
@@ -33,23 +35,29 @@ function sanitizeForLabel(val: string, maxWidth = 100): string {
  * Decision ids dispatched on in `onChange`. Order matters: SettingsList
  * pre-highlights index 0, so `'allow'` is the default-on-Enter choice.
  */
-type DecisionId = 'allow' | 'allow_session' | 'deny' | 'deny_reason'
+type DecisionId =
+  | 'allow'
+  | 'allow_session'
+  | 'allow_dir_tool'
+  | 'allow_dir_all'
+  | 'deny'
+  | 'deny_reason'
 
-const DECISION_IDS: readonly DecisionId[] = [
+const ALL_DECISION_IDS: readonly string[] = [
   'allow',
   'allow_session',
+  'allow_dir_tool',
+  'allow_dir_all',
   'deny',
   'deny_reason',
 ]
 
 function isDecisionId(v: unknown): v is DecisionId {
-  return (
-    typeof v === 'string' && (DECISION_IDS as readonly string[]).includes(v)
-  )
+  return typeof v === 'string' && ALL_DECISION_IDS.includes(v)
 }
 
 /**
- * Build the 4-row decision list. Each row is an "action" row: a single
+ * Build the decision list. Each row is an "action" row: a single
  * sentinel value in `values` so Enter fires `onChange(id, '❯')` exactly
  * once. We dispatch on `id`, ignoring the value.
  *
@@ -58,7 +66,49 @@ function isDecisionId(v: unknown): v is DecisionId {
  * header above the list (see `buildHeader`), so each row's `description`
  * only explains what that choice does.
  */
-function buildDecisionItems(): SettingItem[] {
+function buildDecisionItems(type: AskType): SettingItem[] {
+  if (type === 'external-directory') {
+    return [
+      {
+        id: 'allow',
+        label: 'Allow this call',
+        description: 'Grant once — nothing is remembered.',
+        currentValue: 'grant once',
+        values: ['❯'],
+      },
+      {
+        id: 'allow_dir_tool',
+        label: 'Allow for this tool',
+        description:
+          'Remember for this tool — identical calls skip the prompt.',
+        currentValue: 'remember for tool',
+        values: ['❯'],
+      },
+      {
+        id: 'allow_dir_all',
+        label: 'Allow for all tools',
+        description:
+          'Remember for all tools — identical calls skip the prompt.',
+        currentValue: 'remember for all',
+        values: ['❯'],
+      },
+      {
+        id: 'deny',
+        label: 'Deny',
+        description: 'Block once — the model sees the reason above.',
+        currentValue: 'block once',
+        values: ['❯'],
+      },
+      {
+        id: 'deny_reason',
+        label: 'Deny with reason',
+        description: 'Block and attach your reason for the model.',
+        currentValue: 'block & tell the model why',
+        values: ['❯'],
+      },
+    ]
+  }
+  // tool-permission (default)
   return [
     {
       id: 'allow',
@@ -132,39 +182,57 @@ function headerRow(
 }
 
 /**
- * Static header block rendered above the decision list, mirroring the
- * pi-permission-system prompt layout (tool / rule / command / full
- * command) plus the `reason` row: the reason the layer that produced
- * this ask gave (permission-rule reason first, classifier risk reason
- * second, '—' when neither exists). A `risk` row with score/level is
- * appended only when classifier risk is present.
+ * Static header block rendered above the decision list.
+ *
+ * Two layouts:
+ * - `tool-permission`: tool / rule / command / full command / reason / risk
+ * - `external-directory`: tool / path / rule / reason (no risk, no command)
  */
 function buildHeader(
   req: AskRequest,
   slTheme: SettingsListTheme,
   subtitle?: string
 ): string[] {
-  const lines = [slTheme.label('Permission Required', true)]
+  const lines: string[] = []
+  const isExternalDir = req.type === 'external-directory'
+
+  // Title
+  lines.push(
+    isExternalDir
+      ? slTheme.label('External directory access', true)
+      : slTheme.label('Permission Required', true)
+  )
   // A prompt borrowed into the parent session must say so: the user is being
   // asked about a tool call that is NOT from the session in front of them.
   if (subtitle) lines.push(slTheme.hint(subtitle))
-  lines.push(
-    headerRow(slTheme.hint, 'tool', sanitizeForLabel(req.tool ?? req.surface))
-  )
-  lines.push(
-    headerRow(
-      slTheme.hint,
-      'rule',
-      req.rule
-        ? sanitizeForLabel(`${req.rule.surface} / ${req.rule.pattern}`)
-        : '—'
+
+  if (isExternalDir) {
+    // External-directory layout: tool + path (simplified)
+    const toolLabel = sanitizeForLabel(req.tool ?? req.surface)
+    const dirPath = req.externalDir ?? req.value
+    lines.push(headerRow(slTheme.hint, 'tool', toolLabel))
+    lines.push(headerRow(slTheme.hint, 'path', sanitizeForLabel(dirPath, 160)))
+  } else {
+    // Tool-permission layout (existing)
+    lines.push(
+      headerRow(slTheme.hint, 'tool', sanitizeForLabel(req.tool ?? req.surface))
     )
-  )
-  lines.push(...headerRows(slTheme.hint, 'command', req.value))
-  const full = (req.fullCommand ?? '').trim()
-  if (full.length > 0 && full !== req.value) {
-    lines.push(...headerRows(slTheme.hint, 'full command', full))
+    lines.push(
+      headerRow(
+        slTheme.hint,
+        'rule',
+        req.rule
+          ? sanitizeForLabel(`${req.rule.surface} / ${req.rule.pattern}`)
+          : '—'
+      )
+    )
+    lines.push(...headerRows(slTheme.hint, 'command', req.value))
+    const full = (req.fullCommand ?? '').trim()
+    if (full.length > 0 && full !== req.value) {
+      lines.push(...headerRows(slTheme.hint, 'full command', full))
+    }
   }
+
   const reason = req.rule?.reason ?? req.risk?.reason
   lines.push(
     headerRow(
@@ -283,15 +351,11 @@ export interface ModalResolverOpts {
 
 export function createModalAskResolver(
   pi: ExtensionAPI,
-  _sessionRules: SessionRules,
+  sessionRules: SessionRules,
   cfgState: typeof configState,
   opts?: ModalResolverOpts
 ): AskResolver {
   return async (req) => {
-    // _sessionRules is unused inside the resolver body; the gate (gate.ts)
-    // is the single source of truth for session approvals and records them
-    // after the user selects 'allow'. Accept the arg for symmetry / future use.
-
     const bound = getUiContext()
     let ui: ExtensionUI
     let via: AskVia
@@ -406,7 +470,7 @@ export function createModalAskResolver(
               ),
               buildFooter(slTheme),
               new SettingsList(
-                buildDecisionItems(),
+                buildDecisionItems(req.type ?? 'tool-permission'),
                 8,
                 slTheme,
                 async (itemId, _newValue) => {
@@ -430,6 +494,25 @@ export function createModalAskResolver(
                       // SessionRules.approveForSession(). The modal only
                       // returns the decision; persistence is the gate's job.
                       finish('allow_session')
+                      return
+
+                    case 'allow_dir_tool':
+                      // External-directory: allow this directory for this tool.
+                      // Persist as a session rule so the gate skips future
+                      // prompts for matching calls.
+                      sessionRules.approveForSession(
+                        'external_directory',
+                        `${req.externalDir ?? req.value}/**`,
+                        'allow'
+                      )
+                      finish('allow_dir_tool')
+                      return
+
+                    case 'allow_dir_all':
+                      // External-directory: allow this directory for all tools.
+                      // Add to the global allowlist.
+                      addExternalDirAllow(req.externalDir ?? req.value)
+                      finish('allow_dir_all')
                       return
 
                     case 'deny':

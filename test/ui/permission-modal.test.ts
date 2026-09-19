@@ -6,6 +6,10 @@ import { parseConfig } from '../../src/types/config.ts'
 import type { SettingItem } from '../../test/stubs/pi-tui.ts'
 import { setUiContext, getUiContext } from '../../src/state/ui-context.ts'
 import { publishUi, resetUiRegistry } from '../../src/state/ui-registry.ts'
+import {
+  resetExternalDirAllowlist,
+  isExternalDirAllowed,
+} from '../../src/state/external-dir-allowlist.ts'
 import { BUS_CHANNEL_UI_PROMPT } from '../../src/events.ts'
 import type { AskDecision, AskRequest } from '../../src/gate/ask.ts'
 
@@ -195,12 +199,15 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
   // Render the modal view and return its text lines (header + footer; the
   // mocked SettingsList contributes no lines). Returns a `settle` helper
   // that fires onChange for the chosen row, mirroring `choose()`.
-  function renderModal(req: AskRequest): {
+  function renderModal(
+    req: AskRequest,
+    sessionRules?: SessionRules
+  ): {
     lines: string[]
     settle: (rowId: string) => void
     promise: Promise<AskDecision>
   } {
-    const resolver = makeResolver()
+    const resolver = makeResolver(sessionRules)
     const promise = resolver(req)
     expect(typeof renderCapture).toBe('function')
     const view = renderCapture!(
@@ -961,6 +968,125 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
     } finally {
       jest.useRealTimers()
     }
+  })
+
+  // ─── Modal para directorios externos (type=external-directory) ──
+  describe('external-directory modal', () => {
+    beforeEach(() => {
+      resetExternalDirAllowlist()
+    })
+
+    it('header muestra "External directory access"', () => {
+      const { lines } = renderModal({
+        type: 'external-directory',
+        externalDir: '/mnt/shared',
+        tool: 'bash',
+        surface: 'shell',
+        value: 'echo hi > ../other/file.txt',
+      })
+      const text = lines.join('\n')
+      expect(text).toContain('External directory access')
+      expect(text).toContain('/mnt/shared')
+    })
+
+    it('no muestra "command" en header cuando es external-directory', () => {
+      const { lines } = renderModal({
+        type: 'external-directory',
+        externalDir: '/mnt/shared',
+        tool: 'bash',
+        surface: 'shell',
+        value: 'cat ../other/file.txt',
+      })
+      const text = lines.join('\n')
+      expect(text).not.toContain('command')
+      expect(text).toContain('path')
+    })
+
+    it('SettingsList recibe los 5 items correctos de decision', () => {
+      renderModal({
+        type: 'external-directory',
+        externalDir: '/mnt/shared',
+        tool: 'bash',
+        surface: 'shell',
+        value: 'echo hi',
+      })
+      expect(captures.items).toHaveLength(5)
+      expect(captures.items![0].id).toBe('allow')
+      expect(captures.items![0].label).toBe('Allow this call')
+      expect(captures.items![1].id).toBe('allow_dir_tool')
+      expect(captures.items![1].label).toBe('Allow for this tool')
+      expect(captures.items![2].id).toBe('allow_dir_all')
+      expect(captures.items![2].label).toBe('Allow for all tools')
+      expect(captures.items![3].id).toBe('deny')
+      expect(captures.items![3].label).toBe('Deny')
+      expect(captures.items![4].id).toBe('deny_reason')
+      expect(captures.items![4].label).toBe('Deny with reason')
+    })
+
+    it('tool-permission tiene 4 items de decision', () => {
+      renderModal({
+        surface: 'shell',
+        value: 'cat /etc/passwd',
+      })
+      expect(captures.items).toHaveLength(4)
+      expect(captures.items![0].id).toBe('allow')
+      expect(captures.items![0].label).toBe('Allow')
+      expect(captures.items![1].id).toBe('allow_session')
+      expect(captures.items![1].label).toBe('Allow for session')
+      expect(captures.items![2].id).toBe('deny')
+      expect(captures.items![2].label).toBe('Deny')
+      expect(captures.items![3].id).toBe('deny_reason')
+      expect(captures.items![3].label).toBe('Deny with reason')
+    })
+
+    it('allow_dir_tool inyecta regla en sessionRules', async () => {
+      const sessionRules = new SessionRules()
+      const { settle, promise } = renderModal(
+        {
+          type: 'external-directory',
+          externalDir: '/mnt/shared',
+          tool: 'bash',
+          surface: 'fs',
+          value: '/mnt/shared/file.txt',
+        },
+        sessionRules
+      )
+      settle('allow_dir_tool')
+      expect(await promise).toBe('allow_dir_tool')
+      // La regla se inyectó con el patrón correcto
+      const rules = sessionRules.snapshot()
+      expect(rules).toHaveLength(1)
+      expect(rules[0].surface).toBe('external_directory')
+      expect(rules[0].action).toBe('allow')
+      expect(rules[0].pattern).toContain('/mnt/shared')
+    })
+
+    it('allow_dir_all llama a addExternalDirAllow', async () => {
+      const { settle, promise } = renderModal({
+        type: 'external-directory',
+        externalDir: '/mnt/shared',
+        surface: 'fs',
+        value: '/mnt/shared/file.txt',
+      })
+      settle('allow_dir_all')
+      expect(await promise).toBe('allow_dir_all')
+      expect(isExternalDirAllowed('/mnt/shared/file.txt')).toBe(true)
+      expect(isExternalDirAllowed('/mnt/shared/nested/x')).toBe(true)
+      expect(isExternalDirAllowed('/mnt/other/x')).toBe(false)
+    })
+
+    it('allow_dir_all con path fallback a value si externalDir es undefined', async () => {
+      const { settle, promise } = renderModal({
+        type: 'external-directory',
+        surface: 'fs',
+        value: '/tmp/outside/file.txt',
+      })
+      settle('allow_dir_all')
+      expect(await promise).toBe('allow_dir_all')
+      // El fallback usa value; isExternalDirAllowed busca `${value}/**`.
+      // Verificamos un path anidado que encaje en el patrón.
+      expect(isExternalDirAllowed('/tmp/outside/file.txt/nested/x')).toBe(true)
+    })
   })
 })
 

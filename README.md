@@ -322,6 +322,35 @@ Rules of that path:
 - `ui.noUiAsks: "deny"` restores the historical behavior: no UI, no question, deny.
 - This is a workaround for those child sessions only. Extensions that prompt through their own `ui.confirm()` inside a UI-less session are still denied, because their `ctx.hasUI` is still false — the real fix is passing `uiContext` when the session is bound (upstream).
 
+### Dual-modal: external-directory permissions
+
+When `confineToWorkingDirectory` triggers an `ask` for a path outside the
+working directory, the modal renders a **different layout** than the standard
+permission prompt. This makes it clear that the question is about the
+**target directory**, not about the tool itself.
+
+The external-directory modal shows:
+
+| Button                  | Effect                                                                                                                                                                                                                      |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Allow this call**     | Grant once — nothing is remembered (`'allow'`).                                                                                                                                                                             |
+| **Allow for this tool** | Persist a session rule that skips the prompt for the **same path** on future calls of the **same tool** (`'allow_dir_tool'`). Internally calls `sessionRules.approveForSession('external_directory', '<dir>/**', 'allow')`. |
+| **Allow for all tools** | Add the directory to a process-wide allowlist that covers **every tool** (`'allow_dir_all'`). Stored in memory only — not persisted across restarts.                                                                        |
+| **Deny**                | Block this call only.                                                                                                                                                                                                       |
+| **Deny with reason**    | Block and attach your reason for the model.                                                                                                                                                                                 |
+
+The standard permission modal (for tools that triggered a rule-based `ask`)
+keeps its original four-button layout: `Allow`, `Allow for session`,
+`Deny`, `Deny with reason`.
+
+When the user picks `Allow for this tool`, the gate records a session rule
+with surface `external_directory` and pattern `<dir>/**`. Future calls that
+hit the same external directory **for any tool** will bypass the confinement
+check via `sessionRules` (the external-directory layer checks session rules
+before applying its own logic). When the user picks `Allow for all tools`,
+the directory is added to a process-scoped `Set<string>` allowlist that
+`evaluateExternalDirectory` pre-checks before doing any path analysis.
+
 ### Modal fail-closed invariants
 
 The modal preserves the extension's **fail-closed** principle. Any exit path that isn't an explicit user decision ends in `'deny'`:

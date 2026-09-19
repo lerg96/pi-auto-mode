@@ -7,6 +7,8 @@ export interface ClassifierRisk {
   category?: string
 }
 
+export type AskType = 'tool-permission' | 'external-directory'
+
 export interface AskRequest {
   surface: string
   value: string
@@ -17,6 +19,10 @@ export interface AskRequest {
   tool?: string
   /** Full original command (e.g. input.command); shown when it differs from `value`. */
   fullCommand?: string
+  /** Tipo de permiso que se pregunta. Solo 'external-directory' dispara el modal de directorio. */
+  type?: AskType
+  /** Path externo solicitado; solo se usa cuando type === 'external-directory'. */
+  externalDir?: string
 }
 
 // NUEVO: una negación puede llevar una razón legible (se muestra al modelo).
@@ -34,9 +40,12 @@ export type AskVia = 'modal' | 'parent-modal' | 'no-ui' | 'timeout'
 export type AskDecision =
   | 'allow'
   | 'allow_session'
+  | 'allow_dir_tool'
+  | 'allow_dir_all'
   | 'deny'
   | {
-      decision: 'allow' | 'allow_session' | 'deny'
+      decision:
+        'allow' | 'allow_session' | 'allow_dir_tool' | 'allow_dir_all' | 'deny'
       reason?: string
       via?: AskVia
     }
@@ -47,7 +56,8 @@ export type AskDecision =
  * defecto devuelve el objeto con `via: 'no-ui'`, que es lo que realmente pasó.
  */
 export function normalizeAskDecision(res: AskDecision): {
-  decision: 'allow' | 'allow_session' | 'deny'
+  decision:
+    'allow' | 'allow_session' | 'allow_dir_tool' | 'allow_dir_all' | 'deny'
   reason?: string
   via: AskVia
 } {

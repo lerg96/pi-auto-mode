@@ -1039,7 +1039,7 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       expect(captures.items![3].label).toBe('Deny with reason')
     })
 
-    it('allow_dir_tool inyecta regla en sessionRules', async () => {
+    it('allow_dir_tool devuelve el id y NO muta sessionRules (la persistencia es del gate)', async () => {
       const sessionRules = new SessionRules()
       const { settle, promise } = renderModal(
         {
@@ -1053,15 +1053,13 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       )
       settle('allow_dir_tool')
       expect(await promise).toBe('allow_dir_tool')
-      // La regla se inyectó con el patrón correcto
+      // El modal ya no persiste nada: sessionRules sigue vacío.
+      // La persistencia la hace el gate (gate.ts) al recibir el decision id.
       const rules = sessionRules.snapshot()
-      expect(rules).toHaveLength(1)
-      expect(rules[0].surface).toBe('external_directory')
-      expect(rules[0].action).toBe('allow')
-      expect(rules[0].pattern).toContain('/mnt/shared')
+      expect(rules).toHaveLength(0)
     })
 
-    it('allow_dir_all llama a addExternalDirAllow', async () => {
+    it('allow_dir_all devuelve el id y NO muta el allowlist (la persistencia es del gate)', async () => {
       const { settle, promise } = renderModal({
         type: 'external-directory',
         externalDir: '/mnt/shared',
@@ -1070,12 +1068,12 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       })
       settle('allow_dir_all')
       expect(await promise).toBe('allow_dir_all')
-      expect(isExternalDirAllowed('/mnt/shared/file.txt')).toBe(true)
-      expect(isExternalDirAllowed('/mnt/shared/nested/x')).toBe(true)
-      expect(isExternalDirAllowed('/mnt/other/x')).toBe(false)
+      // El modal ya no llama a addExternalDirAllow: el allowlist sigue limpio.
+      expect(isExternalDirAllowed('/mnt/shared/file.txt')).toBe(false)
+      expect(isExternalDirAllowed('/mnt/shared/nested/x')).toBe(false)
     })
 
-    it('allow_dir_all con path fallback a value si externalDir es undefined', async () => {
+    it('allow_dir_all con path fallback a value si externalDir es undefined devuelve el id sin mutar', async () => {
       const { settle, promise } = renderModal({
         type: 'external-directory',
         surface: 'fs',
@@ -1083,9 +1081,8 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       })
       settle('allow_dir_all')
       expect(await promise).toBe('allow_dir_all')
-      // El fallback usa value; isExternalDirAllowed busca `${value}/**`.
-      // Verificamos un path anidado que encaje en el patrón.
-      expect(isExternalDirAllowed('/tmp/outside/file.txt/nested/x')).toBe(true)
+      // Sin mutation del modal, el allowlist permanece vacío.
+      expect(isExternalDirAllowed('/tmp/outside/file.txt')).toBe(false)
     })
   })
 })

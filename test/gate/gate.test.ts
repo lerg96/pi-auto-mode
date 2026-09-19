@@ -9,6 +9,7 @@ import {
   getAskResolver,
   defaultAskResolver,
 } from '../../src/gate/ask.ts'
+import { resetExternalDirAllowlist } from '../../src/state/external-dir-allowlist.ts'
 import type { Config } from '../../src/types/config.ts'
 import type {
   ClassifierInput,
@@ -1247,5 +1248,329 @@ describe('externalDirectoryTools × gate', () => {
     await expect(
       gateToolCall('read', { path: outsidePath }, makeDeps())
     ).rejects.toThrow()
+  })
+
+  // ─── Bug 1: allow_dir_tool / allow_dir_all resolve as ALLOW ─────
+  describe('Bug 1: allow_dir_tool and allow_dir_all resolve as allow', () => {
+    let prevResolver: ReturnType<typeof getAskResolver>
+    beforeEach(() => {
+      prevResolver = getAskResolver()
+      // Reset the global allowlist so each test starts clean
+      const {
+        resetExternalDirAllowlist,
+      } = require('../../src/state/external-dir-allowlist.ts')
+      resetExternalDirAllowlist()
+    })
+    afterEach(() => {
+      setAskResolver(prevResolver)
+    })
+
+    function externalAskDeps(): GateDeps {
+      // Tool permission = allow; external dir = ask (path outside cwd)
+      return {
+        configState: {
+          get: () => ({
+            ...config,
+            confineToWorkingDirectory: true,
+            permissions: { tools: { bash: 'allow' } },
+          }),
+          set: () => {},
+          getActiveSets: () => [],
+          setActiveSets: () => {},
+        },
+        sessionRules: new SessionRules(),
+        hooks: {},
+        classify: async (): Promise<ClassifierResult> => ({
+          decision: 'allow',
+        }),
+        denyService: new DenyAndContinueService({
+          mode: 'both',
+          escalation: { consecutive: 3, total: 20 },
+        }),
+      }
+    }
+
+    it('resolver returns allow_dir_tool → call is allowed (no deny thrown)', async () => {
+      const deps = externalAskDeps()
+      setAskResolver(async () => 'allow_dir_tool')
+      await expect(
+        gateToolCall('bash', { command: `cat ${outsidePath}` }, deps)
+      ).resolves.toBeUndefined()
+    })
+
+    it('resolver returns allow_dir_all → call is allowed (no deny thrown)', async () => {
+      const deps = externalAskDeps()
+      setAskResolver(async () => 'allow_dir_all')
+      await expect(
+        gateToolCall('bash', { command: `cat ${outsidePath}` }, deps)
+      ).resolves.toBeUndefined()
+    })
+
+    it('allow_dir_tool creates a session rule with surface external_directory:<toolName> and pattern <dir>/**', async () => {
+      const events: unknown[] = []
+      const deps: GateDeps = {
+        ...externalAskDeps(),
+        hooks: {
+          emit: (_c: string, d: unknown) => {
+            events.push(d)
+          },
+        },
+      }
+      setAskResolver(async () => 'allow_dir_tool')
+      await gateToolCall('bash', { command: `cat ${outsidePath}` }, deps)
+
+      const rules = deps.sessionRules.snapshot()
+      expect(rules).toHaveLength(1)
+      expect(rules[0].surface).toBe('external_directory:bash')
+      // grantDirFor returns the parent directory of the offending file
+      expect(rules[0].pattern).toBe(`${resolve(outsidePath, '..')}/**`)
+    })
+
+    it('allow_dir_all records the directory in the allowlist', async () => {
+      const { isExternalDirAllowed } =
+        await import('../../src/state/external-dir-allowlist.ts')
+      const deps = externalAskDeps()
+      setAskResolver(async () => 'allow_dir_all')
+      await gateToolCall('bash', { command: `cat ${outsidePath}` }, deps)
+
+      // The allowlist should contain the external dir path
+      expect(isExternalDirAllowed(outsidePath)).toBe(true)
+    })
+
+    it('allow_dir_tool emits result: allow with decidedBy: user', async () => {
+      const events: unknown[] = []
+      const deps: GateDeps = {
+        ...externalAskDeps(),
+        hooks: {
+          emit: (_c: string, d: unknown) => {
+            events.push(d)
+          },
+        },
+      }
+      setAskResolver(async () => 'allow_dir_tool')
+      await gateToolCall('bash', { command: `cat ${outsidePath}` }, deps)
+
+      const ev = events.find(
+        (e) => (e as Record<string, unknown>).result === 'allow'
+      ) as Record<string, unknown> | undefined
+      expect(ev).toBeDefined()
+      expect(ev?.result).toBe('allow')
+      expect(ev?.decidedBy).toBe('user')
+    })
+
+    it('allow_dir_all emits result: allow with decidedBy: user', async () => {
+      const events: unknown[] = []
+      const deps: GateDeps = {
+        ...externalAskDeps(),
+        hooks: {
+          emit: (_c: string, d: unknown) => {
+            events.push(d)
+          },
+        },
+      }
+      setAskResolver(async () => 'allow_dir_all')
+      await gateToolCall('bash', { command: `cat ${outsidePath}` }, deps)
+
+      const ev = events.find(
+        (e) => (e as Record<string, unknown>).result === 'allow'
+      ) as Record<string, unknown> | undefined
+      expect(ev).toBeDefined()
+      expect(ev?.result).toBe('allow')
+      expect(ev?.decidedBy).toBe('user')
+    })
+
+    it('allow_dir_tool emits userVerdict: allow_dir_tool', async () => {
+      const events: Record<string, unknown>[] = []
+      const deps: GateDeps = {
+        ...externalAskDeps(),
+        hooks: {
+          emit: (_c: string, d: unknown) => {
+            events.push(d as Record<string, unknown>)
+          },
+        },
+      }
+      setAskResolver(async () => 'allow_dir_tool')
+      await gateToolCall('bash', { command: `cat ${outsidePath}` }, deps)
+
+      const ev = events.find((e) => e.result === 'allow') as
+        Record<string, unknown> | undefined
+      expect(ev?.userVerdict).toBe('allow_dir_tool')
+    })
+
+    it('allow_dir_all emits userVerdict: allow_dir_all', async () => {
+      const events: Record<string, unknown>[] = []
+      const deps: GateDeps = {
+        ...externalAskDeps(),
+        hooks: {
+          emit: (_c: string, d: unknown) => {
+            events.push(d as Record<string, unknown>)
+          },
+        },
+      }
+      setAskResolver(async () => 'allow_dir_all')
+      await gateToolCall('bash', { command: `cat ${outsidePath}` }, deps)
+
+      const ev = events.find((e) => e.result === 'allow') as
+        Record<string, unknown> | undefined
+      expect(ev?.userVerdict).toBe('allow_dir_all')
+    })
+  })
+
+  // ─── Bug 2: external-directory modal only when external layer won ──
+  describe('Bug 2: isExternalDirAsk when permission rule asks + external path allowed', () => {
+    it('perm-action ask + external allow → resolver gets type=tool-permission', async () => {
+      // Permission rule produces ask; external directory produces allow.
+      // The winning verdict comes from the permission rule, so the resolver
+      // must receive type: 'tool-permission' (standard modal with command/rule header).
+      configState.set({
+        ...config,
+        confineToWorkingDirectory: true,
+        permissions: { tools: { bash: 'ask' } },
+      })
+      let capturedType: string | undefined
+      setAskResolver(async (req) => {
+        capturedType = req.type
+        return 'allow'
+      })
+      await gateToolCall('bash', { command: `cat ${outsidePath}` }, makeDeps())
+      expect(capturedType).toBe('tool-permission')
+      setAskResolver(getAskResolver())
+    })
+  })
+})
+
+// ─── E2E: allow_dir_tool / allow_dir_all per-tool scoping ─────────────────
+
+describe('E2E: allow_dir_tool and allow_dir_all per-tool scoping', () => {
+  const outsidePath = resolve(process.cwd(), '..', 'pi-auto-mode-probe.txt')
+  let prevResolver: ReturnType<typeof getAskResolver>
+
+  beforeEach(() => {
+    prevResolver = getAskResolver()
+    resetExternalDirAllowlist()
+  })
+  afterEach(() => {
+    setAskResolver(prevResolver)
+  })
+
+  function externalAskDeps(): GateDeps {
+    return {
+      configState: {
+        get: () => ({
+          ...config,
+          confineToWorkingDirectory: true,
+          permissions: { tools: { write: 'allow', read: 'allow' } },
+        }),
+        set: () => {},
+        getActiveSets: () => [],
+        setActiveSets: () => {},
+      },
+      sessionRules: new SessionRules(),
+      hooks: {},
+      classify: async (): Promise<ClassifierResult> => ({
+        decision: 'allow',
+      }),
+      denyService: new DenyAndContinueService({
+        mode: 'both',
+        escalation: { consecutive: 3, total: 20 },
+      }),
+    }
+  }
+
+  it('allow_dir_tool: first prompt, same tool+dir no prompt, other tool prompts', async () => {
+    const deps = externalAskDeps()
+    let promptCount = 0
+    setAskResolver(async () => {
+      promptCount++
+      return promptCount === 1 ? 'allow_dir_tool' : 'deny'
+    })
+
+    // First write: prompts → user chooses allow_dir_tool
+    await gateToolCall('write', { path: outsidePath }, deps)
+    expect(promptCount).toBe(1)
+
+    // Second write (same dir, same tool): should NOT prompt again
+    await gateToolCall('write', { path: outsidePath }, deps)
+    expect(promptCount).toBe(1)
+
+    // Read (different tool): SHOULD prompt again (tool-scoped)
+    await expect(
+      gateToolCall('read', { path: outsidePath }, deps)
+    ).rejects.toThrow(/denied by user/)
+    expect(promptCount).toBe(2)
+
+    // Verify session rule surface is 'external_directory:write'
+    const snap = deps.sessionRules.snapshot()
+    expect(snap).toHaveLength(1)
+    expect(snap[0].surface).toBe('external_directory:write')
+    // grantDirFor returns the parent directory of the offending file
+    expect(snap[0].pattern).toBe(`${resolve(outsidePath, '..')}/**`)
+    expect(snap[0].action).toBe('allow')
+  })
+
+  it('allow_dir_all: after approval, both write and read do not prompt', async () => {
+    const deps = externalAskDeps()
+    let promptCount = 0
+    setAskResolver(async () => {
+      promptCount++
+      return promptCount === 1 ? 'allow_dir_all' : 'deny'
+    })
+
+    // First write: prompts → user chooses allow_dir_all
+    await gateToolCall('write', { path: outsidePath }, deps)
+    expect(promptCount).toBe(1)
+
+    // write again: should NOT prompt
+    await gateToolCall('write', { path: outsidePath }, deps)
+    expect(promptCount).toBe(1)
+
+    // read: should NOT prompt (all-tools grant)
+    await gateToolCall('read', { path: outsidePath }, deps)
+    expect(promptCount).toBe(1)
+  })
+
+  it('allow_dir_tool: result is allow with decidedBy: user', async () => {
+    const events: unknown[] = []
+    const deps: GateDeps = {
+      ...externalAskDeps(),
+      hooks: {
+        emit: (_c: string, d: unknown) => {
+          events.push(d)
+        },
+      },
+    }
+    setAskResolver(async () => 'allow_dir_tool')
+    await gateToolCall('write', { path: outsidePath }, deps)
+
+    const ev = events.find(
+      (e) => (e as Record<string, unknown>).result === 'allow'
+    ) as Record<string, unknown> | undefined
+    expect(ev).toBeDefined()
+    expect(ev?.result).toBe('allow')
+    expect(ev?.decidedBy).toBe('user')
+  })
+
+  it('allow_dir_all does not add to session rules, only to the global allowlist', async () => {
+    const deps = externalAskDeps()
+    const initialSize = deps.sessionRules.size()
+
+    setAskResolver(async () => 'allow_dir_all')
+    await gateToolCall('write', { path: outsidePath }, deps)
+
+    // allow_dir_all uses addExternalDirAllow (process-global), NOT sessionRules
+    expect(deps.sessionRules.size()).toBe(initialSize)
+  })
+
+  it('allow_dir_tool persists to session rules', async () => {
+    const deps = externalAskDeps()
+    const initialSize = deps.sessionRules.size()
+
+    setAskResolver(async () => 'allow_dir_tool')
+    await gateToolCall('write', { path: outsidePath }, deps)
+
+    const snap = deps.sessionRules.snapshot()
+    expect(snap).toHaveLength(initialSize + 1)
+    expect(snap[initialSize].surface).toBe('external_directory:write')
+    expect(snap[initialSize].action).toBe('allow')
   })
 })

@@ -1,5 +1,5 @@
-import { homedir } from 'node:os'
 import { isAbsolute, normalize, relative, resolve, sep } from 'node:path'
+import { expandHomePrefix, expandMsysDrive } from './path-scope.ts'
 import type { Config, SimpleAction } from '../types/config.ts'
 import { wildcardMatch } from './wildcard-matcher.ts'
 import { extractTreePaths, isShellParserReady } from './shell-parse.ts'
@@ -39,49 +39,6 @@ export interface ExternalVerdict {
    * `external_directory` rule allowed it. Reporting only: never widens.
    */
   viaWorktree?: boolean
-}
-
-/**
- * Expands `~` / `$HOME` / `${HOME}` prefixes. Used for candidate paths
- * AND external_directory glob keys, so user-written `~/projects/**`
- * matches resolved absolute paths.
- */
-function expandHomePrefix(p: string): string {
-  const trimmed = p.trim()
-  if (
-    trimmed === '~' ||
-    trimmed.startsWith('~/') ||
-    trimmed.startsWith('~\\')
-  ) {
-    return homedir() + trimmed.slice(1)
-  }
-  if (
-    trimmed === '$HOME' ||
-    trimmed.startsWith('$HOME/') ||
-    trimmed.startsWith('$HOME\\')
-  ) {
-    return homedir() + trimmed.slice(5)
-  }
-  if (trimmed.startsWith('${HOME}')) {
-    return homedir() + trimmed.slice(7)
-  }
-  return trimmed
-}
-
-/**
- * Rewrites MSYS2/Git-Bash drive paths (`/c/Users/...` → `C:/Users/...`).
- * Win32-only: on POSIX `/c/...` is a legitimate absolute path and must
- * NOT be rewritten. A lone `/<letter>` (no trailing slash) means the
- * drive root. Anything else (`/cmd/...`) passes through untouched.
- */
-function expandMsysDrive(p: string): string {
-  if (process.platform !== 'win32') return p
-  const trimmed = p.trim()
-  const m = /^\/([a-zA-Z])(?:\/(.*))?$/.exec(trimmed)
-  if (!m) return p
-  const drive = (m[1] as string).toUpperCase()
-  const rest = m[2] ?? ''
-  return `${drive}:/${rest}`
 }
 
 // Safe sinks with identical meaning on POSIX and MSYS2/Git-Bash shells:
@@ -421,6 +378,58 @@ export function externalScopeAppliesTo(
   return patterns.some((pattern) => wildcardMatch(pattern, toolName))
 }
 
+/** Surface of a session rule that grants an external directory. */
+export const EXTERNAL_DIR_SURFACE = 'external_directory'
+
+/** Session-rule surface granting a directory for ONE tool only. */
+export function externalDirSurfaceFor(toolName: string): string {
+  return `${EXTERNAL_DIR_SURFACE}:${toolName}`
+}
+
+/**
+ * Per-path, per-tool approval check.
+ * A rule matches when it grants all tools (`external_directory`) or exactly
+ * this tool (`external_directory:<toolName>`).
+ */
+function isApprovedBySessionRule(
+  absPath: string,
+  sessionRules: SessionRules,
+  toolName?: string
+): boolean {
+  for (const rule of sessionRules.snapshot()) {
+    if (rule.action !== 'allow') continue
+    const allTools = rule.surface === EXTERNAL_DIR_SURFACE
+    const scoped =
+      toolName !== undefined && rule.surface === externalDirSurfaceFor(toolName)
+    if (!allTools && !scoped) continue
+    const expandedKey = normalize(
+      expandHomePrefix(expandMsysDrive(rule.pattern))
+    )
+    if (wildcardMatch(expandedKey, absPath)) return true
+  }
+  return false
+}
+
+/**
+ * Check whether a specific resolved path is approved either by a session-rule
+ * allow or by the global allowlist (modal "Allow for all tools").
+ *
+ * BUG 1: per-path check — does not short-circuit the whole evaluation.
+ * BUG 2: wires in `isExternalDirAllowed` which was dead code before.
+ */
+function isApprovedExternalPath(
+  absPath: string,
+  opts?: ExternalScopeOptions
+): boolean {
+  // Check global allowlist first (fast path — pure Set + glob).
+  if (isExternalDirAllowed(absPath)) return true
+  // Then check session rules (per-path, not per-call).
+  if (opts?.sessionRules) {
+    return isApprovedBySessionRule(absPath, opts.sessionRules, opts.toolName)
+  }
+  return false
+}
+
 /**
  * Evaluates the external_directory scope. Returns undefined (no opinion) when
  * the flag is off, when the tool is outside `externalDirectoryTools`, when no
@@ -437,31 +446,8 @@ export function evaluateExternalDirectory(
   try {
     if (cfg.confineToWorkingDirectory !== true) return undefined
     if (!externalScopeAppliesTo(cfg, opts?.toolName)) return undefined
-    // Session rules (from "Allow directory" choices) — checked before any
-    // other logic so the user's approval always wins.
-    if (opts?.sessionRules) {
-      const sessionRules = opts.sessionRules
-      const rules = sessionRules.snapshot()
-      for (const intent of intents) {
-        for (const rule of rules) {
-          if (
-            rule.surface === 'external_directory' &&
-            rule.action === 'allow'
-          ) {
-            const expandedKey = normalize(
-              expandHomePrefix(expandMsysDrive(rule.pattern))
-            )
-            const candidate =
-              intent.surface === 'fs'
-                ? resolveFsPath(intent.value, opts?.cwd ?? process.cwd())
-                : (opts?.cwd ?? process.cwd())
-            if (wildcardMatch(expandedKey, candidate)) {
-              return undefined
-            }
-          }
-        }
-      }
-    }
+    // The session-rules block that used to short-circuit the entire evaluation
+    // has been moved into `isApprovedExternalPath` as a per-path check (BUG 1).
     const base = opts?.cwd ?? process.cwd()
     const outside: Array<{
       abs: string
@@ -476,7 +462,7 @@ export function evaluateExternalDirectory(
         if (isEscapeDebris(intent.value)) continue
         if (isQuotedPureGlob(intent.value)) continue
         const abs = resolveFsPath(intent.value, base)
-        if (isOutsideCwd(abs, base))
+        if (isOutsideCwd(abs, base) && !isApprovedExternalPath(abs, opts))
           outside.push({
             abs,
             value: intent.value,
@@ -499,7 +485,7 @@ export function evaluateExternalDirectory(
           : extractBashPaths(intent.value)
         for (const cand of candidates) {
           const abs = resolveFsPath(cand, base)
-          if (isOutsideCwd(abs, base))
+          if (isOutsideCwd(abs, base) && !isApprovedExternalPath(abs, opts))
             outside.push({
               abs,
               value: source,

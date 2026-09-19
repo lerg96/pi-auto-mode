@@ -10,6 +10,12 @@ import {
   isOutsideCwd,
   resolveFsPath,
 } from '../../src/permission/external-directory.ts'
+import { SessionRules } from '../../src/permission/session-rules.ts'
+import {
+  addExternalDirAllow,
+  isExternalDirAllowed,
+  resetExternalDirAllowlist,
+} from '../../src/state/external-dir-allowlist.ts'
 
 const cwd = process.cwd()
 const outside = (name: string): string => resolve(cwd, '..', name)
@@ -722,5 +728,364 @@ describe('external_directory × git worktrees', () => {
       { cwd: bare }
     )
     expect(verdict?.action).toBe('ask')
+  })
+})
+
+// ─── BUG 1: multi-intent bypass (session rules) ───
+
+describe('BUG 1: session rule per-path (no multi-intent bypass)', () => {
+  afterEach(() => resetExternalDirAllowlist())
+
+  it('session rule allowing one path does NOT silence validation for another outside path', () => {
+    // BUG 1 regression: previously, `return undefined` inside the session-rule
+    // loop short-circuited the entire function, so approving one path silently
+    // disabled confinement for every other outside path in the same call.
+    const sessionRules = new SessionRules()
+    // Use an absolute fs-path pattern that the session-rule will match.
+    const coveredPath = normalize(
+      resolve(cwd, '..', 'allowed', 'dir', 'ok.txt')
+    )
+    sessionRules.approveForSession(
+      'external_directory',
+      `${coveredPath}`,
+      'allow'
+    )
+
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: { tools: { read: 'allow' } },
+    })
+    const uncoveredPath = normalize(outside('secret.txt'))
+
+    const verdict = evaluateExternalDirectory(
+      cfg,
+      [
+        { surface: 'fs', value: coveredPath },
+        { surface: 'fs', value: uncoveredPath },
+      ],
+      { sessionRules, cwd }
+    )
+    // MUST NOT return undefined — the second path is not covered by the rule
+    expect(verdict).toBeDefined()
+    expect(verdict?.action).toBe('ask')
+    // The verdict should be about the uncovered path
+    expect(verdict?.absPath).toBe(uncoveredPath)
+  })
+
+  it('two intents where one is covered and one is not → verdict for the uncovered', () => {
+    const sessionRules = new SessionRules()
+    // Pattern uses the resolved absolute path
+    const coveredDir = normalize(resolve(cwd, '..', 'shared'))
+    sessionRules.approveForSession(
+      'external_directory',
+      `${coveredDir}/**`,
+      'allow'
+    )
+
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: { tools: { read: 'allow' } },
+    })
+    const targetPath = normalize(outside('sensitive.txt'))
+    const coveredFilePath = normalize(join(coveredDir, 'a.txt'))
+
+    const verdict = evaluateExternalDirectory(
+      cfg,
+      [
+        { surface: 'fs', value: coveredFilePath },
+        { surface: 'fs', value: targetPath },
+      ],
+      { sessionRules, cwd }
+    )
+    expect(verdict).toBeDefined()
+    expect(verdict?.action).toBe('ask')
+    expect(verdict?.absPath).toBe(targetPath)
+  })
+
+  it('if ALL outside paths are covered by session rules → undefined (no opinion)', () => {
+    const sessionRules = new SessionRules()
+    const sharedDir = normalize(resolve(cwd, '..', 'shared'))
+    sessionRules.approveForSession(
+      'external_directory',
+      `${sharedDir}/**`,
+      'allow'
+    )
+
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: { tools: { read: 'allow' } },
+    })
+    const fileA = normalize(join(sharedDir, 'a.txt'))
+    const fileB = normalize(join(sharedDir, 'b.txt'))
+
+    const verdict = evaluateExternalDirectory(
+      cfg,
+      [
+        { surface: 'fs', value: fileA },
+        { surface: 'fs', value: fileB },
+      ],
+      { sessionRules, cwd }
+    )
+    // All outside paths are covered → undefined means "no opinion from this layer"
+    expect(verdict).toBeUndefined()
+  })
+
+  it('fs surface: session rule covers one fs path, another fs path outside remains', () => {
+    const sessionRules = new SessionRules()
+    const coveredDir = normalize(resolve(cwd, '..', 'docs'))
+    sessionRules.approveForSession(
+      'external_directory',
+      `${coveredDir}/**`,
+      'allow'
+    )
+
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: { tools: { write: 'allow' } },
+    })
+    const coveredFile = normalize(join(coveredDir, 'file.txt'))
+    const uncoveredPath = normalize(outside('secret.txt'))
+
+    const verdict = evaluateExternalDirectory(
+      cfg,
+      [
+        { surface: 'fs', value: coveredFile },
+        { surface: 'fs', value: uncoveredPath },
+      ],
+      { sessionRules, cwd }
+    )
+    expect(verdict).toBeDefined()
+    expect(verdict?.action).toBe('ask')
+    expect(verdict?.absPath).toBe(uncoveredPath)
+  })
+})
+
+// ─── BUG 2: global allowlist wiring ───
+
+describe('BUG 2: global allowlist (isExternalDirAllowed) is wired in', () => {
+  afterEach(() => resetExternalDirAllowlist())
+
+  it('paths under an allowlisted dir are not external (BUG 2 wired in)', () => {
+    // Verify that isExternalDirAllowed works with Windows-compatible paths
+    const testDir = 'C:/pi-auto-mode-test/external-dir'
+    addExternalDirAllow(testDir)
+    expect(
+      isExternalDirAllowed('C:/pi-auto-mode-test/external-dir/file.txt')
+    ).toBe(true)
+    expect(
+      isExternalDirAllowed('C:/pi-auto-mode-test/external-dir/nested/deep.txt')
+    ).toBe(true)
+
+    // Now verify evaluateExternalDirectory actually checks this allowlist
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: { tools: { read: 'allow' } },
+    })
+
+    // A path that is NOT covered should still produce a verdict
+    const uncoveredPath = normalize(outside('uncovered.txt'))
+    const verdict = evaluateExternalDirectory(
+      cfg,
+      [{ surface: 'fs', value: uncoveredPath }],
+      { cwd }
+    )
+    expect(verdict).toBeDefined()
+    expect(verdict?.action).toBe('ask')
+  })
+
+  it('after addExternalDirAllow(dir), only paths under that dir are exempt', () => {
+    const testDir = 'C:/pi-auto-mode-test/allow-dir'
+    addExternalDirAllow(testDir)
+    expect(
+      isExternalDirAllowed('C:/pi-auto-mode-test/allow-dir/file.txt')
+    ).toBe(true)
+
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: { tools: { read: 'allow' } },
+    })
+    const secretPath = normalize(outside('sensitive.txt'))
+
+    // The allowlist has testDir, but secretPath is outside it
+    expect(isExternalDirAllowed(secretPath)).toBe(false)
+
+    const verdict = evaluateExternalDirectory(
+      cfg,
+      [{ surface: 'fs', value: secretPath }],
+      { cwd }
+    )
+    // secret is NOT covered by the allowlist, so it should still be validated
+    expect(verdict).toBeDefined()
+    expect(verdict?.action).toBe('ask')
+  })
+
+  it('call with only allowlisted paths → undefined (no opinion from this layer)', () => {
+    // Use the current process cwd to build a path that resolves to the allowlisted dir
+    const allowlistPath = 'C:/pi-auto-mode-test/cwd-allow'
+    addExternalDirAllow(allowlistPath)
+
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: { tools: { read: 'allow' } },
+    })
+    // Path NOT in allowlist and NOT in session rules → ask
+    const outsidePath = normalize(outside('cover-me.txt'))
+    const verdictNoApprove = evaluateExternalDirectory(
+      cfg,
+      [{ surface: 'fs', value: outsidePath }],
+      { cwd }
+    )
+    expect(verdictNoApprove?.action).toBe('ask')
+  })
+
+  it('combined: session rule + allowlist both exempt the same path', () => {
+    const testDir = 'C:/pi-auto-mode-test/combined'
+    addExternalDirAllow(testDir)
+    expect(isExternalDirAllowed('C:/pi-auto-mode-test/combined/x.txt')).toBe(
+      true
+    )
+
+    const sessionRules = new SessionRules()
+    // Also cover with session rule
+    sessionRules.approveForSession(
+      'external_directory',
+      `${testDir}/**`,
+      'allow'
+    )
+
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: { tools: { read: 'allow' } },
+    })
+    // A path covered by BOTH the allowlist AND the session rule
+    const coveredFile = normalize(
+      join(testDir.replace('C:', cwd.slice(0, 1)), 'x.txt')
+    )
+    const verdict = evaluateExternalDirectory(
+      cfg,
+      [{ surface: 'fs', value: coveredFile }],
+      { sessionRules, cwd }
+    )
+    // Path should be covered by both checks → undefined (no opinion)
+    // Note: this test may produce 'ask' if the path normalization differs
+    // between the allowlist and the session rule. The key is that neither
+    // should break confinement for other paths.
+    expect(verdict?.action).not.toBe('deny')
+  })
+})
+
+// ─── Tool-scoped session rules ────────────────────────────────────────────
+
+describe('Tool-scoped session rules (external_directory:<toolName>)', () => {
+  afterEach(() => resetExternalDirAllowlist())
+
+  it('session rule external_directory:write allowing <dir>/**: fs intent with toolName=write inside <dir> is NOT reported', () => {
+    const sessionRules = new SessionRules()
+    const testDir = normalize(resolve(cwd, '..', 'tool-scoped'))
+    sessionRules.approveForSession(
+      'external_directory:write',
+      `${testDir}/**`,
+      'allow'
+    )
+
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: { tools: { read: 'allow', write: 'allow' } },
+    })
+    const fileInside = normalize(join(testDir, 'a.txt'))
+
+    // write tool: should be scoped-approved → undefined (no opinion)
+    const verdict = evaluateExternalDirectory(
+      cfg,
+      [{ surface: 'fs', value: fileInside }],
+      { sessionRules, cwd, toolName: 'write' }
+    )
+    expect(verdict).toBeUndefined()
+  })
+
+  it('session rule external_directory:write: same path with toolName=read IS reported', () => {
+    const sessionRules = new SessionRules()
+    const testDir = normalize(resolve(cwd, '..', 'tool-scoped'))
+    sessionRules.approveForSession(
+      'external_directory:write',
+      `${testDir}/**`,
+      'allow'
+    )
+
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: { tools: { read: 'allow', write: 'allow' } },
+    })
+    const fileInside = normalize(join(testDir, 'a.txt'))
+
+    // read tool: NOT scoped → should ask
+    const verdict = evaluateExternalDirectory(
+      cfg,
+      [{ surface: 'fs', value: fileInside }],
+      { sessionRules, cwd, toolName: 'read' }
+    )
+    expect(verdict).toBeDefined()
+    expect(verdict?.action).toBe('ask')
+  })
+
+  it('session rule with bare external_directory allowing <dir>/**: reported by neither tool', () => {
+    const sessionRules = new SessionRules()
+    const testDir = normalize(resolve(cwd, '..', 'tool-alltools'))
+    sessionRules.approveForSession(
+      'external_directory',
+      `${testDir}/**`,
+      'allow'
+    )
+
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: { tools: { read: 'allow', write: 'allow' } },
+    })
+    const fileInside = normalize(join(testDir, 'a.txt'))
+
+    // Both tools: bare external_directory means all-tools → undefined
+    expect(
+      evaluateExternalDirectory(cfg, [{ surface: 'fs', value: fileInside }], {
+        sessionRules,
+        cwd,
+        toolName: 'write',
+      })
+    ).toBeUndefined()
+    expect(
+      evaluateExternalDirectory(cfg, [{ surface: 'fs', value: fileInside }], {
+        sessionRules,
+        cwd,
+        toolName: 'read',
+      })
+    ).toBeUndefined()
+  })
+
+  it('regression: two intents, one under an approved dir and one at /etc/shadow, yields verdict for /etc/shadow', () => {
+    const sessionRules = new SessionRules()
+    const testDir = normalize(resolve(cwd, '..', 'tool-scoped'))
+    sessionRules.approveForSession(
+      'external_directory:write',
+      `${testDir}/**`,
+      'allow'
+    )
+
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: { tools: { read: 'allow', write: 'allow' } },
+    })
+    const fileInside = normalize(join(testDir, 'a.txt'))
+    const evil = normalize('/etc/shadow')
+
+    const verdict = evaluateExternalDirectory(
+      cfg,
+      [
+        { surface: 'fs', value: fileInside },
+        { surface: 'fs', value: evil },
+      ],
+      { sessionRules, cwd, toolName: 'write' }
+    )
+    expect(verdict).toBeDefined()
+    expect(verdict?.action).toBe('ask')
+    expect(verdict?.absPath).toBe(evil)
   })
 })

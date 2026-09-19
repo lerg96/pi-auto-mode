@@ -286,14 +286,17 @@ When a tool call lands on `ask` (because the permission rule asks for it or beca
 
 ### Modal options
 
-The select exposes four options (the default-highlighted option is **Deny**):
+The select exposes options for standard tool-permission prompts
+(`Allow` pre-highlighted); the external-directory modal adds two more:
 
-| Option              | Effect                                                                                                                                                                                                                                                                       |
-| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Deny`              | Resolves `'deny'`. Closes the modal.                                                                                                                                                                                                                                         |
-| `Allow`             | Resolves `'allow'` with a single click.                                                                                                                                                                                                                                      |
-| `Allow for session` | Persists the approval for future equivalent tool calls.                                                                                                                                                                                                                      |
-| `Deny with reason`  | Opens a free-text input (`pi.ui.input`) to capture the reason; if there is non-empty text, returns `{ decision: 'deny', reason }`. If cancelled or left empty, falls back to reason-less `'deny'`. The reason is sanitized (no newlines, trimmed) before reaching the model. |
+| Option                | Effect                                                                                                                                                                                                                                                                       |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Deny`                | Resolves `'deny'`. Closes the modal.                                                                                                                                                                                                                                         |
+| `Allow`               | Resolves `'allow'` with a single click.                                                                                                                                                                                                                                      |
+| `Allow for session`   | Persists the approval for future equivalent tool calls.                                                                                                                                                                                                                      |
+| `Deny with reason`    | Opens a free-text input (`pi.ui.input`) to capture the reason; if there is non-empty text, returns `{ decision: 'deny', reason }`. If cancelled or left empty, falls back to reason-less `'deny'`. The reason is sanitized (no newlines, trimmed) before reaching the model. |
+| `Allow for this tool` | (external-directory only) Resolves `'allow_dir_tool'`. The gate records a session rule (`userVerdict: 'allow_dir_tool'`).                                                                                                                                                    |
+| `Allow for all tools` | (external-directory only) Resolves `'allow_dir_all'`. The gate adds to a process allowlist (`userVerdict: 'allow_dir_all'`).                                                                                                                                                 |
 
 ### Configurable timeout (`ui.modalTimeoutMs`)
 
@@ -329,27 +332,50 @@ working directory, the modal renders a **different layout** than the standard
 permission prompt. This makes it clear that the question is about the
 **target directory**, not about the tool itself.
 
-The external-directory modal shows:
+> The external-directory modal is only shown when the **external-directory
+> layer itself produced the `ask`** (i.e. the path check is what triggered
+> the prompt). If a normal permission rule produces the `ask` but the call
+> also references an allowed external path, the standard permission modal
+> is shown instead.
 
-| Button                  | Effect                                                                                                                                                                                                                      |
-| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Allow this call**     | Grant once — nothing is remembered (`'allow'`).                                                                                                                                                                             |
-| **Allow for this tool** | Persist a session rule that skips the prompt for the **same path** on future calls of the **same tool** (`'allow_dir_tool'`). Internally calls `sessionRules.approveForSession('external_directory', '<dir>/**', 'allow')`. |
-| **Allow for all tools** | Add the directory to a process-wide allowlist that covers **every tool** (`'allow_dir_all'`). Stored in memory only — not persisted across restarts.                                                                        |
-| **Deny**                | Block this call only.                                                                                                                                                                                                       |
-| **Deny with reason**    | Block and attach your reason for the model.                                                                                                                                                                                 |
+Whichever button you pick, the approval is scoped to a **directory**, and the
+row the modal labels `path` shows exactly that directory — what is displayed
+is what gets persisted. The gate computes it once (`grantDirFor`) and hands
+the same value to the modal and to persistence, so the two can never drift.
+The directory is resolved as:
+
+| Offending path                | Directory granted               |
+| ----------------------------- | ------------------------------- |
+| exists and is a directory     | the path itself                 |
+| exists and is not a directory | its parent                      |
+| does not exist                | its parent                      |
+| stat fails for another reason | the path itself (never upwards) |
+
+If the grant would be a **filesystem root** (`/`, `C:\`), nothing is persisted
+and the approval degrades to a one-time allow: the prompt comes back next
+time rather than silently whitelisting the whole drive.
+
+The modal shows:
+
+| Button                  | Effect                                                                                                                                                                                                           |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Allow this call**     | Grant once — nothing is remembered (`'allow'`).                                                                                                                                                                  |
+| **Allow for this tool** | The gate records a **session rule** scoped to that tool (surface `external_directory:<tool>`, pattern `<dir>/**`). Other tools still prompt (`'allow_dir_tool'`). Event carries `userVerdict: 'allow_dir_tool'`. |
+| **Allow for all tools** | The gate adds the directory to a **process-scoped allowlist** that `evaluateExternalDirectory` pre-checks for every tool and every session (`'allow_dir_all'`). Event carries `userVerdict: 'allow_dir_all'`.    |
+| **Deny**                | Block this call only.                                                                                                                                                                                            |
+| **Deny with reason**    | Block and attach your reason for the model.                                                                                                                                                                      |
+
+A hand-written session rule on the bare `external_directory` surface grants
+the directory to **all** tools, like `Allow for all tools` but stored as a
+session rule.
 
 The standard permission modal (for tools that triggered a rule-based `ask`)
 keeps its original four-button layout: `Allow`, `Allow for session`,
 `Deny`, `Deny with reason`.
 
-When the user picks `Allow for this tool`, the gate records a session rule
-with surface `external_directory` and pattern `<dir>/**`. Future calls that
-hit the same external directory **for any tool** will bypass the confinement
-check via `sessionRules` (the external-directory layer checks session rules
-before applying its own logic). When the user picks `Allow for all tools`,
-the directory is added to a process-scoped `Set<string>` allowlist that
-`evaluateExternalDirectory` pre-checks before doing any path analysis.
+The gate owns all session-approval persistence: it receives the decision id
+from the modal and applies the appropriate side effect (session rule or
+allowlist) so that the modal never mutates state directly.
 
 ### Modal fail-closed invariants
 

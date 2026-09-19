@@ -18,7 +18,9 @@ import { playNotificationSound, type SoundPlayer } from './sound.ts'
 import type { configState } from '../state/config-state.ts'
 import type { SessionRules } from '../permission/session-rules.ts'
 import type { ExtensionAPI } from '../pi-sdk.ts'
-import { addExternalDirAllow } from '../state/external-dir-allowlist.ts'
+// NOTE: addExternalDirAllow is NOT imported here — the gate (gate.ts) owns
+// persistence for external-directory approvals. The modal only returns the
+// decision id; side effects are applied by the gate after normalisation.
 
 /**
  * Sanitize a value for TUI label display (H5).
@@ -351,10 +353,14 @@ export interface ModalResolverOpts {
 
 export function createModalAskResolver(
   pi: ExtensionAPI,
-  sessionRules: SessionRules,
+  _sessionRules: SessionRules,
   cfgState: typeof configState,
   opts?: ModalResolverOpts
 ): AskResolver {
+  // sessionRules is intentionally unused here — the gate (gate.ts) owns
+  // session-approval persistence for all decision types. This parameter
+  // exists only for backward compatibility with callers that construct the
+  // resolver with an instance.
   return async (req) => {
     const bound = getUiContext()
     let ui: ExtensionUI
@@ -498,20 +504,15 @@ export function createModalAskResolver(
 
                     case 'allow_dir_tool':
                       // External-directory: allow this directory for this tool.
-                      // Persist as a session rule so the gate skips future
-                      // prompts for matching calls.
-                      sessionRules.approveForSession(
-                        'external_directory',
-                        `${req.externalDir ?? req.value}/**`,
-                        'allow'
-                      )
+                      // The gate (gate.ts) persists the session rule after
+                      // receiving this decision id. The modal only returns it.
                       finish('allow_dir_tool')
                       return
 
                     case 'allow_dir_all':
                       // External-directory: allow this directory for all tools.
-                      // Add to the global allowlist.
-                      addExternalDirAllow(req.externalDir ?? req.value)
+                      // The gate (gate.ts) adds to the global allowlist after
+                      // receiving this decision id. The modal only returns it.
                       finish('allow_dir_all')
                       return
 

@@ -14,12 +14,15 @@ import type {
 import { evaluatePermission } from '../permission/visibility.ts'
 import { evaluateExternalDirectory } from '../permission/external-directory.ts'
 import { wildcardMatch } from '../permission/wildcard-matcher.ts'
+import { grantDirFor } from '../permission/path-scope.ts'
+import { externalDirSurfaceFor } from '../permission/external-directory.ts'
 import { normalizeToolCall, type AccessIntent } from './normalize.ts'
 import { getAskResolver, normalizeAskDecision, type AskVia } from './ask.ts'
 import { BUS_CHANNEL_DECISION } from '../events.ts'
 import { redactSecretsForModel } from '../classifier/secret-guard.ts'
 import { redact } from '../telemetry/telemetry.ts'
 import { createHash } from 'node:crypto'
+import { addExternalDirAllow } from '../state/external-dir-allowlist.ts'
 
 export interface DecisionRiskDetail {
   score: number
@@ -381,13 +384,14 @@ class AskDeniedError extends Error {
   }
 }
 
-// Modal outcomes worth training on: grant-once vs grant-for-session are
-// different approval strengths. 'session' (no modal shown) maps to NO
+// Modal outcomes worth training on: grant-once vs grant-for-session vs
+// directory-specific approvals. 'session' (no modal shown) maps to NO
 // userVerdict key at all.
-type AskVerdict = 'allow' | 'allow_session' | 'session'
+type AskVerdict =
+  'allow' | 'allow_session' | 'allow_dir_tool' | 'allow_dir_all' | 'session'
 
 function verdictExtra(verdict: AskVerdict): {
-  userVerdict?: 'allow' | 'allow_session'
+  userVerdict?: 'allow' | 'allow_session' | 'allow_dir_tool' | 'allow_dir_all'
 } {
   return verdict === 'session' ? {} : { userVerdict: verdict }
 }
@@ -427,7 +431,11 @@ async function resolveAsk(
   toolName?: string,
   fullCommand?: string,
   startedAt?: number,
-  externalDir?: { isExternalDir: boolean; externalDirPath?: string }
+  externalDir?: {
+    isExternalDir: boolean
+    externalDirPath?: string
+    externalGrantDir?: string
+  }
 ): Promise<{ requestId: string; verdict: AskVerdict; via: AskAudit['via'] }> {
   const requestId =
     globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)
@@ -480,7 +488,7 @@ async function resolveAsk(
     tool: toolName,
     fullCommand,
     type: externalDir?.isExternalDir ? 'external-directory' : 'tool-permission',
-    externalDir: externalDir?.externalDirPath,
+    externalDir: externalDir?.externalGrantDir ?? externalDir?.externalDirPath,
   })
   const { decision, reason, via } = normalizeAskDecision(res)
 
@@ -494,6 +502,24 @@ async function resolveAsk(
     const safePattern = value
     deps.sessionRules.approveForSession(surface, safePattern, 'allow')
     return { requestId, verdict: 'allow_session', via }
+  }
+  if (decision === 'allow_dir_tool') {
+    deps.denyService?.onContinueSucceeded()
+    if (externalDir?.externalGrantDir && toolName !== undefined) {
+      deps.sessionRules.approveForSession(
+        externalDirSurfaceFor(toolName),
+        `${externalDir.externalGrantDir}/**`,
+        'allow'
+      )
+    }
+    return { requestId, verdict: 'allow_dir_tool', via }
+  }
+  if (decision === 'allow_dir_all') {
+    deps.denyService?.onContinueSucceeded()
+    if (externalDir?.externalGrantDir) {
+      addExternalDirAllow(externalDir.externalGrantDir)
+    }
+    return { requestId, verdict: 'allow_dir_all', via }
   }
   // Plain 'deny' carries no user-typed reason: inherit the reason shown in
   // the modal header (permission-rule reason first, classifier risk
@@ -698,9 +724,16 @@ export async function gateToolCall(
   })
   const externalDirPath =
     externalVerdict === undefined ? undefined : externalVerdict.absPath
+  const externalGrantDir =
+    externalVerdict === undefined
+      ? undefined
+      : grantDirFor(externalVerdict.absPath)
+  let wasExternalDirMoreRestrictive = false
   if (externalVerdict !== undefined) {
     const rank = { allow: 0, ask: 1, deny: 2 } as const
-    if (rank[externalVerdict.action] > rank[permAction]) {
+    wasExternalDirMoreRestrictive =
+      rank[externalVerdict.action] > rank[permAction]
+    if (wasExternalDirMoreRestrictive) {
       permAction = externalVerdict.action
       rulePattern = externalVerdict.pattern ?? '*'
       ruleReason = `access outside the working directory is not allowed: ${externalVerdict.absPath}`
@@ -711,7 +744,10 @@ export async function gateToolCall(
     }
   }
 
-  const isExternalDirAsk = permAction === 'ask' && externalDirPath !== undefined
+  let isExternalDirAsk = false
+  if (externalVerdict !== undefined && wasExternalDirMoreRestrictive) {
+    isExternalDirAsk = externalVerdict.action === 'ask'
+  }
 
   if (permAction === 'deny') {
     const action = applyDenyStrategy(
@@ -916,7 +952,9 @@ export async function gateToolCall(
       toolName,
       fullCommand,
       startedAt,
-      isExternalDirAsk ? { isExternalDir: true, externalDirPath } : undefined
+      isExternalDirAsk
+        ? { isExternalDir: true, externalDirPath, externalGrantDir }
+        : undefined
     )
     emit(deps.hooks, askSurface, askValue, 'allow', resolution, {
       requestId,

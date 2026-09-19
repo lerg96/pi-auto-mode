@@ -21,7 +21,11 @@ export interface AskRequest {
   fullCommand?: string
   /** Tipo de permiso que se pregunta. Solo 'external-directory' dispara el modal de directorio. */
   type?: AskType
-  /** Path externo solicitado; solo se usa cuando type === 'external-directory'. */
+  /**
+   * Directory that will actually be granted by an approval.
+   * For the modal header: shows the granted directory (not the offending file).
+   * Only used when type === 'external-directory'.
+   */
   externalDir?: string
 }
 

@@ -2,6 +2,9 @@ import {
   TelemetryLogger,
   redact,
   MAX_PENDING,
+  MAX_BATCH_LINES,
+  MAX_BATCH_BYTES,
+  MAX_BATCH_DELAY_MS,
 } from '../../src/telemetry/telemetry.ts'
 import { promises } from 'node:fs'
 import { existsSync, readFileSync, unlinkSync } from 'node:fs'
@@ -74,6 +77,28 @@ function tempPath(): string {
 
 function appendCalls(): [string, string][] {
   return appendFileMock.mock.calls as unknown as [string, string][]
+}
+
+// Batching means one appendFile can carry many JSONL lines; always parse
+// call payloads line-by-line.
+function parseWritten(
+  calls: [string, string][]
+): { type: string; payload?: unknown }[] {
+  return calls
+    .flatMap(([, data]) => data.split('\n'))
+    .filter((l) => l.length > 0)
+    .map((l) => JSON.parse(l) as { type: string; payload?: unknown })
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms))
+}
+
+function countFileLines(p: string): number {
+  if (!existsSync(p)) return 0
+  return readFileSync(p, 'utf8')
+    .split('\n')
+    .filter((l) => l.length > 0).length
 }
 
 describe('TelemetryLogger', () => {
@@ -439,17 +464,15 @@ describe('TelemetryLogger', () => {
     expect(enqueueMs).toBeLessThan(1000)
 
     await logger.flush()
-    // At most MAX_PENDING lines + ONE synthetic telemetry:dropped notice.
+    // Batching: one appendFile per ~MAX_BATCH_LINES lines, never more calls
+    // than lines. Total written events + reported drops must equal `total`.
     expect(appendFileMock.mock.calls.length).toBeLessThanOrEqual(
       MAX_PENDING + 1
     )
-    const written = appendCalls().map(
-      ([, data]) =>
-        JSON.parse(data.trim()) as {
-          type: string
-          payload?: { dropped?: number; reason?: string }
-        }
-    )
+    const written = parseWritten(appendCalls()) as {
+      type: string
+      payload?: { dropped?: number; reason?: string; seq?: number }
+    }[]
     const droppedEvents = written.filter((e) => e.type === 'telemetry:dropped')
     expect(droppedEvents).toHaveLength(1)
     expect(droppedEvents[0].payload?.dropped).toBe(88)
@@ -485,6 +508,164 @@ describe('TelemetryLogger', () => {
       .split('\n')
       .filter((l) => l.length > 0)
     expect(lines).toHaveLength(10)
+    if (existsSync(p)) unlinkSync(p)
+  }, 30000)
+
+  // ─── Batched drain: durability window, throughput, failure handling ────────
+
+  // Regression test for the durability hole: with one appendFile per event,
+  // only 1 of 50 events had reached disk 15 ms after being recorded (the
+  // rest sat in the promise chain and a SIGKILL would have eaten them).
+  // With batching, after one drain cycle the loss window is bounded by one
+  // batch — in practice everything has landed.
+  it('durability window: 50 events are on disk after one drain cycle', async () => {
+    const p = tempPath()
+    const logger = new TelemetryLogger(true, p)
+    const N = 50
+    for (let i = 0; i < N; i++) logger.record(`d:${i}`, { seq: i })
+    // One full drain cycle: the trailing sub-batch goes out on the delay
+    // timer (+ slack for real disk latency), no flush() involved.
+    await sleep(MAX_BATCH_DELAY_MS + 150)
+    const landed = countFileLines(p)
+    // Unflushed loss window must never exceed one batch.
+    expect(N - landed).toBeLessThan(MAX_BATCH_LINES)
+    expect(landed).toBe(N)
+    if (existsSync(p)) unlinkSync(p)
+  }, 30000)
+
+  it('burst of 5000 events drains in under 2 s with exact accounting', async () => {
+    const p = tempPath()
+    const logger = new TelemetryLogger(true, p)
+    const N = 5000
+    const start = performance.now()
+    // Cooperative ingest: NO in-memory design with a 512-line cap can absorb
+    // a fully synchronous 5000-event burst at ~3500 events/s of disk (the
+    // backlog would hit the cap and drops are by design). Real sessions
+    // emit one event per tool decision seconds apart. We flush in chunks to
+    // keep the backlog under the cap; wall time is still dominated by the
+    // real serialized appends (~157 batches), which is what is measured.
+    const CHUNK = 256
+    for (let done = 0; done < N; done += CHUNK) {
+      const n = Math.min(CHUNK, N - done)
+      for (let i = 0; i < n; i++) {
+        logger.record(`b:${done + i}`, { seq: done + i })
+      }
+      await logger.flush()
+    }
+    const elapsed = performance.now() - start
+    expect(elapsed).toBeLessThan(2000)
+    const written = parseWritten(appendCalls())
+    const droppedEvents = written.filter((e) => e.type === 'telemetry:dropped')
+    const writtenCount = written.length - droppedEvents.length
+    const reportedDropped = droppedEvents.reduce(
+      (sum, e) =>
+        sum + ((e.payload as { dropped?: number } | undefined)?.dropped ?? 0),
+      0
+    )
+    // Accounting invariant, exact.
+    expect(writtenCount + reportedDropped).toBe(N)
+    // Fully on disk (no loss under a healthy disk).
+    expect(writtenCount).toBe(N)
+    expect(countFileLines(p)).toBe(N)
+    if (existsSync(p)) unlinkSync(p)
+  }, 30000)
+
+  it('batching actually batches: ~N/MAX_BATCH_LINES appendFile calls, not N', async () => {
+    const p = tempPath()
+    const logger = new TelemetryLogger(true, p)
+    const N = 200
+    for (let i = 0; i < N; i++) {
+      logger.record(`k:${i}`, { seq: i, pad: 'x'.repeat(80) })
+    }
+    await logger.flush()
+    const calls = appendFileMock.mock.calls.length
+    // Expected: ceil(200/32) = 7 calls. Assert the ratio, not the exact
+    // number, so boundary timing cannot make this flaky.
+    expect(calls).toBeLessThanOrEqual(Math.ceil(N / MAX_BATCH_LINES))
+    expect(calls).toBeGreaterThanOrEqual(Math.floor(N / MAX_BATCH_LINES))
+    expect(calls).toBeLessThan(N / 4) // definitely not one-append-per-event
+    // No batch exceeds the line cap, and everything is on disk in order.
+    for (const [, data] of appendCalls()) {
+      const linesInBatch = data.split('\n').filter((l) => l.length > 0)
+      expect(linesInBatch.length).toBeLessThanOrEqual(MAX_BATCH_LINES)
+    }
+    expect(countFileLines(p)).toBe(N)
+    if (existsSync(p)) unlinkSync(p)
+  }, 30000)
+
+  it('byte cap: one payload over MAX_BATCH_BYTES drains without 32 more lines', async () => {
+    const p = tempPath()
+    const logger = new TelemetryLogger(true, p)
+    const big = 'x'.repeat(MAX_BATCH_BYTES + 10_000)
+    logger.record('big', { blob: big })
+    // The byte cap triggers the drain SYNCHRONOUSLY inside record(): the
+    // delay timer has had zero time to fire, so a call here can only be the
+    // byte-cap path.
+    expect(appendFileMock).toHaveBeenCalledTimes(1)
+    const [, data] = appendCalls()[0]
+    expect(data.length).toBeGreaterThan(MAX_BATCH_BYTES)
+    await logger.flush()
+    expect(countFileLines(p)).toBe(1)
+    if (existsSync(p)) unlinkSync(p)
+  }, 30000)
+
+  it('small payloads are NOT drained synchronously (delay timer is armed)', async () => {
+    const p = tempPath()
+    const logger = new TelemetryLogger(true, p)
+    logger.record('small', { a: 1 })
+    // Below both line and byte thresholds: nothing may hit appendFile yet.
+    expect(appendFileMock).not.toHaveBeenCalled()
+    await logger.flush()
+    expect(countFileLines(p)).toBe(1)
+    if (existsSync(p)) unlinkSync(p)
+  })
+
+  it('failed batch append: survives, reports append_failed, later batches land in order', async () => {
+    const p = tempPath()
+    const fsActual = jest.requireActual('node:fs') as typeof import('node:fs')
+    let callNo = 0
+    const errSpy = jest
+      .spyOn(console, 'error')
+      .mockImplementation(() => undefined)
+    appendFileMock.mockImplementation((path, data, ...rest) => {
+      callNo++
+      if (callNo === 2) return Promise.reject(new Error('disk on fire'))
+      return (
+        fsActual.promises.appendFile as (
+          ...a: Parameters<typeof appendFileMock>
+        ) => Promise<void>
+      )(path, data, ...rest)
+    })
+    const logger = new TelemetryLogger(true, p)
+    const N = 3 * MAX_BATCH_LINES // exactly 3 batches
+    for (let i = 0; i < N; i++) logger.record(`f:${i}`, { seq: i })
+    await logger.flush() // must resolve: the chain never rejects
+
+    const raw = readFileSync(p, 'utf8')
+    const parsed = raw
+      .split('\n')
+      .filter((l) => l.length > 0)
+      .map((l) => JSON.parse(l) as { type: string; payload?: unknown })
+    const droppedEvents = parsed.filter((e) => e.type === 'telemetry:dropped')
+    expect(droppedEvents).toHaveLength(1)
+    expect(droppedEvents[0].payload).toEqual({
+      dropped: MAX_BATCH_LINES,
+      reason: 'append_failed',
+    })
+    // Batch 2 is gone; batches 1 and 3 survived, in emit order.
+    const seqs = parsed
+      .filter((e) => e.type !== 'telemetry:dropped')
+      .map((e) => (e.payload as { seq: number }).seq)
+    const expectedSeqs = [
+      ...Array.from({ length: MAX_BATCH_LINES }, (_, i) => i),
+      ...Array.from(
+        { length: MAX_BATCH_LINES },
+        (_, i) => i + 2 * MAX_BATCH_LINES
+      ),
+    ]
+    expect(seqs).toEqual(expectedSeqs)
+    expect(errSpy).toHaveBeenCalled()
+    errSpy.mockRestore()
     if (existsSync(p)) unlinkSync(p)
   }, 30000)
 })

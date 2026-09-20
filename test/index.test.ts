@@ -19,7 +19,10 @@ import { DEFAULT_CONFIG } from '../src/types/config.ts'
 import { SessionRules } from '../src/permission/session-rules.ts'
 import { DenyAndContinueService } from '../src/deny/deny-service.ts'
 import { setUiContext, getUiContext } from '../src/state/ui-context.ts'
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { SHUTDOWN_FLUSH_TIMEOUT_MS } from '../src/index.ts'
+import { TelemetryLogger } from '../src/telemetry/telemetry.ts'
+import { initShellParser } from '../src/permission/shell-parse.ts'
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -106,7 +109,7 @@ describe('session lifecycle (M3)', () => {
     expect(denyService.getStats().total).toBe(1)
   })
 
-  it('also resets on session_shutdown (endSession)', () => {
+  it('also resets on session_shutdown (endSession)', async () => {
     const sessionRules = new SessionRules()
     const denyService = new DenyAndContinueService({
       mode: 'both',
@@ -117,7 +120,7 @@ describe('session lifecycle (M3)', () => {
       reason: 'x',
       trigger: 'permission',
     })
-    endSession(
+    await endSession(
       sessionRules,
       denyService,
       (async () => {}) as unknown as PiEventHandler,
@@ -125,6 +128,124 @@ describe('session lifecycle (M3)', () => {
       ctx
     )
     expect(denyService.getStats()).toEqual({ consecutive: 0, total: 0 })
+  })
+})
+
+/*
+  Extension activation kicks off `void initShellParser()` (src/index.ts) - a
+  deliberately fire-and-forget wasm grammar load. When the last test of this
+  file finishes before that load reaches `resolveBashWasm()`, its `require`
+  lands in a module registry jest has already destroyed, which jest reports as
+  an out-of-test ReferenceError and turns into a non-zero exit even though
+  every test passed (intermittent, load-dependent). Awaiting the cached init
+  promise here lets it settle while the environment is still alive.
+*/
+afterAll(async () => {
+  await initShellParser()
+})
+
+describe('session_shutdown flushes the audit log', () => {
+  const dirs: string[] = []
+  afterEach(() => {
+    jest.useRealTimers()
+    while (dirs.length)
+      rmSync(dirs.pop() as string, { recursive: true, force: true })
+  })
+
+  it('writes queued events to disk by the time the handler resolves', async () => {
+    const d = mkdtempSync(join(tmpdir(), 'shutdown-'))
+    dirs.push(d)
+    const p = join(d, 'a.jsonl')
+    // A deliberately slow append: without an awaited flush the handler would
+    // resolve long before this resolves, and the assertions below would see
+    // an empty file. Without the delay the test could pass on a lucky race.
+    const fsp = await import('node:fs/promises')
+    const real = fsp.appendFile
+    jest.spyOn(fsp, 'appendFile').mockImplementation((async (
+      ...a: unknown[]
+    ) => {
+      await new Promise((r) => setTimeout(r, 25))
+      return (real as (...x: unknown[]) => Promise<void>)(
+        ...(a as [string, string, string])
+      )
+    }) as never)
+    const telemetry = new TelemetryLogger(true, p)
+    telemetry.record('permissions:decision', {
+      surface: 'fs',
+      value: 'cat .env',
+    })
+
+    await endSession(
+      new SessionRules(),
+      new DenyAndContinueService({
+        mode: 'both',
+        escalation: { consecutive: 3, total: 20 },
+      }),
+      (async () => {}) as unknown as PiEventHandler,
+      event,
+      ctx,
+      { telemetry }
+    )
+
+    // No explicit telemetry.flush(): the shutdown handler is what drained it.
+    expect(readFileSync(p, 'utf8')).toContain('permissions:decision')
+    ;(fsp.appendFile as unknown as { mockRestore?: () => void }).mockRestore?.()
+  })
+
+  it('resolves even if flush never settles: a stalled disk cannot wedge teardown', async () => {
+    jest.useFakeTimers()
+    const stalled = { flush: () => new Promise<void>(() => {}) }
+    const rejected = { flush: () => Promise.reject(new Error('disk gone')) }
+
+    const done = endSession(
+      new SessionRules(),
+      new DenyAndContinueService({
+        mode: 'both',
+        escalation: { consecutive: 3, total: 20 },
+      }),
+      (async () => {}) as unknown as PiEventHandler,
+      event,
+      ctx,
+      { telemetry: stalled, debug: rejected }
+    )
+
+    let settled = false
+    void done.then(() => {
+      settled = true
+    })
+    await jest.advanceTimersByTimeAsync(SHUTDOWN_FLUSH_TIMEOUT_MS - 1)
+    expect(settled).toBe(false)
+    await jest.advanceTimersByTimeAsync(SHUTDOWN_FLUSH_TIMEOUT_MS + 50)
+    await done
+    expect(settled).toBe(true)
+  })
+
+  it('resets session state synchronously, before awaiting anything', () => {
+    const sessionRules = new SessionRules()
+    sessionRules.approveForSession('fs', '/tmp/x', 'allow')
+    const denyService = new DenyAndContinueService({
+      mode: 'both',
+      escalation: { consecutive: 3, total: 20 },
+    })
+    denyService.recordDenial({
+      toolName: 'bash',
+      reason: 'x',
+      trigger: 'permission',
+    })
+
+    // Called without await on purpose: a caller that treats the handler as
+    // fire-and-forget must still see the reset have happened.
+    void endSession(
+      sessionRules,
+      denyService,
+      (async () => {}) as unknown as PiEventHandler,
+      event,
+      ctx,
+      { telemetry: { flush: () => new Promise<void>(() => {}) } }
+    )
+
+    expect(denyService.getStats()).toEqual({ consecutive: 0, total: 0 })
+    expect(sessionRules.size()).toBe(0)
   })
 })
 

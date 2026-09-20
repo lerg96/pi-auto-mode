@@ -97,17 +97,66 @@ export function beginSession(
   void base(event, ctx)
 }
 
-/** Ends a session; mirrors {@link beginSession} for symmetry of reset. */
-export function endSession(
+/*
+  Telemetry flush at session teardown
+
+  Pi awaits `session_shutdown` handlers (PiEventHandler returns
+  `void | Promise<void>` and the runtime runs its post-shutdown callback only
+  *after* they finish), so awaiting the logger drain here is what turns
+  "queued audit events are probably on disk" into "they are on disk" for every
+  clean teardown (session switch, /exit, Ctrl+C). An abrupt kill can still
+  lose whatever was in the queue - there is no hook for that.
+
+  The flush is raced against a hard deadline. Telemetry must never gain the
+  power to wedge the host: a stalled drive or a file locked by another process
+  could leave the pending append un-resolved forever, and an extension that
+  blocks pi from exiting is a worse bug than the audit line it saves. Past the
+  deadline we give up and lose exactly what we would have lost without this
+  hook, so the timeout can only ever make things better.
+*/
+export const SHUTDOWN_FLUSH_TIMEOUT_MS = 2000
+
+interface Flushable {
+  flush(): Promise<void>
+}
+
+async function boundedFlush(logger: Flushable | undefined): Promise<void> {
+  if (!logger) return
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await Promise.race([
+      // A rejected flush must not propagate into teardown either.
+      logger.flush().catch(() => undefined),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, SHUTDOWN_FLUSH_TIMEOUT_MS)
+        // The deadline itself must never be the thing holding the loop open.
+        timer.unref()
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+/**
+ * Ends a session; mirrors {@link beginSession} for symmetry of reset, plus a
+ * bounded audit-log flush (see `SHUTDOWN_FLUSH_TIMEOUT_MS`). Reset stays
+ * synchronous and happens before the first await, so callers that treat this
+ * as a fire-and-forget handler still observe the reset having taken effect.
+ */
+export async function endSession(
   sessionRules: SessionRules,
   denyService: DenyAndContinueService,
   base: PiEventHandler,
   event: PiEventData,
-  ctx: ExtensionContext
-): void {
+  ctx: ExtensionContext,
+  loggers?: { telemetry?: Flushable; debug?: Flushable }
+): Promise<void> {
   sessionRules.clear()
   denyService.reset()
   void base(event, ctx)
+  await boundedFlush(loggers?.telemetry)
+  await boundedFlush(loggers?.debug)
 }
 
 // ─── Config reload (S3 fail-closed) ─────────────────────────────
@@ -382,9 +431,16 @@ export default function piAutoMode(pi: ExtensionAPI): void {
   )
 
   // No `resources_discover` handler either (same no-op stub removal).
-  pi.on('session_shutdown', (event, ctx) => {
-    endSession(sessionRules, denyService, handleSessionShutdown, event, ctx)
-  })
+  // The handler must RETURN the promise: `PiEventHandler` is declared
+  // `=> void | Promise<void>` and pi only awaits what it is handed back. A
+  // body that drops the promise on the floor would make the shutdown flush
+  // best-effort again, which is the whole point of this hook.
+  pi.on('session_shutdown', (event, ctx) =>
+    endSession(sessionRules, denyService, handleSessionShutdown, event, ctx, {
+      telemetry,
+      debug: debugLog,
+    })
+  )
 
   registerSetCommands(pi, configState)
   setAskResolver(createModalAskResolver(pi, sessionRules, configState))

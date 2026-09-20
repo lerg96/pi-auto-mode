@@ -69,15 +69,13 @@ function matchGreedy(p: string, v: string): boolean {
     } else if (pc === 63 /* '?' */ || pc === v.charCodeAt(vi)) {
       pi++
       vi++
-      continue
-    } else if (starPatternIndex !== -1) {
+    } else if (starPatternIndex === -1) {
+      return false
+    } else {
       // Backtrack: the last '*' consumes one more value char.
       pi = starPatternIndex
       starValueIndex++
       vi = starValueIndex
-      continue
-    } else {
-      return false
     }
   }
 

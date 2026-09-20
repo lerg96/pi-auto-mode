@@ -142,8 +142,14 @@ export function applyConfigReload(next: Config, deps: ReloadDeps): boolean {
   }
   deps.configState.set(next)
   deps.denyService.updateConfig(next.denyStrategy)
-  deps.telemetry.update(next.telemetry.enabled, next.telemetry.path)
-  deps.debug?.update(next.debug.enabled, next.debug.path)
+  deps.telemetry.update(next.telemetry.enabled, next.telemetry.path, {
+    maxBytes: next.telemetry.maxBytes,
+    maxFiles: next.telemetry.maxFiles,
+  })
+  deps.debug?.update(next.debug.enabled, next.debug.path, {
+    maxBytes: next.debug.maxBytes,
+    maxFiles: next.debug.maxFiles,
+  })
   return true
 }
 
@@ -246,14 +252,22 @@ export default function piAutoMode(pi: ExtensionAPI): void {
 
   const telemetry = new TelemetryLogger(
     initialConfig.telemetry.enabled,
-    initialConfig.telemetry.path
+    initialConfig.telemetry.path,
+    {
+      maxBytes: initialConfig.telemetry.maxBytes,
+      maxFiles: initialConfig.telemetry.maxFiles,
+    }
   )
   telemetry.subscribe(pi)
   // Debug jsonl (opt-in, separado de telemetry): diagnósticos LLM con
   // body upstream. Sin subscribe al bus — solo escribe vía record().
   const debugLog = new TelemetryLogger(
     initialConfig.debug.enabled,
-    initialConfig.debug.path
+    initialConfig.debug.path,
+    {
+      maxBytes: initialConfig.debug.maxBytes,
+      maxFiles: initialConfig.debug.maxFiles,
+    }
   )
 
   const denyService = new DenyAndContinueService(initialConfig.denyStrategy)
@@ -261,7 +275,13 @@ export default function piAutoMode(pi: ExtensionAPI): void {
   watchConfig(
     cfgPath,
     (cfg) => {
-      applyConfigReload(cfg, { configState, denyService, telemetry, pi })
+      applyConfigReload(cfg, {
+        configState,
+        denyService,
+        telemetry,
+        debug: debugLog,
+        pi,
+      })
     },
     (err) => {
       const message = err instanceof Error ? err.message : String(err)

@@ -237,7 +237,28 @@ const uiConfig = z
     noUiAsks: 'bubble',
   })
 
-// ─── Telemetry Config (SIN CAMBIOS) ──────────────────────────────────────────
+// ─── Rotación de logs (compartida por telemetry y debug) ────────────────────
+// Tamaño máximo SOFT del archivo activo. El drain rota CUANDO LA ESTIMACIÓN
+// (stat inicial + bytes acumulados por batch) pasa de maxBytes.
+// 5 MiB: con ~94 KB/día medidos en máquina real, ~2 meses de historia por
+// archivo antes de rotar (5 MiB / 94 KB ≈ 55 días).
+// Para desactivar la rotación en la práctica, poner un valor enorme
+// (p. ej. 1073741824 = 1 GiB): la rotación solo es size-based, así que un
+// maxBytes que el archivo no alcance nunca equivale a rotación apagada.
+export const DEFAULT_ROTATION_MAX_BYTES = 5 * 1024 * 1024
+// Número de BACKUPS rotados que se conservan (path.1 ... path.N) cuando el
+// archivo activo supera maxBytes. Techo total de disco: maxBytes*(maxFiles+1)
+// (activo + N backups), aproximado por diseño.
+export const DEFAULT_ROTATION_MAX_FILES = 3
+
+// Fuente única de verdad de los campos de rotación: telemetry y debug los
+// componen del mismo objeto, así sus schemas no pueden divergir.
+const rotationFields = {
+  maxBytes: z.number().int().positive().default(DEFAULT_ROTATION_MAX_BYTES),
+  maxFiles: z.number().int().positive().default(DEFAULT_ROTATION_MAX_FILES),
+}
+
+// ─── Telemetry Config ────────────────────────────────────────────────────────
 const telemetryConfig = z
   .object({
     enabled: z.boolean().default(false),
@@ -246,8 +267,14 @@ const telemetryConfig = z
       .string()
       .default(DEFAULT_TELEMETRY_PATH)
       .transform((p) => (p.trim().length === 0 ? DEFAULT_TELEMETRY_PATH : p)),
+    ...rotationFields,
   })
-  .default({ enabled: false, path: DEFAULT_TELEMETRY_PATH })
+  .default({
+    enabled: false,
+    path: DEFAULT_TELEMETRY_PATH,
+    maxBytes: DEFAULT_ROTATION_MAX_BYTES,
+    maxFiles: DEFAULT_ROTATION_MAX_FILES,
+  })
 
 // ─── Debug Config (ESPEJO de telemetry, archivo separado) ────────────────────
 // Opt-in apagado por default: sin `debug.enabled: true` no se escribe nada.
@@ -261,8 +288,14 @@ const debugConfig = z
       .string()
       .default(DEFAULT_DEBUG_PATH)
       .transform((p) => (p.trim().length === 0 ? DEFAULT_DEBUG_PATH : p)),
+    ...rotationFields,
   })
-  .default({ enabled: false, path: DEFAULT_DEBUG_PATH })
+  .default({
+    enabled: false,
+    path: DEFAULT_DEBUG_PATH,
+    maxBytes: DEFAULT_ROTATION_MAX_BYTES,
+    maxFiles: DEFAULT_ROTATION_MAX_FILES,
+  })
 
 // ──────────────────────────────────────────────────────────────────────────────
 // ROOT SCHEMA — Config principal
@@ -444,12 +477,16 @@ export interface SoundConfig {
 export interface TelemetryConfig {
   enabled: boolean
   path: string
+  maxBytes: number
+  maxFiles: number
 }
 
 /** Debug-log configuration (mirrors `debug` zod sub-tree). */
 export interface DebugConfig {
   enabled: boolean
   path: string
+  maxBytes: number
+  maxFiles: number
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

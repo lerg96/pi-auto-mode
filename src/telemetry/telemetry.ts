@@ -1,7 +1,11 @@
 import { promises as fsPromises } from 'node:fs'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 import { isSecretSensitive } from '../classifier/secret-guard.ts'
-import { DEFAULT_TELEMETRY_PATH } from '../types/config.ts'
+import {
+  DEFAULT_TELEMETRY_PATH,
+  DEFAULT_ROTATION_MAX_BYTES,
+  DEFAULT_ROTATION_MAX_FILES,
+} from '../types/config.ts'
 import { notifyUi } from '../state/ui-context.ts'
 import { BUS_CHANNEL_DECISION, BUS_CHANNEL_UI_PROMPT } from '../events.ts'
 
@@ -92,6 +96,28 @@ interface PendingLine {
   isNotice: boolean
 }
 
+/** Size-based rotation options (mirrors the shared `rotationFields` zod shape). */
+export interface TelemetryRotation {
+  maxBytes: number
+  maxFiles: number
+}
+
+export const DEFAULT_ROTATION: TelemetryRotation = {
+  maxBytes: DEFAULT_ROTATION_MAX_BYTES,
+  maxFiles: DEFAULT_ROTATION_MAX_FILES,
+}
+
+// After a rotation FAILURE (stat/rename error other than a benign ENOENT)
+// no further rotation is attempted for this long. Implemented as a plain
+// timestamp comparison (Date.now), never a timer handle, so it cannot leak.
+// Without this, a permanently failing rename would be retried before every
+// single batch — a rename storm on a broken filesystem. Oversized files are
+// the accepted outcome while rotation is on cooldown.
+export const ROTATION_RETRY_COOLDOWN_MS = 60_000
+
+const isEnoent = (e: unknown): boolean =>
+  (e as NodeJS.ErrnoException | null)?.code === 'ENOENT'
+
 /**
  * Asynchronous JSONL audit sink. Telemetry must NEVER influence a permission
  * decision: `record()` only does cheap CPU work (redact + serialize) on the
@@ -126,6 +152,18 @@ interface PendingLine {
  * Loss is never silent. Accounting invariant: lines written + lines reported
  * dropped == events recorded.
  *
+ * Rotation (size-based, drain-only): before a batch is appended, if the
+ * target's estimated size exceeds `maxBytes`, the backup chain is shifted
+ * (drop path.N, rename path.k -> path.k+1 for k = N-1..1, rename path ->
+ * path.1) and the batch then appends to the fresh path. Rotation NEVER runs
+ * in record() (no syscall added to the caller's stack — the size check
+ * happens inside the async drain) and NEVER loses events: any stat/rename
+ * failure skips rotation and keeps appending to the (oversized) current
+ * file, routed to console.error but NOT counted as dropped — nothing was
+ * dropped. A failure arms ROTATION_RETRY_COOLDOWN_MS so a broken rename is
+ * not retried before every batch. flush() awaits rotation work because it
+ * runs inside the in-flight drain promise.
+ *
  * There is no shutdown hook on the Pi extension bus (`events.on/emit` only),
  * and extensions must not register `process.on(...)` handlers, so the drain
  * cannot wait for pending writes at exit; `flush()` exists so tests (and any
@@ -146,15 +184,30 @@ export class TelemetryLogger {
   private droppedQueueFull = 0
   private droppedAppendFailed = 0
   private timer: ReturnType<typeof setTimeout> | null = null
+  // Approximate on-disk size per target path: one stat per path (first
+  // batch) plus the byte length of each successfully appended batch.
+  // APPROXIMATE BY DESIGN: every concurrently running pi session writes to
+  // the same log path, so another process's appends (and rotations) are
+  // invisible to this counter — exactness is impossible without locking,
+  // and rotation is a soft size bound, not a hard one.
+  private sizes = new Map<string, number>()
+  // Epoch ms before which no rotation is attempted (failure back-off, see
+  // ROTATION_RETRY_COOLDOWN_MS). Plain timestamp, no timer handle.
+  private rotationRetryAt = 0
 
   constructor(
     private enabled: boolean,
-    private path: string
+    private path: string,
+    private rotation: TelemetryRotation = DEFAULT_ROTATION
   ) {}
 
-  update(enabled: boolean, path: string): void {
+  update(enabled: boolean, path: string, rotation?: TelemetryRotation): void {
     this.enabled = enabled
+    // Size estimates belong to the old path; drop them so the new path is
+    // stat'ed fresh on its first batch.
+    if (path !== this.path) this.sizes.clear()
     this.path = path
+    if (rotation !== undefined) this.rotation = rotation
   }
 
   /**
@@ -292,23 +345,108 @@ export class TelemetryLogger {
     const data = batch.map((b) => b.line).join('') // join once per batch, never per push
     this.lastTarget = target
     this.inFlightLines = count
-    this.inFlight = fsPromises.appendFile(target, data, 'utf8').then(
-      () => {
-        try {
-          this.finishBatch(false, isNotice)
-        } catch (e) {
-          console.error('[telemetry] drain bookkeeping failed:', e)
+    // Rotation lives INSIDE the in-flight drain promise: single writer is
+    // preserved (never two renames/appends in flight), and flush() — which
+    // awaits inFlight — automatically awaits any rotation work.
+    // rotateIfNeeded never rejects, so the rejection handler below still
+    // sees only append failures and drop accounting stays exact.
+    this.inFlight = this.rotateIfNeeded(target)
+      .then(() => fsPromises.appendFile(target, data, 'utf8'))
+      .then(
+        () => {
+          // Accumulate the appended byte length toward the size estimate.
+          this.sizes.set(target, (this.sizes.get(target) ?? 0) + data.length)
+          try {
+            this.finishBatch(false, isNotice)
+          } catch (e) {
+            console.error('[telemetry] drain bookkeeping failed:', e)
+          }
+        },
+        (e: unknown) => {
+          console.error('[telemetry] batch append failed:', e)
+          try {
+            this.finishBatch(true, isNotice)
+          } catch (e2) {
+            console.error('[telemetry] drain bookkeeping failed:', e2)
+          }
         }
-      },
-      (e: unknown) => {
-        console.error('[telemetry] batch append failed:', e)
-        try {
-          this.finishBatch(true, isNotice)
-        } catch (e2) {
-          console.error('[telemetry] drain bookkeeping failed:', e2)
+      )
+  }
+
+  /**
+   * Size-based rotation, run inside the drain before appending.
+   * Never rejects; never loses events. Sequence when the estimate exceeds
+   * maxBytes: drop path.N, rename path.k -> path.k+1 (k = N-1..1), rename
+   * path -> path.1, then the caller appends to a fresh path. Backups are
+   * `pi-auto-mode.jsonl.1`, `.2`, `.3`, ...
+   *
+   * Never fires on a file that does not exist: a missing file stats as
+   * ENOENT, which resets the estimate to 0 and skips rotation, so no empty
+   * `.1` files are ever created.
+   *
+   * MULTI-PROCESS RACES ARE EXPECTED AND BENIGN: the log path is shared by
+   * every concurrently running pi session, so another process may rotate at
+   * the same moment. A rename (or the size-check stat) whose source no
+   * longer exists (ENOENT) means someone else already rotated — treated as
+   * success, not an error. Any OTHER failure (EPERM, EBUSY, ...) logs to
+   * console.error in the same style as append failures, arms the cooldown,
+   * and the batch is appended to the current (oversized) file: losing an
+   * audit event is worse than an oversized log. Neither case may reject the
+   * drain chain or stop subsequent batches.
+   *
+   * appendFile (open/close per batch, no long-lived handle) is what makes
+   * the rename safe on Windows: a file held open by this process could not
+   * be renamed while another batch appends to it. Do NOT replace it with a
+   * persistent handle.
+   */
+  private async rotateIfNeeded(target: string): Promise<void> {
+    if (Date.now() < this.rotationRetryAt) return
+    let size = this.sizes.get(target)
+    if (size === undefined) {
+      // First batch for this path: one stat to seed the estimate; later
+      // batches reuse the counter (no syscall per batch).
+      try {
+        size = (await fsPromises.stat(target)).size
+      } catch (e) {
+        if (!isEnoent(e)) {
+          console.error('[telemetry] rotation stat failed:', e)
+          this.rotationRetryAt = Date.now() + ROTATION_RETRY_COOLDOWN_MS
         }
+        this.sizes.set(target, 0)
+        return
       }
-    )
+      this.sizes.set(target, size)
+    }
+    if (size <= this.rotation.maxBytes) return
+    const n = this.rotation.maxFiles
+    try {
+      // rm force: ENOENT (no such backup yet — the common case) is ignored.
+      await fsPromises.rm(`${target}.${n}`, { force: true })
+      for (let k = n - 1; k >= 1; k--) {
+        await this.renameIfPresent(`${target}.${k}`, `${target}.${k + 1}`)
+      }
+      await this.renameIfPresent(target, `${target}.1`)
+      // Re-stat equivalent: after a successful shift the current file is
+      // gone, so the estimate restarts at 0 (the batch appended next will
+      // be added by the append handler).
+      this.sizes.set(target, 0)
+    } catch (e) {
+      console.error(
+        '[telemetry] rotation failed, continuing to append to the current file:',
+        e
+      )
+      this.rotationRetryAt = Date.now() + ROTATION_RETRY_COOLDOWN_MS
+    }
+  }
+
+  // Rename where ENOENT on the SOURCE means another process rotated first:
+  // not an error, just nothing left to do for this step.
+  private async renameIfPresent(from: string, to: string): Promise<void> {
+    try {
+      await fsPromises.rename(from, to)
+    } catch (e) {
+      if (!isEnoent(e)) throw e
+    }
   }
 
   // Runs after the in-flight batch settles (success or failure), then keeps

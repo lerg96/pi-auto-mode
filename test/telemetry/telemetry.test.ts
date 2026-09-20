@@ -7,7 +7,7 @@ import {
   MAX_BATCH_DELAY_MS,
 } from '../../src/telemetry/telemetry.ts'
 import { promises } from 'node:fs'
-import { existsSync, readFileSync, unlinkSync } from 'node:fs'
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
@@ -146,7 +146,12 @@ describe('TelemetryLogger', () => {
     // The append itself is stubbed here so the test never touches the real
     // home directory.
     appendFileMock.mockImplementation(() => Promise.resolve())
-    const logger = new TelemetryLogger(true, '')
+    // maxBytes huge: the rotation gate must never rename the REAL
+    // ~/.pi/pi-auto-mode.jsonl from inside a unit test.
+    const logger = new TelemetryLogger(true, '', {
+      maxBytes: Number.MAX_SAFE_INTEGER,
+      maxFiles: 1,
+    })
     logger.record('tool_call_blocked', { error: 'boom' })
     await logger.flush()
     expect(appendFileMock).toHaveBeenCalledTimes(1)
@@ -160,7 +165,11 @@ describe('TelemetryLogger', () => {
     appendFileMock.mockImplementation(() => Promise.resolve())
     for (const bad of ['', '   ', '\n\t']) {
       appendFileMock.mockClear()
-      const logger = new TelemetryLogger(true, bad)
+      // maxBytes huge: never rotate the REAL default log from a test.
+      const logger = new TelemetryLogger(true, bad, {
+        maxBytes: Number.MAX_SAFE_INTEGER,
+        maxFiles: 1,
+      })
       logger.record('tool_call_blocked', { reason: bad })
       await logger.flush()
       expect(appendFileMock).toHaveBeenCalledTimes(1)
@@ -598,9 +607,15 @@ describe('TelemetryLogger', () => {
     const logger = new TelemetryLogger(true, p)
     const big = 'x'.repeat(MAX_BATCH_BYTES + 10_000)
     logger.record('big', { blob: big })
-    // The byte cap triggers the drain SYNCHRONOUSLY inside record(): the
-    // delay timer has had zero time to fire, so a call here can only be the
-    // byte-cap path.
+    // The byte cap triggers the drain SYNCHRONOUSLY inside record(). The
+    // drain's rotation gate (one stat before the first append) makes the
+    // appendFile call itself land a moment later, so we poll — with a
+    // deadline strictly BELOW MAX_BATCH_DELAY_MS, proving the append can
+    // only come from the byte-cap drain, never from the delay timer.
+    const deadline = Date.now() + MAX_BATCH_DELAY_MS - 10
+    while (appendFileMock.mock.calls.length === 0 && Date.now() < deadline) {
+      await sleep(1)
+    }
     expect(appendFileMock).toHaveBeenCalledTimes(1)
     const [, data] = appendCalls()[0]
     expect(data.length).toBeGreaterThan(MAX_BATCH_BYTES)
@@ -668,4 +683,211 @@ describe('TelemetryLogger', () => {
     errSpy.mockRestore()
     if (existsSync(p)) unlinkSync(p)
   }, 30000)
+
+  // ─── Rotation ───────────────────────────────────────────────────────────────
+  // Rotation is size-based, drain-only, and must never lose events. Backups
+  // are `path.1` (newest) ... `path.N` (oldest). All helpers below use the
+  // `path` module (via tempPath joins), never hardcoded '/' separators, so
+  // the whole suite is Windows-friendly.
+  const errnoWith = (code: string): Error =>
+    Object.assign(new Error(code), { code })
+
+  function cleanupLog(p: string): void {
+    for (const candidate of [p, `${p}.1`, `${p}.2`, `${p}.3`]) {
+      if (candidate && existsSync(candidate)) unlinkSync(candidate)
+    }
+  }
+
+  // Chronological read of a rotated log family: oldest backup first, then
+  // descending backup indexes, then the current file (highest index = oldest).
+  // JSONL shape is { ts, type, payload: { seq, ... } }.
+  function readFamily(p: string, maxFiles: number): number[] {
+    const out: number[] = []
+    const files = [
+      ...Array.from({ length: maxFiles }, (_, i) => `${p}.${maxFiles - i}`),
+      p,
+    ]
+    for (const f of files) {
+      if (!existsSync(f)) continue
+      for (const l of readFileSync(f, 'utf8').split('\n')) {
+        if (l.length > 0) {
+          out.push((JSON.parse(l) as { payload: { seq: number } }).payload.seq)
+        }
+      }
+    }
+    return out
+  }
+
+  describe('rotation', () => {
+    it('rotates when the log exceeds maxBytes: .1 holds earlier content, current file continues', async () => {
+      const p = tempPath()
+      const logger = new TelemetryLogger(true, p, {
+        maxBytes: 400,
+        maxFiles: 3,
+      })
+      // ~170-byte lines, one flush per event => one batch per event.
+      for (let i = 0; i < 8; i++) {
+        logger.record(`r:${i}`, { seq: i, pad: 'x'.repeat(120) })
+        await logger.flush()
+      }
+      expect(existsSync(`${p}.1`)).toBe(true)
+      // The current file must contain the NEWEST events only.
+      const mainSeqs = readFileSync(p, 'utf8')
+        .split('\n')
+        .filter((l) => l.length > 0)
+        .map((l) => (JSON.parse(l) as { payload: { seq: number } }).payload.seq)
+      expect(mainSeqs.length).toBeGreaterThan(0)
+      expect(mainSeqs[mainSeqs.length - 1]).toBe(7)
+      // No loss, exact order across the rotation boundary(s).
+      expect(readFamily(p, 3)).toEqual([0, 1, 2, 3, 4, 5, 6, 7])
+      cleanupLog(p)
+    }, 30000)
+
+    it('caps the backup chain at maxFiles and discards the oldest content', async () => {
+      const p = tempPath()
+      const logger = new TelemetryLogger(true, p, {
+        maxBytes: 300,
+        maxFiles: 2,
+      })
+      const N = 12
+      for (let i = 0; i < N; i++) {
+        logger.record(`c:${i}`, { seq: i, pad: 'x'.repeat(120) })
+        await logger.flush()
+      }
+      // .3 must never exist: the chain is capped at maxFiles = 2.
+      expect(existsSync(`${p}.3`)).toBe(false)
+      expect(existsSync(`${p}.1`)).toBe(true)
+      expect(existsSync(`${p}.2`)).toBe(true)
+      const seqs = readFamily(p, 2)
+      // Strictly increasing (chronological across .2 -> .1 -> current) and
+      // no duplicates: the tail (newest) survived, the head (oldest) was
+      // discarded.
+      expect(seqs).toEqual([...seqs].sort((a, b) => a - b))
+      expect(new Set(seqs).size).toBe(seqs.length)
+      expect(seqs[seqs.length - 1]).toBe(N - 1)
+      expect(seqs.length).toBeLessThan(N)
+      cleanupLog(p)
+    }, 30000)
+
+    it('rotation failure (EPERM) is survivable: no loss, no drops, drain keeps working, no rename storm', async () => {
+      const errSpy = jest
+        .spyOn(console, 'error')
+        .mockImplementation(() => undefined)
+      const renameSpy = jest
+        .spyOn(promises, 'rename')
+        .mockRejectedValue(errnoWith('EPERM'))
+      const p = tempPath()
+      const logger = new TelemetryLogger(true, p, {
+        maxBytes: 100,
+        maxFiles: 3,
+      })
+      const N = 10
+      for (let i = 0; i < N; i++) {
+        logger.record(`f:${i}`, { seq: i, pad: 'x'.repeat(120) })
+        await logger.flush()
+      }
+      // Every event landed in the MAIN file (rotation was skipped).
+      const lines = readFileSync(p, 'utf8')
+        .split('\n')
+        .filter((l) => l.length > 0)
+      expect(lines).toHaveLength(N)
+      expect(
+        lines.map(
+          (l) => (JSON.parse(l) as { payload: { seq: number } }).payload.seq
+        )
+      ).toEqual(Array.from({ length: N }, (_, i) => i))
+      // Nothing was reported dropped: rotation loss is not event loss.
+      expect(lines.some((l) => l.includes('telemetry:dropped'))).toBe(false)
+      // Rotation failure IS surfaced via console.error (append-style).
+      expect(
+        errSpy.mock.calls.some((c) => String(c[0]).includes('rotation failed'))
+      ).toBe(true)
+      // NO RENAME STORM: the first failure arms a cooldown, so exactly ONE
+      // rename attempt happened across all 10 batches.
+      expect(renameSpy).toHaveBeenCalledTimes(1)
+      renameSpy.mockRestore()
+      errSpy.mockRestore()
+      cleanupLog(p)
+    }, 30000)
+
+    it('ENOENT on rename means another process rotated: treated as success, no error, no drops', async () => {
+      const errSpy = jest
+        .spyOn(console, 'error')
+        .mockImplementation(() => undefined)
+      const renameSpy = jest
+        .spyOn(promises, 'rename')
+        .mockRejectedValue(errnoWith('ENOENT'))
+      const p = tempPath()
+      const logger = new TelemetryLogger(true, p, {
+        maxBytes: 100,
+        maxFiles: 3,
+      })
+      const N = 6
+      for (let i = 0; i < N; i++) {
+        logger.record(`m:${i}`, { seq: i, pad: 'x'.repeat(120) })
+        await logger.flush()
+      }
+      // Drain survived; all events landed in the main file.
+      const lines = readFileSync(p, 'utf8')
+        .split('\n')
+        .filter((l) => l.length > 0)
+      expect(lines).toHaveLength(N)
+      expect(lines.some((l) => l.includes('telemetry:dropped'))).toBe(false)
+      // ENOENT is benign: it must NOT be logged as a rotation failure.
+      expect(
+        errSpy.mock.calls.some((c) => String(c[0]).includes('rotation failed'))
+      ).toBe(false)
+      expect(renameSpy).toHaveBeenCalled() // rotation was genuinely attempted
+      renameSpy.mockRestore()
+      errSpy.mockRestore()
+      cleanupLog(p)
+    }, 30000)
+
+    it('size estimate resets when update() changes the path', async () => {
+      // Inflate the in-memory estimate with fake appends (they resolve as
+      // success but never grow the real file), so the cached size for p is
+      // FAR above the real on-disk size. After update() moves the path away
+      // and back, the logger must re-stat p (fresh estimate) instead of
+      // trusting the stale cache and rotating a small file.
+      const p = tempPath()
+      const p2 = tempPath()
+      writeFileSync(p, 'x'.repeat(100))
+      appendFileMock.mockImplementation(() => Promise.resolve())
+      const renameSpy = jest.spyOn(promises, 'rename')
+      const logger = new TelemetryLogger(true, p, {
+        maxBytes: 100_000,
+        maxFiles: 2,
+      })
+      for (let i = 0; i < 3; i++) {
+        logger.record('inflate', { pad: 'y'.repeat(1000) })
+        await logger.flush()
+      }
+      // Cached estimate for p is now ~3 KB (real file: 100 bytes).
+      logger.update(true, p2)
+      logger.record('elsewhere', { seq: 0 })
+      await logger.flush()
+      // Coming BACK to p with a tight maxBytes: a fresh stat says 100 bytes
+      // (under 1000) so NO rotation may happen. Without the reset the stale
+      // cache (~3 KB) would rename p to p.1.
+      logger.update(true, p, { maxBytes: 1000, maxFiles: 2 })
+      logger.record('after-reset', { seq: 1 })
+      await logger.flush()
+      expect(renameSpy).not.toHaveBeenCalled()
+      expect(existsSync(`${p}.1`)).toBe(false)
+      renameSpy.mockRestore()
+      cleanupLog(p)
+    }, 30000)
+
+    it('does not rotate a file that does not exist and never creates an empty .1', async () => {
+      const p = tempPath()
+      // maxBytes tiny: the moment real bytes exist the estimate exceeds it,
+      // but the FIRST batch (before the file exists) must not rotate.
+      const logger = new TelemetryLogger(true, p, { maxBytes: 10, maxFiles: 3 })
+      logger.record('first', { seq: 0 })
+      await logger.flush()
+      expect(existsSync(p)).toBe(true)
+      expect(existsSync(`${p}.1`)).toBe(false)
+      cleanupLog(p)
+    }, 30000)
+  })
 })

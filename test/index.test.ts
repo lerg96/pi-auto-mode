@@ -165,7 +165,11 @@ describe('config reload (S3 fail-closed)', () => {
     const pi = { ui: { notify: jest.fn() } } as unknown as ExtensionAPI
     const next: typeof DEFAULT_CONFIG = {
       ...DEFAULT_CONFIG,
-      telemetry: { enabled: true, path: 'out.log' },
+      telemetry: {
+        ...DEFAULT_CONFIG.telemetry,
+        enabled: true,
+        path: 'out.log',
+      },
     }
 
     const result = applyConfigReload(next, {
@@ -176,7 +180,10 @@ describe('config reload (S3 fail-closed)', () => {
     })
     expect(result).toBe(true)
     expect(configState.get().telemetry.enabled).toBe(true)
-    expect(telemetryUpdate).toHaveBeenCalledWith(true, 'out.log')
+    expect(telemetryUpdate).toHaveBeenCalledWith(true, 'out.log', {
+      maxBytes: DEFAULT_CONFIG.telemetry.maxBytes,
+      maxFiles: DEFAULT_CONFIG.telemetry.maxFiles,
+    })
   })
 })
 

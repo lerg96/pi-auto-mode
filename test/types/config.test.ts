@@ -1,6 +1,11 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { parseConfig, DEFAULT_CONFIG } from '../../src/types/config.ts'
+import {
+  parseConfig,
+  DEFAULT_CONFIG,
+  DEFAULT_ROTATION_MAX_BYTES,
+  DEFAULT_ROTATION_MAX_FILES,
+} from '../../src/types/config.ts'
 
 const EXAMPLE_PATH = resolve(__dirname, '../../config.example.json')
 
@@ -28,6 +33,55 @@ describe('parseConfig defaults', () => {
   it('defaults classifier.fallback to ask-user', () => {
     expect(parseConfig({}).classifier.fallback.onTimeout).toBe('ask-user')
     expect(parseConfig({}).classifier.fallback.onError).toBe('ask-user')
+  })
+})
+
+describe('log rotation config (telemetry + debug)', () => {
+  it('defaults maxBytes to 5 MiB and maxFiles to 3 for BOTH blocks', () => {
+    const cfg = parseConfig({})
+    expect(DEFAULT_ROTATION_MAX_BYTES).toBe(5 * 1024 * 1024)
+    expect(DEFAULT_ROTATION_MAX_FILES).toBe(3)
+    expect(cfg.telemetry.maxBytes).toBe(DEFAULT_ROTATION_MAX_BYTES)
+    expect(cfg.telemetry.maxFiles).toBe(DEFAULT_ROTATION_MAX_FILES)
+    expect(cfg.debug.maxBytes).toBe(DEFAULT_ROTATION_MAX_BYTES)
+    expect(cfg.debug.maxFiles).toBe(DEFAULT_ROTATION_MAX_FILES)
+  })
+
+  it('parses explicit maxBytes/maxFiles on both blocks', () => {
+    const cfg = parseConfig({
+      telemetry: { maxBytes: 1024, maxFiles: 1 },
+      debug: { maxBytes: 2048, maxFiles: 5 },
+    })
+    expect(cfg.telemetry.maxBytes).toBe(1024)
+    expect(cfg.telemetry.maxFiles).toBe(1)
+    expect(cfg.debug.maxBytes).toBe(2048)
+    expect(cfg.debug.maxFiles).toBe(5)
+  })
+
+  // Shared shape: both schemas compose the SAME rotationFields object, so
+  // invalid values must be rejected identically by both blocks.
+  for (const bad of [0, -1, 1.5, '1024']) {
+    it(`rejects maxBytes=${JSON.stringify(bad)} on telemetry AND debug (shared schema)`, () => {
+      expect(() => parseConfig({ telemetry: { maxBytes: bad } })).toThrow()
+      expect(() => parseConfig({ debug: { maxBytes: bad } })).toThrow()
+    })
+    it(`rejects maxFiles=${JSON.stringify(bad)} on telemetry AND debug (shared schema)`, () => {
+      expect(() => parseConfig({ telemetry: { maxFiles: bad } })).toThrow()
+      expect(() => parseConfig({ debug: { maxFiles: bad } })).toThrow()
+    })
+  }
+
+  it('config.example.json carries the rotation defaults', () => {
+    const raw = JSON.parse(readFileSync(EXAMPLE_PATH, 'utf8'))
+    expect(raw.telemetry.maxBytes).toBe(DEFAULT_ROTATION_MAX_BYTES)
+    expect(raw.telemetry.maxFiles).toBe(DEFAULT_ROTATION_MAX_FILES)
+    expect(raw.debug.maxBytes).toBe(DEFAULT_ROTATION_MAX_BYTES)
+    expect(raw.debug.maxFiles).toBe(DEFAULT_ROTATION_MAX_FILES)
+  })
+
+  it('DEFAULT_CONFIG exposes the rotation fields', () => {
+    expect(DEFAULT_CONFIG.telemetry.maxBytes).toBe(DEFAULT_ROTATION_MAX_BYTES)
+    expect(DEFAULT_CONFIG.debug.maxFiles).toBe(DEFAULT_ROTATION_MAX_FILES)
   })
 })
 

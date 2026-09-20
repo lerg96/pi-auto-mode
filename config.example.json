@@ -82,5 +82,16 @@
     "subagentModalTimeoutMs": 120000,
     "noUiAsks": "bubble"
   },
-  "telemetry": { "enabled": false, "path": "" }
+  "telemetry": {
+    "enabled": false,
+    "path": "",
+    "maxBytes": 5242880,
+    "maxFiles": 3
+  },
+  "debug": {
+    "enabled": false,
+    "path": "",
+    "maxBytes": 5242880,
+    "maxFiles": 3
+  }
 }

@@ -6,8 +6,12 @@
  *   - `?`  matches exactly one character.
  *   - On Windows (`process.platform === 'win32'`) comparisons are
  *     case-insensitive so a pattern `"Bash"` still matches the tool `"bash"`.
- *   - No regex compilation: a linear scan avoids ReDoS risk and keeps the
- *     visibility filter cheap to run on every `before_agent_start` event.
+ *   - No regex compilation: an iterative two-pointer scan avoids ReDoS risk
+ *     and keeps the matcher cheap to run on every tool-call decision.
+ *   - Worst-case cost is O(pattern.length x value.length) with a single
+ *     backtracking point, so the matcher is safe against long inputs (it is
+ *     used both for short tool/skill names and for long absolute filesystem
+ *     paths in `external-directory.ts`).
  *
  * This matcher is intentionally distinct from `globToRegex` in
  * `src/permission/rule.ts`: rule patterns use token-boundary anchoring and
@@ -32,42 +36,52 @@ export function wildcardMatch(pattern: string, value: string): boolean {
   const p = pattern
   const v = process.platform === 'win32' ? value.toLowerCase() : value
   const pat = process.platform === 'win32' ? p.toLowerCase() : p
-  return matchRecursive(pat, 0, v, 0)
+  return matchGreedy(pat, v)
 }
 
 /**
- * Recursive matcher. A non-empty `*` first tries to consume one more char
- * (`star = match(p+1, i+1)`); on a miss it back-tracks one position in the
- * value and retries. Pathological inputs (e.g. `*?...?` against a very long
- * string) are still linear in the pattern length because `*` only spawns one
- * branch per value char and the pattern length is small for tool names.
+ * Iterative greedy matcher with a single backtracking point (no regex, no
+ * recursion). Literal/`?` characters advance both cursors; on a mismatch the
+ * most recent `*` in the pattern absorbs exactly one more value char and the
+ * scan resumes from there. Runs of `*` collapse naturally: each `*` seen
+ * replaces the recorded backtrack point, which is equivalent to matching the
+ * run as a single `*`.
  *
- * For tool/skill names (tens of chars) this is cheaper than building a RegExp.
+ * Worst case is O(pattern.length x value.length) — never exponential in the
+ * number of `*` groups — and there is no recursion, so long absolute paths
+ * cannot blow the stack either.
  */
-function matchRecursive(p: string, pi: number, v: string, vi: number): boolean {
-  while (pi < p.length) {
-    const pc = p.charCodeAt(pi)
+function matchGreedy(p: string, v: string): boolean {
+  let pi = 0
+  let vi = 0
+  // Index just past the most recent '*', or -1 when none has been seen.
+  let starPatternIndex = -1
+  // Value index that `*` currently consumes (one past its last match).
+  let starValueIndex = 0
+
+  while (vi < v.length) {
+    const pc = pi < p.length ? p.charCodeAt(pi) : -1
     if (pc === 42 /* '*' */) {
       // collapse runs of '*'
       while (pi < p.length && p.charCodeAt(pi) === 42) pi++
-      // '*' at end matches everything left
-      if (pi === p.length) return true
-      // try every possible position in v
-      while (vi <= v.length) {
-        if (matchRecursive(p, pi, v, vi)) return true
-        vi++
-      }
-      return false
-    }
-    if (vi >= v.length) return false
-    if (pc === 63 /* '?' */) {
+      starPatternIndex = pi
+      starValueIndex = vi
+    } else if (pc === 63 /* '?' */ || pc === v.charCodeAt(vi)) {
       pi++
       vi++
       continue
+    } else if (starPatternIndex !== -1) {
+      // Backtrack: the last '*' consumes one more value char.
+      pi = starPatternIndex
+      starValueIndex++
+      vi = starValueIndex
+      continue
+    } else {
+      return false
     }
-    if (pc !== v.charCodeAt(vi)) return false
-    pi++
-    vi++
   }
-  return vi === v.length
+
+  // Trailing pattern survives only if it is all '*' (matches empty tail).
+  while (pi < p.length && p.charCodeAt(pi) === 42) pi++
+  return pi === p.length
 }

@@ -187,6 +187,69 @@ describe('evaluateRules', () => {
       expect(result.matchedException).toBe('EX-001')
     })
 
+    // Whitespace normalization hardens DENY patterns; it must not widen an
+    // explicit allow, or a mangled command would pass without a human.
+    it('does NOT let an exception cover a whitespace-mangled command', () => {
+      const customRules: BlockRule[] = [
+        {
+          id: 'CUSTOM-SPACE',
+          type: 'pattern',
+          pattern: 'dangerous cmd',
+          category: 'custom',
+          description: 'Custom dangerous command with a space',
+          severity: 'high',
+          enabled: true,
+        },
+      ]
+      const exception: BlockRule = {
+        id: 'EX-SPACE',
+        type: 'pattern',
+        pattern: 'dangerous cmd',
+        enabled: true,
+        description: 'Allow the verbatim command only',
+      }
+      const boundary = { protectedPaths: [], protectedCommands: [] }
+
+      // The deny side is whitespace-robust: the mangled form still hits BR.
+      const mangledNoEx = evaluateRules(
+        makeToolCall('dangerous  cmd --all'),
+        customRules,
+        [],
+        boundary
+      )
+      expect(mangledNoEx.matchedRule).toBe('CUSTOM-SPACE')
+
+      // Verbatim text keeps earning the exception.
+      const verbatim = evaluateRules(
+        makeToolCall('dangerous cmd --all'),
+        customRules,
+        [exception],
+        boundary
+      )
+      expect(verbatim.evaluation).toBe('allowed')
+      expect(verbatim.matchedException).toBe('EX-SPACE')
+
+      // Mangled text must NOT be silently allowed.
+      const mangled = evaluateRules(
+        makeToolCall('dangerous  cmd --all'),
+        customRules,
+        [exception],
+        boundary
+      )
+      expect(mangled.evaluation).not.toBe('allowed')
+      expect(mangled.matchedException).toBeUndefined()
+      expect(mangled.matchedRule).toBe('CUSTOM-SPACE')
+
+      const tabbed = evaluateRules(
+        makeToolCall('dangerous\tcmd --all'),
+        customRules,
+        [exception],
+        boundary
+      )
+      expect(tabbed.evaluation).not.toBe('allowed')
+      expect(tabbed.matchedException).toBeUndefined()
+    })
+
     it('does NOT override a critical block rule', () => {
       // BR-005 ("dd if=") is critical but not a hardcoded trust-boundary command,
       // so the exception is blocked by hasCriticalRuleMatch, not isTrustBoundaryHit.
@@ -626,5 +689,96 @@ describe('evaluateRules', () => {
       expect(result.evaluation).not.toBe('uncertain')
       expect(result.evaluation).toBe('ask')
     })
+  })
+})
+
+// ── Whitespace-evasion hardening (matches(raw) || matches(collapsed(raw))) ──
+describe('evaluateRules — whitespace-evasion hardening', () => {
+  const makeToolCall = (command: string) => ({
+    toolName: 'bash' as const,
+    arguments: { command },
+  })
+  const noBoundary = { protectedPaths: [], protectedCommands: [] }
+  const evalCmd = (command: string) =>
+    evaluateRules(makeToolCall(command), DEFAULT_BLOCK_RULES, [], noBoundary)
+
+  // Reviewer reproduction table: every case used to return `uncertain`
+  // (no rule fired). Each must now produce a rule match, never `uncertain`.
+  const reviewerCases: Array<[string, string, string]> = [
+    ['rm  -rf /', 'blocked', 'BR-001'],
+    ['rm\t-rf /', 'blocked', 'BR-001'],
+    ['rm   -rf   /tmp', 'blocked', 'BR-001'],
+    ['git reset  --hard', 'ask', 'BR-037'],
+    ['systemctl  restart nginx', 'ask', 'BR-014'],
+    ['docker rm  -f x', 'ask', 'BR-003'],
+  ]
+  it.each(reviewerCases)(
+    'closes the gap for %j (evaluation=%s, rule=%s)',
+    (command, evaluation, matchedRule) => {
+      const result = evalCmd(command)
+      expect(result.evaluation).toBe(evaluation)
+      expect(result.matchedRule).toBe(matchedRule)
+    }
+  )
+
+  // Irregular-whitespace matrix at the evaluator level: extra space, double
+  // space, tab, mixed space+tab and 3+ spaces (newline is a shell statement
+  // separator and is handled by segment splitting, pinned separately below).
+  const separators: Array<[string, string]> = [
+    ['double space', '  '],
+    ['triple space', '   '],
+    ['tab', '\t'],
+    ['space+tab', ' \t'],
+    ['tab+space', '\t '],
+  ]
+  const targets: Array<[string, string, string]> = [
+    ['rm -rf', 'blocked', 'BR-001'],
+    ['git reset --hard', 'ask', 'BR-037'],
+    ['systemctl restart', 'ask', 'BR-014'],
+    ['docker rm -f x', 'ask', 'BR-003'],
+  ]
+  for (const [base, evaluation, matchedRule] of targets) {
+    for (const [label, sep] of separators) {
+      const command = base.replace(/ /g, sep)
+      it(`mangled ${label} form ${JSON.stringify(command)} → ${evaluation}`, () => {
+        const result = evalCmd(command)
+        expect(result.evaluation).toBe(evaluation)
+        expect(result.matchedRule).toBe(matchedRule)
+      })
+    }
+  }
+
+  // A newline inside a command splits it into separate statements BEFORE
+  // matching; neither half alone is the dangerous literal, so this stays
+  // `uncertain` by design (newline is a real command separator in sh).
+  it('newline-separated halves stay uncertain (segment split, not collapse)', () => {
+    const result = evalCmd('rm\n-rf /')
+    expect(result.evaluation).toBe('uncertain')
+  })
+
+  // ── Over-match guards: collapsing must never turn DATA into a command ──
+  const benign: string[] = [
+    'echo hello  world',
+    'echo hello \t world',
+    'git commit -m "fix  two  spaces"',
+    'git commit -m "multi\nnewline   message"',
+    'echo "rm  -rf"',
+    "echo 'systemctl  restart nginx'",
+    'printf "%s   %s" a b',
+    'cat file  with  many  spaces.txt',
+    'git log --format="%h  %s"',
+  ]
+  it.each(benign)('stays uncertain (data, not command): %j', (command) => {
+    const result = evalCmd(command)
+    expect(result.evaluation).toBe('uncertain')
+    expect(result.matchedRule).toBeUndefined()
+  })
+
+  // The raw command must survive evaluation untouched (audit / modal).
+  it('does not mutate the command argument during evaluation', () => {
+    const raw = 'rm \t -rf  /  && echo  done'
+    const toolCall = makeToolCall(raw)
+    evaluateRules(toolCall, DEFAULT_BLOCK_RULES, [], noBoundary)
+    expect(toolCall.arguments.command).toBe(raw)
   })
 })

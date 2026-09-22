@@ -105,9 +105,36 @@ function globToRegex(glob: string): string {
   return out
 }
 
+/**
+ * Collapses every run of horizontal whitespace (spaces, tabs) and newlines
+ * into a single space and trims the result. Used ONLY on the matching path of
+ * `PatternMatcher.match` as a strictly additive second pass
+ * (`matches(raw) || matches(collapsed(raw))`), so whitespace-mangled commands
+ * like `rm  -rf /` or `git reset\t--hard` cannot slip past literal patterns.
+ * The raw command is never mutated: display, audit and telemetry keep it
+ * verbatim.
+ */
+export function collapseWhitespaceForMatching(text: string): string {
+  return text.replace(/\s+/g, ' ').trim()
+}
+
 export class PatternMatcher {
-  /** Returns true if `text` matches `pattern` (case-insensitive). Safe, never throws. */
+  /**
+   * Returns true if `text` matches `pattern` (case-insensitive). Safe, never throws.
+   *
+   * Additive by construction: a match requires the pattern to hit the raw
+   * text OR the whitespace-collapsed text, so results can only go from
+   * false to true, never the other way.
+   */
   match(pattern: string, text: string): boolean {
+    if (this.matchVerbatim(pattern, text)) return true
+    const normalized = collapseWhitespaceForMatching(text)
+    if (normalized === text) return false
+    return this.matchVerbatim(pattern, normalized)
+  }
+
+  /** Original single-pass matching against one exact text. */
+  protected matchVerbatim(pattern: string, text: string): boolean {
     if (pattern.startsWith(REGEX_PREFIX)) {
       const body = pattern.slice(REGEX_PREFIX.length)
       return safeRegexpTest(body, text) || submatch(body, text)
@@ -130,5 +157,21 @@ export class PatternMatcher {
    */
   splitSegments(command: string): string[] {
     return splitShellSegments(command)
+  }
+}
+
+/**
+ * Matcher for ALLOW paths (block-rule exceptions).
+ *
+ * Whitespace normalization makes DENY patterns robust, but applied to an
+ * allow exception it does the opposite: a command the user never excepted
+ * verbatim (`git  reset  --hard`) would be silently allowed by an exception
+ * written for `git reset --hard`, turning a human prompt into a silent pass.
+ * Allow rules must be earned with the exact text they were written with, so
+ * this matcher stays raw-only. Deny/block paths keep `PatternMatcher`.
+ */
+export class StrictPatternMatcher extends PatternMatcher {
+  override match(pattern: string, text: string): boolean {
+    return this.matchVerbatim(pattern, text)
   }
 }

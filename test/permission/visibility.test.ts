@@ -428,3 +428,86 @@ describe('catch-all "*" default', () => {
     )
   })
 })
+
+describe('whitespace-mangled commands vs literal-space rules', () => {
+  it('deny rule with literal spaces still matches a mangled command', () => {
+    const c = cfg({
+      permissionSets: {
+        a: {
+          permissions: {
+            tools: {
+              bash: [
+                { pattern: 'rm -rf *', action: 'deny', reason: 'no rm -rf' },
+                {
+                  pattern: 'git reset --hard',
+                  action: 'deny',
+                  reason: 'no hard reset',
+                },
+              ],
+            },
+          },
+        },
+      },
+      activePermissionSets: ['a'],
+    })
+    expect(resolveToolVisibility(c, 'bash', 'rm -rf /tmp')).toBe('deny')
+    expect(resolveToolVisibility(c, 'bash', 'rm  -rf /tmp')).toBe('deny')
+    expect(resolveToolVisibility(c, 'bash', 'rm\t-rf /tmp')).toBe('deny')
+    expect(resolveToolVisibility(c, 'bash', 'git  reset  --hard')).toBe('deny')
+  })
+
+  it('ask rule hardens against mangling too', () => {
+    const c = cfg({
+      permissionSets: {
+        a: {
+          permissions: {
+            tools: { bash: [{ pattern: 'git push main', action: 'ask' }] },
+          },
+        },
+      },
+      activePermissionSets: ['a'],
+    })
+    expect(resolveToolVisibility(c, 'bash', 'git  push  main')).toBe('ask')
+  })
+
+  it('allow rule stays STRICT — mangling does not earn the allow', () => {
+    const c = cfg({
+      permissionSets: {
+        a: {
+          permissions: {
+            tools: { bash: [{ pattern: 'git reset --soft', action: 'allow' }] },
+          },
+        },
+      },
+      activePermissionSets: ['a'],
+    })
+    expect(resolveToolVisibility(c, 'bash', 'git reset --soft')).toBe('allow')
+    // The mangled text was never written by the user, so it is not granted.
+    expect(resolveToolVisibility(c, 'bash', 'git  reset  --soft')).toBe(
+      'unknown'
+    )
+    expect(resolveToolVisibility(c, 'bash', 'git\treset\t--soft')).toBe(
+      'unknown'
+    )
+  })
+
+  it('hardening later rules does NOT reorder the cascade', () => {
+    const c = cfg({
+      permissionSets: {
+        a: {
+          permissions: {
+            tools: {
+              bash: [
+                { pattern: 'git *', action: 'allow' },
+                { pattern: 'git reset --hard', action: 'deny' },
+              ],
+            },
+          },
+        },
+      },
+      activePermissionSets: ['a'],
+    })
+    // First match still wins, exactly as before the hardening.
+    expect(resolveToolVisibility(c, 'bash', 'git  reset  --hard')).toBe('allow')
+  })
+})

@@ -11,7 +11,7 @@ import {
   DEFAULT_BLOCK_RULES,
 } from './block-rules.ts'
 export { DEFAULT_BLOCK_RULES }
-import { PatternMatcher } from './pattern-matcher.ts'
+import { PatternMatcher, StrictPatternMatcher } from './pattern-matcher.ts'
 import { segmentCommand, stripQuotedLiterals } from '../gate/normalize.ts'
 
 export type RuleEvalResult = 'allowed' | 'blocked' | 'uncertain' | 'ask'
@@ -302,6 +302,9 @@ export function evaluateRules(
   trustBoundary: TrustBoundary
 ): RuleEvalOutput {
   const pm = new PatternMatcher()
+  // Allow-exception matching stays whitespace-strict: normalization may only
+  // harden deny patterns, never widen a user's explicit allow list.
+  const strictPm = new StrictPatternMatcher()
   const command = toolCall.arguments.command ?? ''
   const cmdSegments = segmentCommand(command)
   // Build the set of command content to scan:
@@ -368,7 +371,12 @@ export function evaluateRules(
   } else {
     // 2. Allow exceptions — only if every segment is covered AND the command
     // is not a critical rule match or a hardcoded trust-boundary hit.
-    const exId = findAllowException(pm, unquotedCommand, scannable, exceptions)
+    const exId = findAllowException(
+      strictPm,
+      unquotedCommand,
+      scannable,
+      exceptions
+    )
     if (exId) {
       const isCritical = hasCriticalRuleMatch(
         pm,

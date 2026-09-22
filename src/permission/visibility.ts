@@ -6,6 +6,7 @@ import type {
   PermissionsBlock,
 } from '../types/config.ts'
 import { wildcardMatch } from './wildcard-matcher.ts'
+import { collapseWhitespaceForMatching } from '../classifier/pattern-matcher.ts'
 
 // ─── Legacy compat exports (tests only) ────────────────────────────────
 // These are the OLD API (tool:arg keys, wildcards). Kept so existing tests
@@ -50,6 +51,24 @@ function isPatternRuleArray(perm: ToolPermission): perm is PatternRule[] {
 }
 
 /**
+ * Does `rule` match the call value?
+ *
+ * Whitespace-mangled commands (`rm  -rf`, tabs instead of spaces) must not
+ * slip past a rule the user wrote with literal single spaces, so `deny`/`ask`
+ * rules also match the whitespace-collapsed value. `allow` rules stay strict:
+ * normalizing them would silently grant a call whose text the user never
+ * wrote, turning a prompt into a pass. Same asymmetry as `StrictPatternMatcher`
+ * in the classifier — normalization may only ever harden.
+ */
+function ruleMatchesCall(rule: PatternRule, value: string): boolean {
+  if (wildcardMatch(rule.pattern, value)) return true
+  if (rule.action === 'allow') return false
+  const collapsed = collapseWhitespaceForMatching(value)
+  if (collapsed === value) return false
+  return wildcardMatch(rule.pattern, collapsed)
+}
+
+/**
  * Finds the first matching PatternRule for a given value (the full tool call string).
  * Returns the matching rule or undefined if no match.
  */
@@ -59,7 +78,7 @@ function firstPatternMatch(
 ): PatternRule | undefined {
   if (!value) return undefined
   for (const rule of rules) {
-    if (wildcardMatch(rule.pattern, value)) {
+    if (ruleMatchesCall(rule, value)) {
       return rule
     }
   }

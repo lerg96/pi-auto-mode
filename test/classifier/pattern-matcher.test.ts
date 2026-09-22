@@ -1,4 +1,8 @@
-import { PatternMatcher } from '../../src/classifier/pattern-matcher.ts'
+import {
+  PatternMatcher,
+  StrictPatternMatcher,
+  collapseWhitespaceForMatching,
+} from '../../src/classifier/pattern-matcher.ts'
 import { segmentCommand } from '../../src/gate/normalize.ts'
 
 describe('PatternMatcher', () => {
@@ -57,6 +61,55 @@ describe('PatternMatcher', () => {
     })
   })
 
+  // ── Additive whitespace normalization (fixed evasion class) ──
+  describe('collapseWhitespaceForMatching + additive match', () => {
+    it('collapses runs of spaces/tabs/newlines to one space and trims', () => {
+      expect(collapseWhitespaceForMatching('  rm \t-rf\n/tmp  ')).toBe(
+        'rm -rf /tmp'
+      )
+      expect(collapseWhitespaceForMatching('single  spaces')).toBe(
+        'single spaces'
+      )
+      expect(collapseWhitespaceForMatching('as-is')).toBe('as-is')
+      expect(collapseWhitespaceForMatching('   ')).toBe('')
+    })
+
+    it('still matches the raw text exactly as before', () => {
+      const pm = new PatternMatcher()
+      expect(pm.match('rm -rf', 'sudo rm -rf /tmp')).toBe(true)
+      expect(pm.match('docker', 'rm -rf /tmp')).toBe(false)
+    })
+
+    it('matches substring literals only via the collapsed form', () => {
+      const pm = new PatternMatcher()
+      expect(pm.match('rm -rf', 'rm \t-rf /')).toBe(true)
+      expect(pm.match('git reset --hard', 'git  reset \t --hard')).toBe(true)
+    })
+
+    it('matches glob patterns via the collapsed form', () => {
+      const pm = new PatternMatcher()
+      // Raw glob 'cat .*id_rsa' needs a literal space; tab evades raw only.
+      expect(pm.match('cat *id_rsa', 'cat\tid_rsa')).toBe(true)
+    })
+
+    it('matches regex: patterns via the collapsed form', () => {
+      const pm = new PatternMatcher()
+      expect(pm.match('regex:rm -rf', 'rm  -rf')).toBe(true)
+    })
+
+    it('collapses newlines too at matcher level (opaque text)', () => {
+      const pm = new PatternMatcher()
+      expect(pm.match('rm -rf', 'rm\n-rf')).toBe(true)
+    })
+
+    it('additivity: absent literals stay false even after collapsing', () => {
+      const pm = new PatternMatcher()
+      expect(pm.match('rm -rf', 'rm -r /tmp')).toBe(false)
+      expect(pm.match('rm -rf', 'rm  - r f')).toBe(false)
+      expect(pm.match('echo hello world', 'echo   world')).toBe(false)
+    })
+  })
+
   // ── H6: splitSegments must agree with the gate's quote-aware segmentCommand ──
   describe('splitSegments parity with segmentCommand (H6)', () => {
     const cases = ['a && b', 'a | b', 'sh -c "x; y"', 'echo "a;b"', 'a || b']
@@ -108,7 +161,7 @@ describe('PatternMatcher', () => {
       const pm = new PatternMatcher()
       const input = 'a'.repeat(50) + '!'
       const start = performance.now()
-      const _result = pm.match('regex:(a|a?)+', input)
+      pm.match('regex:(a|a?)+', input)
       const elapsed = performance.now() - start
       expect(elapsed).toBeLessThan(100)
     })
@@ -129,5 +182,30 @@ describe('PatternMatcher', () => {
         expect(() => pm.match(pattern, input)).not.toThrow()
       }
     })
+  })
+})
+
+describe('StrictPatternMatcher (allow paths stay whitespace-strict)', () => {
+  it('does NOT match a whitespace-mangled command', () => {
+    const strict = new StrictPatternMatcher()
+    expect(strict.match('rm -rf', 'rm  -rf /')).toBe(false)
+    expect(strict.match('rm -rf', 'rm\t-rf /')).toBe(false)
+    expect(strict.match('git reset --hard', 'git  reset  --hard')).toBe(false)
+  })
+
+  it('still matches the exact text it was written with', () => {
+    const strict = new StrictPatternMatcher()
+    expect(strict.match('rm -rf', 'rm -rf /')).toBe(true)
+    expect(strict.match('git reset --hard', 'sudo git reset --hard now')).toBe(
+      true
+    )
+  })
+
+  it('is exactly the pre-normalization PatternMatcher (deny side differs)', () => {
+    const loose = new PatternMatcher()
+    const strict = new StrictPatternMatcher()
+    // The loose matcher is additive, so it matches strictly more than strict.
+    expect(loose.match('rm -rf', 'rm  -rf /')).toBe(true)
+    expect(strict.match('rm -rf', 'rm  -rf /')).toBe(false)
   })
 })

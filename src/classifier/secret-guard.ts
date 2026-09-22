@@ -144,6 +144,12 @@ function maskSecretValue(value: string): string {
  * preserved so the message stays useful; only the credential material is
  * replaced with `[REDACTED]`. Conservative by design: unknown shapes pass
  * through untouched, and re-applying is idempotent. Never throws.
+ *
+ * Home-prefix masking (see classifier/home-path.ts) is deliberately NOT
+ * applied here: this function feeds the model that is actively trying to
+ * fix and re-run the denied command, so it must keep seeing the real path
+ * — masking it would invite the model to reissue a literal `[REDACTED]`
+ * and fail again. Pinned by test/gate/deny-message.test.ts.
  */
 export function redactSecretsForModel(text: string): string {
   if (!text) return text

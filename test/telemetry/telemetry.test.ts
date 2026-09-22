@@ -891,3 +891,73 @@ describe('TelemetryLogger', () => {
     }, 30000)
   })
 })
+
+// Home-path masking at the telemetry disclosure boundary. The JSONL log
+// persists under ~/.pi and can be shared/attached to bug reports, so every
+// string field must have its home prefix masked before it hits disk.
+// The fake home is injected by re-loading the module under a node:os mock
+// (isolateModules + doMock), same pattern as the default-path test above.
+describe('telemetry home-path masking', () => {
+  const osActual = jest.requireActual('node:os') as typeof import('node:os')
+
+  function isolatedLoggerModule(
+    fakeHome: string
+  ): typeof import('../../src/telemetry/telemetry.ts') {
+    let mod: typeof import('../../src/telemetry/telemetry.ts') | undefined
+    jest.isolateModules(() => {
+      jest.doMock('node:os', () => ({
+        ...osActual,
+        homedir: () => fakeHome,
+      }))
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      mod = require('../../src/telemetry/telemetry.ts')
+    })
+    return mod!
+  }
+
+  it('masks the home prefix in EVERY string field written to the log', async () => {
+    const mod = isolatedLoggerModule('/home/mockuser')
+    const p = tempPath()
+    const logger = new mod.TelemetryLogger(true, p)
+    logger.record('permissions:decision', {
+      command: 'cat /home/mockuser/Downloads/x.md',
+      cwd: '/home/mockuser/projects/app',
+      nested: {
+        error: "open failed: '/home/mockuser/.local/y'",
+        untouched: '/home/someone-else/z',
+      },
+      list: ['/home/mockuser/a', 42],
+    })
+    await logger.flush()
+
+    const raw = readFileSync(p, 'utf8')
+    expect(raw).not.toContain('/home/mockuser')
+    const ev = JSON.parse(raw.trim()) as {
+      payload: Record<string, unknown>
+    }
+    expect(ev.payload.command).toBe('cat /home/[REDACTED]/Downloads/x.md')
+    expect(ev.payload.cwd).toBe('/home/[REDACTED]/projects/app')
+    const nested = ev.payload.nested as Record<string, unknown>
+    expect(nested.error).toBe("open failed: '/home/[REDACTED]/.local/y'")
+    expect(nested.untouched).toBe('/home/someone-else/z')
+    expect(ev.payload.list).toEqual(['/home/[REDACTED]/a', 42])
+    if (existsSync(p)) unlinkSync(p)
+  })
+
+  it('composes AFTER whole-value secret redaction (secret still wins)', async () => {
+    // A value flagged by isSecretSensitive is replaced wholesale with
+    // [REDACTED]; home masking must not reorder or weaken that.
+    const mod = isolatedLoggerModule('/home/mockuser')
+    const p = tempPath()
+    const logger = new mod.TelemetryLogger(true, p)
+    logger.record('permissions:decision', {
+      command: 'cat /home/mockuser/.ssh/id_rsa',
+    })
+    await logger.flush()
+    const raw = readFileSync(p, 'utf8')
+    expect(raw).not.toContain('mockuser')
+    const ev = JSON.parse(raw.trim()) as { payload: Record<string, unknown> }
+    expect(ev.payload.command).toBe('[REDACTED]')
+    if (existsSync(p)) unlinkSync(p)
+  })
+})

@@ -118,6 +118,7 @@ async function resolveLlmCredentials(
 }
 
 import { isSecretSensitive } from './secret-guard.ts'
+import { maskHomePrefix } from './home-path.ts'
 import {
   callLlmWithFallback,
   isTimeoutError,
@@ -240,6 +241,14 @@ export function redactSecrets(text: string): string {
     /(--|-)(token|auth|secret|api[_-]?key|password)[=:\s]+[^\s"',}]+/gi,
     (m) => m.replace(/[^\s"',=:-]+$/, '[REDACTED]')
   )
+  // 6. Home-prefix masking: this redactor's output goes to an EXTERNAL LLM
+  // over the network, so the username embedded in absolute paths is a
+  // personal identifier leaving the process. Masking only the prefix keeps
+  // the structure (`C:/Users/[REDACTED]/Downloads/x.md`) that the classifier
+  // needs for judgement — classification quality is unaffected. The
+  // model-facing deny path (redactSecretsForModel) deliberately does NOT do
+  // this: that model must be able to reissue the real path. See home-path.ts.
+  out = maskHomePrefix(out)
   return out
 }
 

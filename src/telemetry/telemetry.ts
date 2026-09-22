@@ -1,6 +1,7 @@
 import { promises as fsPromises } from 'node:fs'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 import { isSecretSensitive } from '../classifier/secret-guard.ts'
+import { maskHomePrefix } from '../classifier/home-path.ts'
 import {
   DEFAULT_TELEMETRY_PATH,
   DEFAULT_ROTATION_MAX_BYTES,
@@ -32,7 +33,20 @@ type RedactedValue =
 
 export function redact(value: unknown): RedactedValue {
   if (typeof value === 'string') {
-    return isSecretSensitive(value).sensitive ? '[REDACTED]' : value
+    // Disclosure boundary: the JSONL log persists on disk (and gets attached
+    // to bug reports), so the home prefix — a personal identifier — is masked
+    // on every string that reaches the writer. This is the single narrowest
+    // chokepoint: redact() recurses through every field (command, paths,
+    // cwd, error text, nested objects/arrays/maps), so masking here covers
+    // all of them. Order matters: the secret detector still wins wholesale
+    // when it fires; home masking composes AFTER it as a separate,
+    // structural transformation (isSecretSensitive is never told about home
+    // paths, or whole commands would be blanked and lose their diagnostic
+    // value). NOT applied to model-facing deny messages — see
+    // redactSecretsForModel in secret-guard.ts.
+    return isSecretSensitive(value).sensitive
+      ? '[REDACTED]'
+      : maskHomePrefix(value)
   }
   if (Array.isArray(value)) {
     return value.map((v) => redact(v))

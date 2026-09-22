@@ -588,3 +588,68 @@ describe('thinking-model response tolerance (extractJsonFromThinkingOutput via m
     expect(res.decision).toBe('ask')
   })
 })
+
+// Home-path masking at the external-LLM disclosure boundary: `redactSecrets`
+// feeds buildLlmPrompt, so masking the home prefix there costs nothing for
+// classification quality and keeps the personal identifier out of the
+// request. The fake home is injected via isolateModules + doMock('node:os').
+describe('llm-layer home-path masking (external payload boundary)', () => {
+  const osActual = jest.requireActual('node:os') as typeof import('node:os')
+  let iso: typeof import('../../src/classifier/llm-layer.ts') | undefined
+
+  beforeEach(() => {
+    jest.isolateModules(() => {
+      jest.doMock('node:os', () => ({
+        ...osActual,
+        homedir: () => 'C:\\Users\\FakeUser',
+      }))
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      iso = require('../../src/classifier/llm-layer.ts')
+    })
+  })
+
+  it('redactSecrets masks the home prefix in all spellings', () => {
+    expect(iso!.redactSecrets('cat C:\\Users\\FakeUser\\x.md')).toBe(
+      'cat C:\\Users\\[REDACTED]\\x.md'
+    )
+    expect(iso!.redactSecrets('cat C:/Users/FakeUser/x.md')).toBe(
+      'cat C:/Users/[REDACTED]/x.md'
+    )
+    expect(iso!.redactSecrets(String.raw`cat C:\\Users\\FakeUser\\x.md`)).toBe(
+      String.raw`cat C:\\Users\\[REDACTED]\\x.md`
+    )
+  })
+
+  it('redactSecrets leaves non-identifying tokens intact', () => {
+    expect(iso!.redactSecrets('cat ~/Downloads/x.md')).toBe(
+      'cat ~/Downloads/x.md'
+    )
+    expect(iso!.redactSecrets('echo $HOME/x ${HOME}/y')).toBe(
+      'echo $HOME/x ${HOME}/y'
+    )
+  })
+
+  it('the prompt actually SENT to the LLM carries masked home paths', async () => {
+    const fetchSpy = mockFetch('{"decision":"allow","riskScore":1}')
+    ;(globalThis as { fetch?: unknown }).fetch = fetchSpy
+    try {
+      await iso!.classifyToolCall(
+        {
+          toolName: 'bash',
+          arguments: { command: 'cat C:/Users/FakeUser/notes.md' },
+          surface: 'shell',
+          value: 'cat C:\\Users\\FakeUser\\notes.md',
+        },
+        { config: baseConfig, llm: llmCfg }
+      )
+      const prompt = promptFromFetch(
+        fetchSpy as unknown as ReturnType<typeof jest.fn>
+      )
+      expect(prompt).toContain('C:/Users/[REDACTED]/notes.md')
+      expect(prompt).toContain('C:\\Users\\[REDACTED]\\notes.md')
+      expect(prompt).not.toContain('FakeUser')
+    } finally {
+      ;(globalThis as { fetch?: unknown }).fetch = undefined
+    }
+  })
+})

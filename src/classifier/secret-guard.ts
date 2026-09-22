@@ -33,8 +33,21 @@ const KEYWORD_RE =
   /\b(credential|password)s?\b|\b(secret|token|api[_-]?key)s?\b\s*[=:]/i
 
 // 3. Embedded credentials: key=value, Bearer tokens, URL user:pass@host.
+//    The URL branch accepts any RFC-3986-ish scheme (`[a-z][a-z0-9+.-]*`),
+//    not just http(s): DSNs like `postgres://`, `mysql://`, `redis://`,
+//    `mongodb+srv://` or `amqp://` carry passwords the same way and must
+//    reach the model / telemetry masked. The userinfo user part is `*` so
+//    password-only DSNs (`redis://:pw@cache`) are caught. All branches stay
+//    linear (negated character classes, no nested quantifiers). Known false
+//    positive: `http://proxy:8080@host` — a port in the userinfo position is
+//    indistinguishable from a password without a scheme allowlist; noise is
+//    preferred over under-masking.
+//    The scheme quantifier is BOUNDED ({0,31}, RFC 3986 caps schemes at 63 and
+//    no real DSN scheme is longer): an unbounded `[a-z0-9+.-]*` turns the scan
+//    quadratic (measured 1.4s vs 7.6ms at 40k chars) because every position in
+//    a long alphanumeric run restarts the inner backtrack.
 const EMBEDDED_RE =
-  /\b(client_secret|api[_-]?key|apikey)\s*[=:]\s*\S|bearer\s+\S|https?:\/\/[^/:\s]+:[^/@\s]+@/i
+  /\b(client_secret|api[_-]?key|apikey)\s*[=:]\s*\S|bearer\s+\S|[a-z][a-z0-9+.-]{0,31}:\/\/[^/:@\s]*:[^/@\s]+@/i
 
 // 4. Secret flags: --token / -token / --auth / -api-key etc. with = or space separator.
 const FLAG_RE = /(?:--|-)(token|auth|secret|api[_-]?key|password)[=:\s]+\S/i
@@ -79,21 +92,29 @@ export function isSecretSensitive(text: string): SecretCheck {
 
 const REDACTED = '[REDACTED]'
 
-// URL userinfo: https://user:pass@host → https://user:[REDACTED]@host.
-const URL_CREDS_RE = /(https?:\/\/[^/:\s]+:)([^/@\s]+)(@)/gi
+// URL userinfo: scheme://user:pass@host → scheme://user:[REDACTED]@host.
+// Any RFC-3986-ish scheme (see EMBEDDED_RE above), so DSNs are masked too.
+// The password class excludes `"`, `'`, `,`, `;` and `` ` `` so a delimiter
+// trailing the credential is never swallowed: `psql "postgres://user:pw@db"`
+// keeps its quotes. Residual: a password containing one of those literals
+// immediately before `@` is not masked by this pattern (the detector still
+// flags the whole string as sensitive). Linear: three fixed groups, negated
+// classes only, no nested quantifiers, and the scheme quantifier is bounded
+// for the same ReDoS reason as EMBEDDED_RE above.
+const URL_CREDS_RE = /([a-z][a-z0-9+.-]{0,31}:\/\/[^/:@\s]*:)([^/@"',;`]+)(@)/gi
 
 // Bearer / Basic tokens: `Bearer xyz` → `Bearer [REDACTED]`.
 const BEARER_BASIC_RE = /\b(Bearer|Basic)(\s*:?\s+)([^\s"'`,;]+)/gi
 
 // CLI flags: --token=xyz / --token xyz → --token [REDACTED].
 const FLAG_VALUE_RE =
-  /((?:--|-)(?:token|auth|secret|api[_-]?key|password)[=:\s]+)("[^\"]*"|'[^']*'|[^\s"'`,;]+)/gi
+  /((?:--|-)(?:token|auth|secret|api[_-]?key|password)[=:\s]+)("[^"]*"|'[^']*'|[^\s"'`,;]+)/gi
 
 // Env-style assignments: PASSWORD=hunter2 → PASSWORD=[REDACTED].
 // Mirrors ENV_RE's keyword set and boundary rule so substrings like
 // `password_reset` never match.
 const ENV_VALUE_RE =
-  /(^|[^A-Za-z_])((?:[A-Za-z_]*?(?:SECRET_ACCESS_KEY|ACCESS_KEY|SECRET_KEY|API[_-]?KEY|PRIVATE[_-]?KEY|CLIENT[_-]?SECRET|SECRET|TOKEN|PASSWORD|PASSWD|PWD|CREDENTIAL))\s*[=:]\s*)("[^\"]*"|'[^']*'|[^\s"'`,;]+)/gi
+  /(^|[^A-Za-z_])((?:[A-Za-z_]*?(?:SECRET_ACCESS_KEY|ACCESS_KEY|SECRET_KEY|API[_-]?KEY|PRIVATE[_-]?KEY|CLIENT[_-]?SECRET|SECRET|TOKEN|PASSWORD|PASSWD|PWD|CREDENTIAL))\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s"'`,;]+)/gi
 
 /** Masks one credential value, preserving quotes and trailing closers. */
 function maskSecretValue(value: string): string {
@@ -102,7 +123,7 @@ function maskSecretValue(value: string): string {
   if (
     value === REDACTED ||
     (value.startsWith(REDACTED) &&
-      /^[\]\)}.,!?;:]+$/.test(value.slice(REDACTED.length)))
+      /^[\])}.,!?;:]+$/.test(value.slice(REDACTED.length)))
   )
     return value
   if (value.length >= 2) {
@@ -111,7 +132,7 @@ function maskSecretValue(value: string): string {
     if ((first === '"' && last === '"') || (first === "'" && last === "'"))
       return first + REDACTED + last
   }
-  const trailing = value.match(/[\)\].,!?]+$/)
+  const trailing = value.match(/[)\].,!?]+$/)
   if (trailing && trailing[0].length < value.length)
     return REDACTED + trailing[0]
   return REDACTED

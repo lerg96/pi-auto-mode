@@ -188,6 +188,72 @@ describe('isSecretSensitive', () => {
     })
   })
 
+  // ── DSN credentials: any RFC-3986 scheme, not just http(s) ─
+  describe('embedded credentials in DSN schemes', () => {
+    it('detects postgres:// DSN credentials', () => {
+      const result = isSecretSensitive('psql "postgres://user:hunter2@db/prod"')
+      expect(result.sensitive).toBe(true)
+      expect(result.reason).toBe('embedded credential')
+    })
+
+    it('detects mysql:// DSN credentials', () => {
+      const result = isSecretSensitive('mysql://user:hunter2@db/prod')
+      expect(result.sensitive).toBe(true)
+      expect(result.reason).toBe('embedded credential')
+    })
+
+    it('detects redis:// DSN credentials with empty username', () => {
+      const result = isSecretSensitive('redis-cli -u redis://:pw@cache:6379/0')
+      expect(result.sensitive).toBe(true)
+      expect(result.reason).toBe('embedded credential')
+    })
+
+    it('detects mongodb+srv:// DSN credentials (scheme with + and -)', () => {
+      const result = isSecretSensitive(
+        'mongosh "mongodb+srv://u:p@cluster0.mongodb.net/test"'
+      )
+      expect(result.sensitive).toBe(true)
+      expect(result.reason).toBe('embedded credential')
+    })
+
+    it('detects amqp:// DSN credentials', () => {
+      const result = isSecretSensitive('amqp://guest:guest@mq.internal/vhost')
+      expect(result.sensitive).toBe(true)
+      expect(result.reason).toBe('embedded credential')
+    })
+
+    it('still detects http(s):// embedded credentials', () => {
+      const result = isSecretSensitive('https://user:pass@host')
+      expect(result.sensitive).toBe(true)
+      expect(result.reason).toBe('embedded credential')
+    })
+
+    it('ssh:// userinfo without a password is NOT sensitive', () => {
+      const result = isSecretSensitive('ssh://git@github.com:user/repo.git')
+      expect(result.sensitive).toBe(false)
+    })
+
+    it('plain https:// docs URL is NOT sensitive', () => {
+      const result = isSecretSensitive('https://example.com/docs')
+      expect(result.sensitive).toBe(false)
+    })
+
+    it('DSN without userinfo is NOT sensitive', () => {
+      const result = isSecretSensitive(
+        'psql postgresql://db.example.com:5432/prod'
+      )
+      expect(result.sensitive).toBe(false)
+    })
+
+    // Documented false positive: a port in the userinfo position is
+    // indistinguishable from a password without a scheme allowlist.
+    it('http://proxy:8080@host is flagged (accepted false positive)', () => {
+      const result = isSecretSensitive('curl http://proxy:8080@host')
+      expect(result.sensitive).toBe(true)
+      expect(result.reason).toBe('embedded credential')
+    })
+  })
+
   // ── H5: KEYWORD_RE reduced false positives ─────────────────
   describe('H5: KEYWORD_RE reduced false positives', () => {
     it("benign phrase 'the project has a secret feature' is NOT sensitive", () => {
@@ -299,6 +365,55 @@ describe('redactSecretsForModel', () => {
 
   it('leaves empty assignments untouched', () => {
     expect(redactSecretsForModel('SECRET_KEY=')).toBe('SECRET_KEY=')
+  })
+
+  it('masks DSN passwords for non-http schemes and preserves structure', () => {
+    expect(
+      redactSecretsForModel('psql "postgres://user:hunter2@db/prod"')
+    ).toBe('psql "postgres://user:[REDACTED]@db/prod"')
+    expect(redactSecretsForModel('mysql://user:hunter2@db/prod')).toBe(
+      'mysql://user:[REDACTED]@db/prod'
+    )
+    expect(redactSecretsForModel('redis-cli -u redis://:pw@cache:6379/0')).toBe(
+      'redis-cli -u redis://:[REDACTED]@cache:6379/0'
+    )
+    expect(
+      redactSecretsForModel('mongosh "mongodb+srv://u:p@cluster0.example.net"')
+    ).toBe('mongosh "mongodb+srv://u:[REDACTED]@cluster0.example.net"')
+    expect(redactSecretsForModel('amqp://guest:guest@mq/vhost')).toBe(
+      'amqp://guest:[REDACTED]@mq/vhost'
+    )
+  })
+
+  it('masks several DSNs in one string without eating separators', () => {
+    const out = redactSecretsForModel(
+      'urls: postgres://a:b@h1/db,mysql://c:d@h2/db; redis://e:f@h3/0'
+    )
+    expect(out).toBe(
+      'urls: postgres://a:[REDACTED]@h1/db,mysql://c:[REDACTED]@h2/db; redis://e:[REDACTED]@h3/0'
+    )
+  })
+
+  it('still masks http(s) URL passwords', () => {
+    expect(redactSecretsForModel('git clone https://user:pw@host/r')).toBe(
+      'git clone https://user:[REDACTED]@host/r'
+    )
+  })
+
+  it('leaves DSNs without credentials untouched', () => {
+    for (const s of [
+      'ssh://git@github.com:user/repo.git',
+      'https://example.com/docs',
+      'psql postgresql://db.example.com:5432/prod',
+    ])
+      expect(redactSecretsForModel(s)).toBe(s)
+  })
+
+  it('is idempotent for DSN passwords', () => {
+    const once = redactSecretsForModel(
+      'psql "postgres://user:hunter2@db/prod" mysql://c:d@h2/db'
+    )
+    expect(redactSecretsForModel(once)).toBe(once)
   })
 
   it('is idempotent', () => {

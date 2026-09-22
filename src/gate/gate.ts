@@ -4,119 +4,32 @@ import type { SessionRules } from '../permission/session-rules.ts'
 import type {
   ClassifierInput,
   ClassifierResult,
-  RiskLevel,
 } from '../classifier/llm-layer.ts'
-import type { PermissionState } from '../permission/rule.ts'
-import type {
-  DenyAndContinueService,
-  DenialAction,
-} from '../deny/deny-service.ts'
+import type { DenyAndContinueService } from '../deny/deny-service.ts'
 import { evaluatePermission } from '../permission/visibility.ts'
 import { evaluateExternalDirectory } from '../permission/external-directory.ts'
-import { wildcardMatch } from '../permission/wildcard-matcher.ts'
 import { grantDirFor } from '../permission/path-scope.ts'
-import { externalDirSurfaceFor } from '../permission/external-directory.ts'
 import { normalizeToolCall, type AccessIntent } from './normalize.ts'
-import { getAskResolver, normalizeAskDecision, type AskVia } from './ask.ts'
-import { BUS_CHANNEL_DECISION } from '../events.ts'
-import { redactSecretsForModel } from '../classifier/secret-guard.ts'
-import { redact } from '../telemetry/telemetry.ts'
-import { createHash } from 'node:crypto'
-import { addExternalDirAllow } from '../state/external-dir-allowlist.ts'
+import { emit, askActor, type GateHooks } from './ask-audit.ts'
+import { buildDecisionDetail } from './decision-detail.ts'
+import {
+  resolveAsk,
+  verdictExtra,
+  askDeniedAudit,
+  type ExternalDirAsk,
+} from './ask-flow.ts'
+import { applyDenyStrategy } from './deny-strategy.ts'
+import { aggregateClassify, mostRestrictive } from './risk-aggregation.ts'
+import { handleClassifierBlock } from './classifier-block.ts'
+import { formatDenyMessage } from './deny-message.ts'
 
-export interface DecisionRiskDetail {
-  score: number
-  level: RiskLevel
-  category?: string
-  reason?: string
-  riskOrigin?: 'rule' | 'llm'
-}
-
-export interface DecisionRuleDetail {
-  surface: string
-  pattern: string
-  reason?: string
-  // Stable rule identity (sha1 surface|pattern, 12 hex): lets a model
-  // group by rule without seeing raw patterns.
-  ruleId: string
-}
-
-export interface DecisionDetail {
-  toolName: string
-  matchedSurface: string
-  matchedValue: string
-  rule?: DecisionRuleDetail
-  risk?: DecisionRiskDetail
-  latencyMs: number
-  // Deny-routing outcome that produced this event, when a deny strategy
-  // ran: 'auto-retry' | 'deny-and-continue' | 'ask-user' | 'escalate' |
-  // 'deny'. Absent on allow/ask paths that never hit deny routing.
-  strategy?: string
-}
-
-// Stable rule identity for training grouping. Patterns stay in the payload
-// (operators need them); the hash is the join key.
-function ruleIdFor(surface: string, pattern: string): string {
-  return createHash('sha1')
-    .update(`${surface}|${pattern}`)
-    .digest('hex')
-    .slice(0, 12)
-}
-
-function redactedString(value: string): string {
-  const redacted = redact(value)
-  return typeof redacted === 'string' ? redacted : '[REDACTED]'
-}
-
-function buildDecisionDetail(args: {
-  toolName: string
-  matchedSurface: string
-  matchedValue: string
-  rule?: { surface: string; pattern: string; reason?: string }
-  risk?: ClassifierResult['risk']
-  startedAt: number
-  strategy?: string
-}): { detail: DecisionDetail } {
-  const detail: DecisionDetail = {
-    toolName: args.toolName,
-    matchedSurface: args.matchedSurface,
-    matchedValue: redactedString(args.matchedValue),
-    latencyMs: Date.now() - args.startedAt,
-  }
-  if (args.rule !== undefined) {
-    detail.rule = {
-      surface: args.rule.surface,
-      pattern: redactedString(args.rule.pattern),
-      ...(args.rule.reason === undefined
-        ? {}
-        : { reason: redactedString(args.rule.reason) }),
-      ruleId: ruleIdFor(args.rule.surface, args.rule.pattern),
-    }
-  }
-  if (args.risk !== undefined) {
-    detail.risk = {
-      score: args.risk.score,
-      level: args.risk.level,
-      ...(args.risk.category === undefined
-        ? {}
-        : { category: redactedString(args.risk.category) }),
-      ...(args.risk.reason === undefined
-        ? {}
-        : { reason: redactedString(args.risk.reason) }),
-      ...(args.risk.riskOrigin === undefined
-        ? {}
-        : { riskOrigin: args.risk.riskOrigin }),
-    }
-  }
-  if (args.strategy !== undefined) {
-    detail.strategy = args.strategy
-  }
-  return { detail }
-}
-
-export interface GateHooks {
-  emit?: (channel: string, data: unknown) => void
-}
+export { formatDenyMessage }
+export type {
+  DecisionRiskDetail,
+  DecisionRuleDetail,
+  DecisionDetail,
+} from './decision-detail.ts'
+export type { GateHooks } from './ask-audit.ts'
 
 export interface GateDeps {
   configState: typeof configState
@@ -126,556 +39,99 @@ export interface GateDeps {
   denyService?: DenyAndContinueService
 }
 
-interface AskAudit {
-  requestId?: string
-  // 'no-ui' = no se mostró ningún modal: no hubo humano que decidiera. Darlo
-  // como 'user' falsea la auditoría (y entrena al modelo con datos falsos).
-  // 'timeout' = se mostró, pero nadie respondió antes de expirar.
-  decidedBy: 'user' | 'session' | 'no-ui' | 'timeout'
-  // 'parent-modal' = el modal se renderizó en la UI de otra sesión del
-  // proceso (sub-sesión sin UI propia). Derivado de AskVia para que el gate no
-  // pueda quedarse atrás cuando ask.ts añade un origen nuevo.
-  via: AskVia | 'session-rules'
-  matchedPattern?: string
-  denialReason?: string
-}
-
-function emit(
-  hooks: GateHooks,
-  surface: string,
-  value: string,
-  result: string,
-  resolution: string,
-  extra?: AskAudit | Record<string, unknown>
-): void {
-  try {
-    hooks.emit?.(BUS_CHANNEL_DECISION, {
-      surface,
-      value,
-      result,
-      resolution,
-      ...extra,
-    })
-  } catch {
-    /* fire-and-forget */
-  }
-}
-
-// Quién hay detrás de la decisión de un ask. `no-ui` nunca es un usuario: no
-// se mostró ningún prompt, así que atribuirla a una persona falsea la
-// auditoría y el mensaje que recibe el modelo. Lo mismo con `timeout` (nadie
-// respondió) y `session-rules` (quién decidió fue una aprobación previa).
-function askActor(via: AskAudit['via']): AskAudit['decidedBy'] {
-  switch (via) {
-    case 'no-ui':
-      return 'no-ui'
-    case 'timeout':
-      return 'timeout'
-    case 'session-rules':
-      return 'session'
-    default:
-      return 'user'
-  }
-}
-
-const RISK_RANK: Record<RiskLevel, number> = { low: 0, medium: 1, high: 2 }
-
-function classifyDecision(
-  r: ClassifierResult,
-  onBlock: 'ask' | 'deny' = 'deny'
-): 'allow' | 'ask' | 'deny' {
-  if (r.decision === 'block') return onBlock === 'deny' ? 'deny' : 'ask'
-  if (r.decision === 'allow') return 'allow'
-  return 'ask'
-}
-
-function applyDenyStrategy(
-  toolName: string,
-  reason: string,
-  trigger: 'permission' | 'classifier',
-  deps: GateDeps
-): DenialAction | 'ask' {
-  if (!deps.denyService) return 'ask'
-  return deps.denyService.recordDenial({ toolName, reason, trigger })
-}
-
-async function handleClassifierBlock(
-  toolName: string,
-  surface: string,
-  value: string,
-  risk: ClassifierResult['risk'] | undefined,
-  deps: GateDeps,
-  cfg: Config,
-  opts: {
-    startedAt: number
-    rule?: { surface: string; pattern: string; reason?: string }
-  }
-): Promise<boolean> {
-  const blockMessage = () =>
-    formatDenyMessage({
-      kind: 'classifier_block',
-      toolName,
-      command: value,
-      surface,
-      risk,
-    })
-  // strategy defaults to 'deny': the direct-deny paths (no override,
-  // crashed resolver) never reach a modal. Override + auto-retry pass
-  // their routing explicitly.
-  const detail = (strategy: string = 'deny') =>
-    buildDecisionDetail({
-      toolName,
-      matchedSurface: surface,
-      matchedValue: value,
-      rule: opts.rule,
-      risk,
-      startedAt: opts.startedAt,
-      strategy,
-    })
-  if (cfg.classifier.onBlockUserOverride !== true) {
-    emit(deps.hooks, surface, value, 'deny', 'classifier_block', {
-      ...detail(),
-    })
-    throw new Error(blockMessage())
-  }
-  const reason = risk?.reason ?? 'classifier_block'
-  let action: DenialAction | 'ask'
-  try {
-    action = applyDenyStrategy(toolName, reason, 'classifier', deps)
-  } catch {
-    emit(deps.hooks, surface, value, 'deny', 'classifier_block', {
-      ...detail(),
-    })
-    throw new Error(blockMessage())
-  }
-  if (action === 'auto-retry' || action === 'deny-and-continue') {
-    emit(deps.hooks, surface, value, 'deny', 'classifier_block', {
-      ...detail(action),
-    })
-    throw new Error(blockMessage())
-  }
-  // action === 'ask-user'
-  let requestId: string
-  let verdict: AskVerdict = 'allow'
-  let via: AskAudit['via'] = 'modal'
-  try {
-    ;({ requestId, verdict, via } = await resolveAsk(
-      surface,
-      value,
-      risk,
-      deps,
-      undefined,
-      toolName,
-      undefined,
-      opts.startedAt
-    ))
-  } catch (err) {
-    if (err instanceof AskDeniedError) {
-      emit(deps.hooks, surface, value, 'deny', 'classifier_block_override', {
-        requestId: err.audit.requestId,
-        decidedBy: err.audit.decidedBy,
-        via: err.audit.via,
-        userVerdict: 'deny',
-        ...detail('ask-user'),
-      })
-      throw new Error(blockMessage())
-    }
-    emit(deps.hooks, surface, value, 'deny', 'classifier_block', {
-      ...detail(),
-    })
-    throw new Error(blockMessage())
-  }
-  emit(deps.hooks, surface, value, 'allow', 'classifier_block_override', {
-    requestId,
-    decidedBy: askActor(via),
-    via,
-    ...verdictExtra(verdict),
-    ...detail('ask-user'),
-  })
-  return true
-}
-
-interface DenyMessageParams {
-  kind:
-    | 'deny-and-continue'
-    | 'escalate'
-    | 'classifier_block'
-    | 'unknown_tool'
-    | 'permission_deny'
+// Per-call context threaded through every phase of gateToolCall.
+interface GateCtx {
   toolName: string
-  command: string
-  surface: string
-  risk?: ClassifierResult['risk']
-  rulePattern?: string
-  ruleSurface?: string
+  input: Record<string, unknown>
+  deps: GateDeps
+  startedAt: number
+  cfg: Config
+  intents: AccessIntent[]
+  fullCommand?: string
+}
+
+interface CascadeState {
+  permAction: 'allow' | 'ask' | 'deny'
+  matchedSurface: string
+  matchedValue: string
+  ruleSurface: string
+  rulePattern: string
   ruleReason?: string
 }
 
-/**
- * Self-explanatory deny message for the LLM.
- */
-export function formatDenyMessage(p: DenyMessageParams): string {
-  if (p.kind === 'unknown_tool') {
-    const name = p.toolName && p.toolName.length > 0 ? p.toolName : 'unknown'
-    return [
-      `Tool call denied: tool name was unrecognized by the gate.`,
-      `  Tool: '${name}'`,
-      `  Reformulation: only the registered tools can be used. Available tools`,
-      `  are listed in the system prompt (if visibility filtering is active,`,
-      `  only the tools the permission set allows are visible). Pick a known`,
-      `  tool, or ask the user to enable a new one via the permission set.`,
-    ].join('\n')
-  }
-  if (p.kind === 'classifier_block') {
-    const r = p.risk
-    const score = r ? r.score : '?'
-    const level = r ? r.level : '?'
-    const category = r?.category ?? 'unknown'
-    // Never leak secrets to the model: redact user-controlled strings.
-    const reason = redactSecretsForModel(r?.reason ?? 'classifier verdict')
-    const command = redactSecretsForModel(p.command)
-    const lines: string[] = [
-      `Tool call denied by classifier: command '${command}' was classified`,
-      `as high risk.`,
-    ]
-    if (r?.riskOrigin === 'llm' && reason && reason !== 'classifier verdict') {
-      lines.push(`  LLM explanation: ${reason}  (source: LLM classifier)`)
-    }
-    lines.push(
-      `  Risk: score ${score}/10, level ${level}, category ${category},`,
-      `  reason ${reason}`,
-      `  Reformulation: the classifier is enforcing the same policy as the`,
-      `  underlying rules — pick a non-destructive alternative (e.g. remove`,
-      `  a single file instead of a recursive force, or scope the operation`,
-      `  to a project-local path), or ask the user to run the original`,
-      `  command manually outside the agent.`
-    )
-    return lines.join('\n')
-  }
-  // permission_deny, deny-and-continue, escalate
-  // Never leak secrets to the model (config reasons get pasted around,
-  // so they are redacted defensively; ids like surface/toolName are not).
-  const rulePattern = p.rulePattern ? redactSecretsForModel(p.rulePattern) : '*'
-  const ruleSurface = p.ruleSurface ?? p.surface
-  const ruleReason = p.ruleReason
-    ? redactSecretsForModel(p.ruleReason)
-    : undefined
-  const reasonPart = ruleReason
-    ? `  Rule: ${ruleSurface} / ${rulePattern}  (reason: ${ruleReason})\n`
-    : `  Rule: ${ruleSurface} / ${rulePattern}\n`
-  const command = redactSecretsForModel(p.command)
-  return [
-    `Tool call denied: command '${command}' was blocked by a deny rule.`,
-    reasonPart.trimEnd(),
-    `  Reformulation: avoid destructive / policy-violating operations. Use a`,
-    `  narrower, non-destructive alternative (e.g. remove a single file`,
-    `  instead of a recursive force, or scope the operation to a`,
-    `  project-local path). If the user explicitly requested this exact`,
-    `  action, ask them to run it manually outside the agent.`,
-  ].join('\n')
+interface ExternalScopeResult {
+  externalDirPath?: string
+  externalGrantDir?: string
+  isExternalDirAsk: boolean
 }
 
-class AskDeniedError extends Error {
-  readonly audit: AskAudit
-  constructor(message: string, audit: AskAudit) {
-    super(message)
-    this.name = 'AskDeniedError'
-    this.audit = audit
-  }
-}
+type AggResult = Awaited<ReturnType<typeof aggregateClassify>>
 
-// Modal outcomes worth training on: grant-once vs grant-for-session vs
-// directory-specific approvals. 'session' (no modal shown) maps to NO
-// userVerdict key at all.
-type AskVerdict =
-  'allow' | 'allow_session' | 'allow_dir_tool' | 'allow_dir_all' | 'session'
+type DetailFn = (strategy?: string) => ReturnType<typeof buildDecisionDetail>
 
-function verdictExtra(verdict: AskVerdict): {
-  userVerdict?: 'allow' | 'allow_session' | 'allow_dir_tool' | 'allow_dir_all'
-} {
-  return verdict === 'session' ? {} : { userVerdict: verdict }
-}
-
-// El mensaje al modelo tiene que decir la verdad: si no hubo UI nadie negó la
-// llamada, y un prompt expirado tampoco es una decisión de una persona.
-function askDenial(
-  via: AskAudit['via'],
-  requestId: string,
-  denialReason?: string
-): AskDeniedError {
-  const suffix = denialReason ? ` (${denialReason})` : ''
-  if (via === 'no-ui') {
-    return new AskDeniedError(
-      `Permission denied without asking: this session has no UI, so no user could approve it${suffix}. Run pi interactively, or allow the action in config.`,
-      { requestId, decidedBy: 'no-ui', via, denialReason }
-    )
-  }
-  if (via === 'timeout') {
-    return new AskDeniedError(
-      `Permission denied: the confirmation prompt expired without an answer${suffix}. Nothing ran; ask the user to approve it, or allow it in the config.`,
-      { requestId, decidedBy: 'timeout', via, denialReason }
-    )
-  }
-  return new AskDeniedError(
-    `Permission denied by user${denialReason ? `: ${denialReason}` : ''}`,
-    { requestId, decidedBy: 'user', via, denialReason }
-  )
-}
-
-async function resolveAsk(
-  surface: string,
-  value: string,
-  risk: ClassifierResult['risk'] | undefined,
-  deps: GateDeps,
-  matchedRule?: { surface: string; pattern: string; reason?: string },
-  toolName?: string,
-  fullCommand?: string,
-  startedAt?: number,
-  externalDir?: {
-    isExternalDir: boolean
-    externalDirPath?: string
-    externalGrantDir?: string
-  }
-): Promise<{ requestId: string; verdict: AskVerdict; via: AskAudit['via'] }> {
-  const requestId =
-    globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)
-
-  // Session allow short-circuit (Bug A fix)
-  // Check if there's a session allow rule matching this surface and value
-  const sessionApproved = deps.sessionRules
-    .snapshot()
-    .find(
-      (r) =>
-        r.origin === 'session' &&
-        r.action === 'allow' &&
-        r.surface === surface &&
-        wildcardMatch(r.pattern, value)
-    )
-  if (sessionApproved) {
-    emit(deps.hooks, surface, value, 'allow', 'session_allow', {
-      requestId,
-      decidedBy: 'session',
-      via: 'session-rules',
-      matchedPattern: sessionApproved.pattern,
-      ...buildDecisionDetail({
-        toolName: toolName ?? surface,
-        matchedSurface: surface,
-        matchedValue: value,
-        rule: { surface, pattern: sessionApproved.pattern },
-        risk,
-        startedAt: startedAt ?? Date.now(),
-      }),
-    })
-    deps.denyService?.onContinueSucceeded()
-    return { requestId, verdict: 'session', via: 'session-rules' }
-  }
-
-  const ruleForResolver = matchedRule
-    ? {
-        surface: matchedRule.surface,
-        pattern: matchedRule.pattern,
-        action: 'ask' as PermissionState,
-        reason: matchedRule.reason,
-      }
-    : undefined
-
-  const res = await getAskResolver()({
-    surface,
-    value,
-    rule: ruleForResolver,
-    risk,
-    requestId,
-    tool: toolName,
-    fullCommand,
-    type: externalDir?.isExternalDir ? 'external-directory' : 'tool-permission',
-    externalDir: externalDir?.externalGrantDir ?? externalDir?.externalDirPath,
-  })
-  const { decision, reason, via } = normalizeAskDecision(res)
-
-  if (decision === 'allow') {
-    deps.denyService?.onContinueSucceeded()
-    return { requestId, verdict: 'allow', via }
-  }
-  if (decision === 'allow_session') {
-    deps.denyService?.onContinueSucceeded()
-    // Persist exact value for catch-all patterns
-    const safePattern = value
-    deps.sessionRules.approveForSession(surface, safePattern, 'allow')
-    return { requestId, verdict: 'allow_session', via }
-  }
-  if (decision === 'allow_dir_tool') {
-    deps.denyService?.onContinueSucceeded()
-    if (externalDir?.externalGrantDir && toolName !== undefined) {
-      deps.sessionRules.approveForSession(
-        externalDirSurfaceFor(toolName),
-        `${externalDir.externalGrantDir}/**`,
-        'allow'
-      )
-    }
-    return { requestId, verdict: 'allow_dir_tool', via }
-  }
-  if (decision === 'allow_dir_all') {
-    deps.denyService?.onContinueSucceeded()
-    if (externalDir?.externalGrantDir) {
-      addExternalDirAllow(externalDir.externalGrantDir)
-    }
-    return { requestId, verdict: 'allow_dir_all', via }
-  }
-  // Plain 'deny' carries no user-typed reason: inherit the reason shown in
-  // the modal header (permission-rule reason first, classifier risk
-  // second) so the model still learns why it was denied.
-  const denialReason = reason ?? matchedRule?.reason ?? risk?.reason
-  throw askDenial(via, requestId, denialReason)
-}
-
-async function aggregateClassify(
-  intents: AccessIntent[],
-  toolName: string,
-  input: Record<string, unknown>,
-  deps: GateDeps
-): Promise<{
-  action: 'allow' | 'ask' | 'deny'
-  risk?: ClassifierResult['risk']
-  surface: string
+// Unknown-tool path: tools with surface === 'denied' stay visible and ask
+// the user; a denied ask throws the unknown-tool deny message.
+async function handleUnknownToolIntent(
+  ctx: GateCtx,
   value: string
-}> {
-  if (deps.configState.get().classifier.enabled === false) {
-    return {
-      action: 'allow',
-      surface: intents[0]?.surface ?? toolName,
-      value: intents[0]?.value ?? '*',
-    }
-  }
-  let action: 'allow' | 'ask' | 'deny' = 'allow'
-  const onBlock = deps.configState.get().classifier.onBlock
-  let risk: ClassifierResult['risk'] | undefined
-  let repSurface = intents[0]?.surface ?? toolName
-  let repValue = intents[0]?.value ?? '*'
-  let askRepSet = false
-
-  for (const intent of intents) {
-    if (!deps.classify)
-      return { action: 'deny', surface: repSurface, value: repValue }
-    const r = await deps.classify({
-      toolName,
-      arguments: input,
-      surface: intent.surface,
-      value: intent.value,
-    })
-    const a = classifyDecision(r, onBlock)
-    if (a === 'ask' && !askRepSet) {
-      repSurface = intent.surface
-      repValue = intent.value
-      askRepSet = true
-    }
-    if (mostRestrictive(action, a) === a) action = a
-    if (r.risk && (!risk || RISK_RANK[r.risk.level] > RISK_RANK[risk.level])) {
-      risk = r.risk
-    }
-  }
-  return { action, risk, surface: repSurface, value: repValue }
-}
-
-function mostRestrictive(
-  a: 'allow' | 'ask' | 'deny',
-  b: 'allow' | 'ask' | 'deny'
-): 'allow' | 'ask' | 'deny' {
-  const rank = { allow: 0, ask: 1, deny: 2 }
-  return rank[a] >= rank[b] ? a : b
-}
-
-export async function gateToolCall(
-  toolName: string,
-  input: Record<string, unknown>,
-  deps: GateDeps
 ): Promise<void> {
-  const startedAt = Date.now()
-  const cfg = deps.configState.get()
-  const intents = normalizeToolCall(toolName, input)
-  const fullCommand =
-    typeof input.command === 'string' && input.command.length > 0
-      ? input.command
-      : undefined
-
-  // Unknown tools (surface === 'denied') are visible and ask the user
-  const deniedIntent = intents.find((i) => i.surface === 'denied')
-  if (deniedIntent) {
-    try {
-      const { requestId, verdict, via } = await resolveAsk(
-        toolName,
-        deniedIntent.value,
-        undefined,
-        deps,
-        undefined,
-        toolName,
-        fullCommand,
-        startedAt
-      )
-      emit(
-        deps.hooks,
-        toolName,
-        deniedIntent.value,
-        'allow',
-        'unknown_tool_ask',
-        {
-          requestId,
-          decidedBy: askActor(via),
-          via,
-          ...verdictExtra(verdict),
-          ...buildDecisionDetail({
-            toolName,
-            matchedSurface: toolName,
-            matchedValue: deniedIntent.value,
-            startedAt,
-          }),
-        }
-      )
-      return
-    } catch (err) {
-      const audit = err instanceof AskDeniedError ? err.audit : undefined
-      emit(
-        deps.hooks,
-        toolName,
-        deniedIntent.value,
-        'deny',
-        'unknown_tool_ask',
-        {
-          ...audit,
-          ...(err instanceof AskDeniedError
-            ? { userVerdict: 'deny' as const }
-            : {}),
-          ...buildDecisionDetail({
-            toolName,
-            matchedSurface: toolName,
-            matchedValue: deniedIntent.value,
-            startedAt,
-          }),
-        }
-      )
-      throw new Error(
-        formatDenyMessage({
-          kind: 'unknown_tool',
-          toolName,
-          command: deniedIntent.value,
-          surface: toolName,
-        })
-      )
-    }
+  const { deps, toolName, fullCommand, startedAt } = ctx
+  const detailArgs = {
+    toolName,
+    matchedSurface: toolName,
+    matchedValue: value,
+    startedAt,
   }
+  try {
+    const { requestId, verdict, via } = await resolveAsk(
+      toolName,
+      value,
+      undefined,
+      deps,
+      undefined,
+      toolName,
+      fullCommand,
+      startedAt
+    )
+    emit(deps.hooks, toolName, value, 'allow', 'unknown_tool_ask', {
+      requestId,
+      decidedBy: askActor(via),
+      via,
+      ...verdictExtra(verdict),
+      ...buildDecisionDetail(detailArgs),
+    })
+    return
+  } catch (err) {
+    emit(deps.hooks, toolName, value, 'deny', 'unknown_tool_ask', {
+      ...askDeniedAudit(err),
+      ...buildDecisionDetail(detailArgs),
+    })
+    throw new Error(
+      formatDenyMessage({
+        kind: 'unknown_tool',
+        toolName,
+        command: value,
+        surface: toolName,
+      })
+    )
+  }
+}
 
-  // Evaluate permission cascade for all intents.
-  // Returns: 'allow' | 'ask' | 'deny' | undefined
-  let permAction: 'allow' | 'ask' | 'deny' = 'allow'
-  let matchedSurface = toolName
-  let matchedValue = '*'
-  let rulePattern = '*'
-  let ruleSurface = toolName
-  let ruleReason: string | undefined
-
+// Evaluate permission cascade for all intents.
+// Session allows do NOT skip cascade evaluation here (config deny beats
+// session allow); the session short-circuit only happens in resolveAsk
+// (Bug A fix).
+function evaluateCascade(ctx: GateCtx): CascadeState {
+  const { cfg, intents, toolName } = ctx
+  const state: CascadeState = {
+    permAction: 'allow',
+    matchedSurface: toolName,
+    matchedValue: '*',
+    ruleSurface: toolName,
+    rulePattern: '*',
+  }
   for (const intent of intents) {
     // Evaluate permission cascade (config) - use toolName as key, not surface
-    // Session allows do NOT skip cascade evaluation here (config deny beats session allow)
-    // Session short-circuit only happens in resolveAsk (Bug A fix).
     const evalResult = evaluatePermission(
       cfg,
       'tools',
@@ -683,41 +139,44 @@ export async function gateToolCall(
       intent.value // callValue = the full command string for pattern matching
     )
     const cascadeAction = evalResult.action
-
-    if (cascadeAction !== undefined) {
-      if (
-        cascadeAction !== 'unknown' &&
-        mostRestrictive(permAction, cascadeAction) === cascadeAction
-      ) {
-        permAction = cascadeAction
-        matchedSurface = intent.surface
-        matchedValue = intent.value
-        ruleSurface = intent.surface
-        rulePattern = evalResult.matchedRule?.pattern ?? intent.value
-        // A bare action ('ask'/'deny') is not an explanation: synthesize a
-        // reason that names the match instead of leaking the action string.
-        // Explicit rule reasons are left untouched.
-        const matched = evalResult.matchedRule
-        if (matched?.reason !== undefined) {
-          ruleReason = matched.reason
-        } else if (matched === undefined) {
-          ruleReason = `default '${cascadeAction}' for tool '${toolName}'`
-        } else {
-          ruleReason = `rule '${matched.pattern}' matched`
-        }
+    if (cascadeAction === undefined) continue
+    if (
+      cascadeAction !== 'unknown' &&
+      mostRestrictive(state.permAction, cascadeAction) === cascadeAction
+    ) {
+      state.permAction = cascadeAction
+      state.matchedSurface = intent.surface
+      state.matchedValue = intent.value
+      state.ruleSurface = intent.surface
+      state.rulePattern = evalResult.matchedRule?.pattern ?? intent.value
+      // A bare action ('ask'/'deny') is not an explanation: synthesize a
+      // reason that names the match instead of leaking the action string.
+      // Explicit rule reasons are left untouched.
+      const matched = evalResult.matchedRule
+      if (matched?.reason !== undefined) {
+        state.ruleReason = matched.reason
+      } else if (matched === undefined) {
+        state.ruleReason = `default '${cascadeAction}' for tool '${toolName}'`
+      } else {
+        state.ruleReason = `rule '${matched.pattern}' matched`
       }
     }
   }
+  return state
+}
 
-  // Session allow does NOT override permission cascade result here.
-  // Session short-circuit only happens in resolveAsk (Bug A fix).
-
-  // External directory scope (opt-in via confineToWorkingDirectory).
-  // Only tightens: overwrite permAction ONLY when strictly more restrictive
-  // (deny > ask > allow), so an explicit tool deny always beats an explicit
-  // external allow. Reporting follows the triggering intent (not intent[0]).
-  // Track whether this ask came from the external-directory layer so the
-  // resolver can render the correct modal variant.
+// External directory scope (opt-in via confineToWorkingDirectory).
+// Only tightens: overwrite permAction ONLY when strictly more restrictive
+// (deny > ask > allow), so an explicit tool deny always beats an explicit
+// external allow. Reporting follows the triggering intent (not intent[0]).
+// Track whether this ask came from the external-directory layer so the
+// resolver can render the correct modal variant.
+// Mutates `state` in place when the external verdict is more restrictive.
+function applyExternalScope(
+  ctx: GateCtx,
+  state: CascadeState
+): ExternalScopeResult {
+  const { cfg, intents, toolName, deps } = ctx
   const externalVerdict = evaluateExternalDirectory(cfg, intents, {
     toolName,
     sessionRules: deps.sessionRules,
@@ -728,220 +187,278 @@ export async function gateToolCall(
     externalVerdict === undefined
       ? undefined
       : grantDirFor(externalVerdict.absPath)
-  let wasExternalDirMoreRestrictive = false
+  let isExternalDirAsk = false
   if (externalVerdict !== undefined) {
     const rank = { allow: 0, ask: 1, deny: 2 } as const
-    wasExternalDirMoreRestrictive =
-      rank[externalVerdict.action] > rank[permAction]
+    const wasExternalDirMoreRestrictive =
+      rank[externalVerdict.action] > rank[state.permAction]
     if (wasExternalDirMoreRestrictive) {
-      permAction = externalVerdict.action
-      rulePattern = externalVerdict.pattern ?? '*'
-      ruleReason = `access outside the working directory is not allowed: ${externalVerdict.absPath}`
+      state.permAction = externalVerdict.action
+      state.rulePattern = externalVerdict.pattern ?? '*'
+      state.ruleReason = `access outside the working directory is not allowed: ${externalVerdict.absPath}`
       if (externalVerdict.matchedValue !== undefined) {
-        matchedValue = externalVerdict.matchedValue
-        matchedSurface = externalVerdict.matchedSurface ?? matchedSurface
+        state.matchedValue = externalVerdict.matchedValue
+        state.matchedSurface =
+          externalVerdict.matchedSurface ?? state.matchedSurface
       }
+      isExternalDirAsk = externalVerdict.action === 'ask'
     }
   }
+  return { externalDirPath, externalGrantDir, isExternalDirAsk }
+}
 
-  let isExternalDirAsk = false
-  if (externalVerdict !== undefined && wasExternalDirMoreRestrictive) {
-    isExternalDirAsk = externalVerdict.action === 'ask'
-  }
-
-  if (permAction === 'deny') {
-    const action = applyDenyStrategy(
-      toolName,
-      ruleReason ?? 'policy_deny',
-      'permission',
-      deps
-    )
-    if (action === 'auto-retry' || action === 'deny-and-continue') {
-      emit(
-        deps.hooks,
-        matchedSurface,
-        matchedValue,
-        'deny',
-        'deny_and_continue',
-        {
-          ...buildDecisionDetail({
-            toolName,
-            matchedSurface,
-            matchedValue,
-            rule: {
-              surface: ruleSurface,
-              pattern: rulePattern,
-              reason: ruleReason,
-            },
-            startedAt,
-            strategy: action,
-          }),
-        }
-      )
-      throw new Error(
-        formatDenyMessage({
-          kind: 'permission_deny',
-          toolName,
-          command: matchedValue,
-          surface: matchedSurface,
-          rulePattern,
-          ruleSurface,
-          ruleReason,
-        })
-      )
-    }
-    if (action === 'ask-user') {
-      try {
-        const { requestId, verdict } = await resolveAsk(
-          matchedSurface,
-          matchedValue,
-          undefined,
-          deps,
-          { surface: toolName, pattern: matchedValue, reason: ruleReason },
-          toolName,
-          fullCommand,
-          startedAt
-        )
-        emit(
-          deps.hooks,
-          matchedSurface,
-          matchedValue,
-          'allow',
-          'permission_ask',
-          {
-            requestId,
-            decidedBy: 'user',
-            via: 'modal',
-            ...verdictExtra(verdict),
-            ...buildDecisionDetail({
-              toolName,
-              matchedSurface,
-              matchedValue,
-              rule: {
-                surface: ruleSurface,
-                pattern: rulePattern,
-                reason: ruleReason,
-              },
-              startedAt,
-              strategy: 'ask-user',
-            }),
-          }
-        )
-      } catch (err) {
-        const audit = err instanceof AskDeniedError ? err.audit : undefined
-        emit(
-          deps.hooks,
-          matchedSurface,
-          matchedValue,
-          'deny',
-          'permission_ask',
-          {
-            ...audit,
-            ...(err instanceof AskDeniedError
-              ? { userVerdict: 'deny' as const }
-              : {}),
-            ...buildDecisionDetail({
-              toolName,
-              matchedSurface,
-              matchedValue,
-              rule: {
-                surface: ruleSurface,
-                pattern: rulePattern,
-                reason: ruleReason,
-              },
-              startedAt,
-              strategy: 'ask-user',
-            }),
-          }
-        )
-        throw err
-      }
-      return
-    }
-    // action === "escalate" (legacy, mapped to 'both')
-    emit(deps.hooks, matchedSurface, matchedValue, 'deny', 'escalate', {
+// Hard deny (no modal): emit the deny event with the matched rule and throw
+// the self-explanatory deny message.
+function hardDeny(args: {
+  ctx: GateCtx
+  state: CascadeState
+  resolution: string
+  kind: 'permission_deny' | 'escalate'
+  strategy: string
+}): never {
+  const { ctx, state, resolution, kind, strategy } = args
+  const { deps, toolName, startedAt } = ctx
+  emit(
+    deps.hooks,
+    state.matchedSurface,
+    state.matchedValue,
+    'deny',
+    resolution,
+    {
       ...buildDecisionDetail({
         toolName,
-        matchedSurface,
-        matchedValue,
+        matchedSurface: state.matchedSurface,
+        matchedValue: state.matchedValue,
         rule: {
-          surface: ruleSurface,
-          pattern: rulePattern,
-          reason: ruleReason,
+          surface: state.ruleSurface,
+          pattern: state.rulePattern,
+          reason: state.ruleReason,
         },
         startedAt,
-        strategy: 'escalate',
+        strategy,
       }),
+    }
+  )
+  throw new Error(
+    formatDenyMessage({
+      kind,
+      toolName,
+      command: state.matchedValue,
+      surface: state.matchedSurface,
+      rulePattern: state.rulePattern,
+      ruleSurface: state.ruleSurface,
+      ruleReason: state.ruleReason,
     })
-    throw new Error(
-      formatDenyMessage({
-        kind: 'escalate',
-        toolName,
-        command: matchedValue,
-        surface: matchedSurface,
-        rulePattern,
-        ruleSurface,
-        ruleReason,
-      })
-    )
-  }
+  )
+}
 
-  if (permAction === 'allow') {
-    // Explicit allow is final: the permission layer owns the decision and
-    // the classifier is NOT consulted (it only hardens `ask`, see below).
-    // Trade-off: an allow bypasses the LLM safety net for that call —
-    // uncovered commands (cascade `unknown`) also land here permissively.
-    emit(deps.hooks, matchedSurface, matchedValue, 'allow', 'allow', {
-      ...buildDecisionDetail({
-        toolName,
-        matchedSurface,
-        matchedValue,
-        startedAt,
-      }),
-    })
+// Deny-routing for the permission layer: auto-retry / deny-and-continue
+// throw immediately, ask-user delegates to the resolver, 'escalate'
+// (legacy, mapped to 'both') throws with its own strategy tag.
+async function handlePermDeny(
+  ctx: GateCtx,
+  state: CascadeState
+): Promise<void> {
+  const action = applyDenyStrategy(
+    ctx.toolName,
+    state.ruleReason ?? 'policy_deny',
+    'permission',
+    ctx.deps
+  )
+  if (action === 'ask-user') {
+    await handleDenyAskUser(ctx, state)
     return
   }
+  if (action === 'auto-retry' || action === 'deny-and-continue') {
+    hardDeny({
+      ctx,
+      state,
+      resolution: 'deny_and_continue',
+      kind: 'permission_deny',
+      strategy: action,
+    })
+  }
+  // action === "escalate" (legacy, mapped to 'both')
+  hardDeny({
+    ctx,
+    state,
+    resolution: 'escalate',
+    kind: 'escalate',
+    strategy: 'escalate',
+  })
+}
 
-  // permAction === "ask": harden with classifier BEFORE prompting
-  const agg = await aggregateClassify(intents, toolName, input, deps)
-  if (agg.action === 'deny') {
-    const proceeded = await handleClassifierBlock(
+async function handleDenyAskUser(
+  ctx: GateCtx,
+  state: CascadeState
+): Promise<void> {
+  const { deps, toolName, fullCommand, startedAt } = ctx
+  const { matchedSurface, matchedValue, ruleReason } = state
+  const detail: DetailFn = (strategy) =>
+    buildDecisionDetail({
       toolName,
-      agg.surface,
-      agg.value,
-      agg.risk,
+      matchedSurface,
+      matchedValue,
+      rule: {
+        surface: state.ruleSurface,
+        pattern: state.rulePattern,
+        reason: ruleReason,
+      },
+      startedAt,
+      strategy,
+    })
+  try {
+    const { requestId, verdict } = await resolveAsk(
+      matchedSurface,
+      matchedValue,
+      undefined,
       deps,
-      cfg,
-      {
-        startedAt,
-        rule: { surface: toolName, pattern: rulePattern, reason: ruleReason },
-      }
+      { surface: toolName, pattern: matchedValue, reason: ruleReason },
+      toolName,
+      fullCommand,
+      startedAt
     )
+    emit(deps.hooks, matchedSurface, matchedValue, 'allow', 'permission_ask', {
+      requestId,
+      decidedBy: 'user',
+      via: 'modal',
+      ...verdictExtra(verdict),
+      ...detail('ask-user'),
+    })
+  } catch (err) {
+    emit(deps.hooks, matchedSurface, matchedValue, 'deny', 'permission_ask', {
+      ...askDeniedAudit(err),
+      ...detail('ask-user'),
+    })
+    throw err
+  }
+}
+
+// Explicit allow is final: the permission layer owns the decision and
+// the classifier is NOT consulted (it only hardens `ask`). Trade-off: an
+// allow bypasses the LLM safety net for that call — uncovered commands
+// (cascade `unknown`) also land here permissively.
+function emitAllowDecision(ctx: GateCtx, state: CascadeState): void {
+  emit(
+    ctx.deps.hooks,
+    state.matchedSurface,
+    state.matchedValue,
+    'allow',
+    'allow',
+    {
+      ...buildDecisionDetail({
+        toolName: ctx.toolName,
+        matchedSurface: state.matchedSurface,
+        matchedValue: state.matchedValue,
+        startedAt: ctx.startedAt,
+      }),
+    }
+  )
+}
+
+// permAction === "ask": harden with classifier BEFORE prompting.
+async function handleAskPath(
+  ctx: GateCtx,
+  state: CascadeState,
+  external: ExternalScopeResult
+): Promise<void> {
+  const agg = await aggregateClassify(
+    ctx.intents,
+    ctx.toolName,
+    ctx.input,
+    ctx.deps
+  )
+  if (agg.action === 'deny') {
+    const proceeded = await handleClassifierBlock(ctx.deps, ctx.cfg, {
+      toolName: ctx.toolName,
+      surface: agg.surface,
+      value: agg.value,
+      risk: agg.risk,
+      startedAt: ctx.startedAt,
+      rule: {
+        surface: ctx.toolName,
+        pattern: state.rulePattern,
+        reason: state.ruleReason,
+      },
+    })
     if (proceeded) return
     throw new Error(
       formatDenyMessage({
         kind: 'classifier_block',
-        toolName,
+        toolName: ctx.toolName,
         command: agg.value,
         surface: agg.surface,
         risk: agg.risk,
       })
     )
   }
+  await promptAskAfterClassifier(ctx, state, external, agg)
+}
+
+// Which surface/value/resolution the ask prompt should carry once the
+// classifier has hardened the permission ask.
+function planAsk(
+  ctx: GateCtx,
+  state: CascadeState,
+  agg: AggResult
+): {
+  askSurface: string
+  askValue: string
+  resolution: string
+  matchedRuleForAsk: { surface: string; pattern: string; reason?: string }
+} {
   const useClassifierRep =
-    agg.risk != null && (agg.surface !== toolName || agg.value !== '*')
-  const askSurface = useClassifierRep ? agg.surface : matchedSurface
-  const askValue = useClassifierRep ? agg.value : matchedValue
-  const classifierInvoked = cfg.classifier.enabled === true && agg.risk != null
-  const resolution = classifierInvoked ? 'classifier_ask' : 'permission_ask'
-  // Always surface the permission/external rule that produced this ask:
-  // when the classifier errored, its fallback reason must not mask the
-  // pre-LLM reason in the modal header (rule.reason wins over risk.reason).
-  const matchedRuleForAsk = {
-    surface: toolName,
-    pattern: rulePattern,
-    reason: ruleReason,
+    agg.risk != null && (agg.surface !== ctx.toolName || agg.value !== '*')
+  const classifierInvoked =
+    ctx.cfg.classifier.enabled === true && agg.risk != null
+  return {
+    askSurface: useClassifierRep ? agg.surface : state.matchedSurface,
+    askValue: useClassifierRep ? agg.value : state.matchedValue,
+    resolution: classifierInvoked ? 'classifier_ask' : 'permission_ask',
+    // Always surface the permission/external rule that produced this ask:
+    // when the classifier errored, its fallback reason must not mask the
+    // pre-LLM reason in the modal header (rule.reason wins over risk.reason).
+    matchedRuleForAsk: {
+      surface: ctx.toolName,
+      pattern: state.rulePattern,
+      reason: state.ruleReason,
+    },
   }
+}
+
+function toExternalDirAsk(
+  external: ExternalScopeResult
+): ExternalDirAsk | undefined {
+  return external.isExternalDirAsk
+    ? {
+        isExternalDir: true,
+        externalDirPath: external.externalDirPath,
+        externalGrantDir: external.externalGrantDir,
+      }
+    : undefined
+}
+
+async function promptAskAfterClassifier(
+  ctx: GateCtx,
+  state: CascadeState,
+  external: ExternalScopeResult,
+  agg: AggResult
+): Promise<void> {
+  const { deps, toolName, fullCommand, startedAt } = ctx
+  const { askSurface, askValue, resolution, matchedRuleForAsk } = planAsk(
+    ctx,
+    state,
+    agg
+  )
+  const detailArgs = {
+    toolName,
+    matchedSurface: askSurface,
+    matchedValue: askValue,
+    rule: matchedRuleForAsk,
+    risk: agg.risk,
+    startedAt,
+  }
+  const externalDirAsk = toExternalDirAsk(external)
   try {
     const { requestId, verdict, via } = await resolveAsk(
       askSurface,
@@ -952,40 +469,61 @@ export async function gateToolCall(
       toolName,
       fullCommand,
       startedAt,
-      isExternalDirAsk
-        ? { isExternalDir: true, externalDirPath, externalGrantDir }
-        : undefined
+      externalDirAsk
     )
     emit(deps.hooks, askSurface, askValue, 'allow', resolution, {
       requestId,
       decidedBy: askActor(via),
       via,
       ...verdictExtra(verdict),
-      ...buildDecisionDetail({
-        toolName,
-        matchedSurface: askSurface,
-        matchedValue: askValue,
-        rule: matchedRuleForAsk,
-        risk: agg.risk,
-        startedAt,
-      }),
+      ...buildDecisionDetail(detailArgs),
     })
   } catch (err) {
-    const audit = err instanceof AskDeniedError ? err.audit : undefined
     emit(deps.hooks, askSurface, askValue, 'deny', resolution, {
-      ...audit,
-      ...(err instanceof AskDeniedError
-        ? { userVerdict: 'deny' as const }
-        : {}),
-      ...buildDecisionDetail({
-        toolName,
-        matchedSurface: askSurface,
-        matchedValue: askValue,
-        rule: matchedRuleForAsk,
-        risk: agg.risk,
-        startedAt,
-      }),
+      ...askDeniedAudit(err),
+      ...buildDecisionDetail(detailArgs),
     })
     throw err
   }
+}
+
+export async function gateToolCall(
+  toolName: string,
+  input: Record<string, unknown>,
+  deps: GateDeps
+): Promise<void> {
+  const ctx: GateCtx = {
+    toolName,
+    input,
+    deps,
+    startedAt: Date.now(),
+    cfg: deps.configState.get(),
+    intents: normalizeToolCall(toolName, input),
+    fullCommand:
+      typeof input.command === 'string' && input.command.length > 0
+        ? input.command
+        : undefined,
+  }
+
+  // Unknown tools (surface === 'denied') are visible and ask the user
+  const deniedIntent = ctx.intents.find((i) => i.surface === 'denied')
+  if (deniedIntent) {
+    return handleUnknownToolIntent(ctx, deniedIntent.value)
+  }
+
+  const state = evaluateCascade(ctx)
+  // Session allow does NOT override permission cascade result here.
+  // Session short-circuit only happens in resolveAsk (Bug A fix).
+  const external = applyExternalScope(ctx, state)
+
+  if (state.permAction === 'deny') {
+    return handlePermDeny(ctx, state)
+  }
+
+  if (state.permAction === 'allow') {
+    return emitAllowDecision(ctx, state)
+  }
+
+  // permAction === "ask": harden with classifier BEFORE prompting
+  return handleAskPath(ctx, state, external)
 }

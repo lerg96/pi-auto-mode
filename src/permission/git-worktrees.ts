@@ -151,11 +151,6 @@ export function findRepoContext(startDir: string): RepoContext | undefined {
   }
 }
 
-/** Convenience wrapper over `findRepoContext`. */
-export function findCommonGitDir(startDir: string): string | undefined {
-  return findRepoContext(startDir)?.commonDir
-}
-
 /**
  * Common dir behind a `.git` file pointer. Shapes seen in the wild:
  *   * linked worktree  → `<common>/worktrees/<id>` + `commondir` (`../..`)

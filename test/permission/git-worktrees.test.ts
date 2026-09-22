@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve, sep } from 'node:path'
 import {
   discoverWorktreeRoots,
-  findCommonGitDir,
+  findRepoContext,
   isInsideTrustedWorktree,
 } from '../../src/permission/git-worktrees.ts'
 
@@ -76,7 +76,7 @@ describe('git worktree discovery', () => {
     const bare = join(tmp, 'not-a-repo')
     mkdirSync(join(bare, 'nested', 'deep'), { recursive: true })
     expect(discoverWorktreeRoots(join(bare, 'nested', 'deep'))).toEqual([])
-    expect(findCommonGitDir(bare)).toBeUndefined()
+    expect(findRepoContext(bare)?.commonDir).toBeUndefined()
   })
 
   it('main checkout + registered worktrees are all returned', () => {
@@ -102,7 +102,9 @@ describe('git worktree discovery', () => {
     expect(discoverWorktreeRoots(wt).sort()).toEqual(
       discoverWorktreeRoots(root).sort()
     )
-    expect(findCommonGitDir(wt)).toBe(findCommonGitDir(root))
+    expect(findRepoContext(wt)?.commonDir).toBe(
+      findRepoContext(root)?.commonDir
+    )
   })
 
   it('discovery from a subdirectory of the repo works', () => {
@@ -189,7 +191,7 @@ describe('git worktree discovery', () => {
     const wt = join(tmp, 'nocommon-wt')
     addWorktree(root, 'wt', wt, { noCommondir: true })
 
-    expect(findCommonGitDir(wt)).toBe(join(root, '.git'))
+    expect(findRepoContext(wt)?.commonDir).toBe(join(root, '.git'))
     expect(discoverWorktreeRoots(wt).sort()).toEqual(
       discoverWorktreeRoots(root).sort()
     )
@@ -199,7 +201,7 @@ describe('git worktree discovery', () => {
     const root = join(tmp, 'nohead', 'repo')
     mkdirSync(join(root, '.git'), { recursive: true })
     expect(discoverWorktreeRoots(root)).toEqual([])
-    expect(findCommonGitDir(root)).toBeUndefined()
+    expect(findRepoContext(root)?.commonDir).toBeUndefined()
   })
 
   it('`.git` file without a gitdir: pointer is not a worktree', () => {
@@ -207,7 +209,7 @@ describe('git worktree discovery', () => {
     mkdirSync(dir, { recursive: true })
     writeFileSync(join(dir, '.git'), 'not a pointer at all')
     expect(discoverWorktreeRoots(dir)).toEqual([])
-    expect(findCommonGitDir(dir)).toBeUndefined()
+    expect(findRepoContext(dir)?.commonDir).toBeUndefined()
   })
 })
 
@@ -330,7 +332,7 @@ describe('other repository shapes (bare, --separate-git-dir, submodule)', () => 
     const roots = discoverWorktreeRoots(wt)
     expect(roots).toContain(wt)
     expect(roots).not.toContain(common)
-    expect(findCommonGitDir(wt)).toBe(common)
+    expect(findRepoContext(wt)?.commonDir).toBe(common)
   })
 
   it('--separate-git-dir checkout: pointer is the common dir, checkout is a root', () => {

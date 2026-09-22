@@ -1,0 +1,6 @@
+# Normalise line endings: LF in the repository AND LF in the working tree.
+# Contributors on Windows commonly run core.autocrlf=true, which rewrites the
+# checkout to CRLF; Prettier (endOfLine: "lf") then flags every untouched file
+# as dirty and the lint-staged pre-commit hook (`prettier --write`) sweeps that
+# pure-format noise into unrelated commits. `eol=lf` here overrides autocrlf.
+* text=auto eol=lf

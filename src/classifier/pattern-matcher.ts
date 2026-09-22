@@ -1,29 +1,29 @@
-// Pattern matcher for block rules (Milestone M4-T1).
-// Supports plain substrings, `regex:`-prefixed patterns, and glob patterns,
-// with a robust ReDoS guard that rejects unsafe patterns and enforces a
-// wall-clock deadline on regex execution.
+// Safe matching primitives shared with the permission layer.
+//
+// HISTORY: this module used to back the rule-based classifier phase
+// (`rule-evaluator.ts` plus the ~54 block rules hardcoded in `block-rules.ts`).
+// That engine has been retired: pi-auto-mode's allow/deny policy is the
+// `permissions` cascade coming from the config JSON, not patterns hardcoded in
+// the repository. Keeping a second, disconnected policy source was misleading
+// — it looked like a safety net while nothing called it.
+//
+// Only the two primitives the live path actually uses remain below:
+//   - `safeRegexpTest`              → permission/rule.ts
+//   - `collapseWhitespaceForMatching` → permission/visibility.ts
 
 import { runInNewContext } from 'node:vm'
-import { splitShellSegments } from '../gate/normalize.ts'
-
-const REGEX_PREFIX = 'regex:'
-const GLOB_METACHARS = /[*?[{}]/
 
 /**
  * Wall-clock budget for a single RegExp execution under `safeRegexpTest`.
  *
  * The original M5 value was `5ms`. Under heavy CPU contention (e.g. Jest's
- * default 1-worker-per-CPU schedule, where `pattern-matcher.test.ts` and
- * `rule-evaluator.test.ts` run concurrently across workers and contend for
- * time slices), a single `vm.runInNewContext('new RegExp(...).test(...)')`
- * call routinely takes 10–20ms — measured on the development Windows host
- * with 32 logical CPUs and on Linux runners. The 5ms budget tripped
- * false-positives under load: `safeRegexpTest` returned `true` (fail-closed),
- * which made `PatternMatcher.match()` report a glob match that the regex
- * itself does not produce. The downstream effect was flaky tests
- * (`pattern-matcher.test.ts`, `rule-evaluator.test.ts`,
- * `permission/rule.test.ts`) plus spurious `ask`/`block` verdicts in the
- * LLM classifier under load.
+ * default 1-worker-per-CPU schedule, where several suites run concurrently and
+ * contend for time slices), a single `vm.runInNewContext('new RegExp(...).test(...)')`
+ * call routinely takes 10–20ms — measured on the development Windows host with
+ * 32 logical CPUs and on Linux runners. The 5ms budget tripped false-positives
+ * under load: `safeRegexpTest` returned `true` (fail-closed), which produced
+ * spurious `ask`/`block` verdicts and flaky tests
+ * (`permission/rule.test.ts` among them).
  *
  * Catastrophic patterns (the only legitimate reason for this timeout) are
  * already caught by `looksReDoSy` before `runInNewContext` runs — that
@@ -35,11 +35,6 @@ const GLOB_METACHARS = /[*?[{}]/
  * `test/permission/rule.test.ts`.
  */
 const REGEXP_TIMEOUT_MS = 50
-
-/** Case-insensitive substring match of a clean (prefix-free) pattern. */
-function submatch(needle: string, text: string): boolean {
-  return text.toLowerCase().includes(needle.toLowerCase())
-}
 
 // Structural ReDoS pattern detectors — covers all major catastrophic backtracking shapes.
 const UNSAFE_RE_PATTERNS: RegExp[] = [
@@ -71,7 +66,8 @@ function looksReDoSy(body: string): boolean {
  * Execute a RegExp test with a hard wall-clock deadline.
  * Uses `vm.runInNewContext` with a timeout so truly exponential
  * patterns are **aborted** rather than blocking the event loop.
- * Falls back to substring match on timeout or compile error.
+ * Returns false for structurally catastrophic patterns and true on
+ * timeout or compile error (fail-closed).
  */
 export function safeRegexpTest(
   body: string,
@@ -93,85 +89,19 @@ export function safeRegexpTest(
   }
 }
 
-function globToRegex(glob: string): string {
-  let out = ''
-  for (const c of glob) {
-    if (c === '*') out += '.*'
-    else if (c === '?') out += '.'
-    else if ('.+^$()|\\'.includes(c)) out += '\\' + c
-    else if (c === '[' || c === ']' || c === '{' || c === '}') out += '\\' + c
-    else out += c
-  }
-  return out
-}
-
 /**
  * Collapses every run of horizontal whitespace (spaces, tabs) and newlines
- * into a single space and trims the result. Used ONLY on the matching path of
- * `PatternMatcher.match` as a strictly additive second pass
- * (`matches(raw) || matches(collapsed(raw))`), so whitespace-mangled commands
- * like `rm  -rf /` or `git reset\t--hard` cannot slip past literal patterns.
- * The raw command is never mutated: display, audit and telemetry keep it
- * verbatim.
+ * into a single space and trims the result.
+ *
+ * Used ONLY on the matching path of DENY/ASK rules as a strictly additive
+ * second pass (`matches(raw) || matches(collapsed(raw))`), so whitespace-mangled
+ * commands like `rm  -rf /` or `git reset\t--hard` cannot slip past literal
+ * patterns written with single spaces. The raw command is never mutated:
+ * display, audit and telemetry keep it verbatim.
+ *
+ * It must NEVER widen an `allow` rule — see `ruleMatchesCall` in
+ * `permission/visibility.ts`.
  */
 export function collapseWhitespaceForMatching(text: string): string {
   return text.replace(/\s+/g, ' ').trim()
-}
-
-export class PatternMatcher {
-  /**
-   * Returns true if `text` matches `pattern` (case-insensitive). Safe, never throws.
-   *
-   * Additive by construction: a match requires the pattern to hit the raw
-   * text OR the whitespace-collapsed text, so results can only go from
-   * false to true, never the other way.
-   */
-  match(pattern: string, text: string): boolean {
-    if (this.matchVerbatim(pattern, text)) return true
-    const normalized = collapseWhitespaceForMatching(text)
-    if (normalized === text) return false
-    return this.matchVerbatim(pattern, normalized)
-  }
-
-  /** Original single-pass matching against one exact text. */
-  protected matchVerbatim(pattern: string, text: string): boolean {
-    if (pattern.startsWith(REGEX_PREFIX)) {
-      const body = pattern.slice(REGEX_PREFIX.length)
-      return safeRegexpTest(body, text) || submatch(body, text)
-    }
-
-    if (GLOB_METACHARS.test(pattern)) {
-      const body = '^' + globToRegex(pattern) + '$'
-      return safeRegexpTest(body, text) || submatch(pattern, text)
-    }
-
-    return submatch(pattern, text)
-  }
-
-  /**
-   * Splits a compound shell command into trimmed, non-empty segments using the
-   * SAME quote-aware logic as `segmentCommand` in `gate/normalize.ts`. This
-   * keeps the classifier and the permission gate in agreement on segment
-   * boundaries (H6) — including `&&`, `||`, `|`, quoted separators, backticks
-   * and `$(...)` command substitution.
-   */
-  splitSegments(command: string): string[] {
-    return splitShellSegments(command)
-  }
-}
-
-/**
- * Matcher for ALLOW paths (block-rule exceptions).
- *
- * Whitespace normalization makes DENY patterns robust, but applied to an
- * allow exception it does the opposite: a command the user never excepted
- * verbatim (`git  reset  --hard`) would be silently allowed by an exception
- * written for `git reset --hard`, turning a human prompt into a silent pass.
- * Allow rules must be earned with the exact text they were written with, so
- * this matcher stays raw-only. Deny/block paths keep `PatternMatcher`.
- */
-export class StrictPatternMatcher extends PatternMatcher {
-  override match(pattern: string, text: string): boolean {
-    return this.matchVerbatim(pattern, text)
-  }
 }

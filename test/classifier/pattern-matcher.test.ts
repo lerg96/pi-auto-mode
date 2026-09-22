@@ -1,211 +1,108 @@
 import {
-  PatternMatcher,
-  StrictPatternMatcher,
+  safeRegexpTest,
   collapseWhitespaceForMatching,
 } from '../../src/classifier/pattern-matcher.ts'
-import { segmentCommand } from '../../src/gate/normalize.ts'
 
-describe('PatternMatcher', () => {
-  describe('plain substring matches', () => {
-    it('matches a plain substring case-insensitively', () => {
-      const pm = new PatternMatcher()
-      expect(pm.match('rm -rf', 'sudo rm -rf /tmp')).toBe(true)
-    })
+// The rule-based engine (PatternMatcher / rule-evaluator / block-rules) has
+// been retired — see the history note in src/classifier/pattern-matcher.ts.
+// These suites cover the two primitives the live permission path keeps using.
 
-    it('does not match when substring is absent', () => {
-      const pm = new PatternMatcher()
-      expect(pm.match('docker', 'rm -rf /tmp')).toBe(false)
-    })
+describe('collapseWhitespaceForMatching', () => {
+  it('collapses runs of spaces/tabs/newlines to one space and trims', () => {
+    expect(collapseWhitespaceForMatching('  rm \t-rf\n/tmp  ')).toBe(
+      'rm -rf /tmp'
+    )
+    expect(collapseWhitespaceForMatching('single  spaces')).toBe(
+      'single spaces'
+    )
+    expect(collapseWhitespaceForMatching('as-is')).toBe('as-is')
+    expect(collapseWhitespaceForMatching('   ')).toBe('')
   })
 
-  describe('glob matches', () => {
-    it('matches a glob pattern with wildcard', () => {
-      const pm = new PatternMatcher()
-      // cat *id_rsa — glob with * expands to .*
-      expect(pm.match('cat *id_rsa', 'cat /home/user/.ssh/id_rsa')).toBe(true)
-    })
-
-    it('does not match glob when pattern does not align', () => {
-      const pm = new PatternMatcher()
-      expect(pm.match('cat *id_rsa', 'cat report.txt')).toBe(false)
-    })
+  it('is idempotent', () => {
+    const once = collapseWhitespaceForMatching('rm   -rf\t/')
+    expect(collapseWhitespaceForMatching(once)).toBe(once)
   })
 
-  describe('regex: prefixed matches', () => {
-    it('matches a valid regex: pattern', () => {
-      const pm = new PatternMatcher()
-      expect(pm.match('regex:rm\\s+-rf', 'sudo rm -rf /tmp')).toBe(true)
-    })
-
-    it('falls back to substring when regex: body does not match but appears as text', () => {
-      const pm = new PatternMatcher()
-      // The regex \bfoo\b won't match "foo bar" as a whole-word match unless word boundary works — but safeRegexpTest runs it.
-      expect(pm.match('regex:foo', 'foo bar')).toBe(true)
-    })
+  it('never invents text: distinct literals stay distinct after collapsing', () => {
+    // Collapsing must not turn a non-match into a match for different literals.
+    expect(collapseWhitespaceForMatching('rm  - r f')).toBe('rm - r f')
+    expect(collapseWhitespaceForMatching('rm -rf /tmp')).not.toBe('rm -r /tmp')
+    expect(collapseWhitespaceForMatching('echo   world')).toBe('echo world')
   })
+})
 
-  describe('splitSegments', () => {
-    it('splits on semicolons', () => {
-      const pm = new PatternMatcher()
-      expect(pm.splitSegments('cmd1; cmd2')).toEqual(['cmd1', 'cmd2'])
+describe('safeRegexpTest', () => {
+  describe('correctness on legitimate patterns', () => {
+    it('matches and does not match as a plain RegExp would', () => {
+      expect(safeRegexpTest('rm -rf', 'sudo rm -rf /tmp')).toBe(true)
+      expect(safeRegexpTest('docker', 'rm -rf /tmp')).toBe(false)
+      expect(safeRegexpTest('^cat .*\\.env$', 'cat .env')).toBe(true)
     })
 
-    it('splits on pipes', () => {
-      const pm = new PatternMatcher()
-      expect(pm.splitSegments('ls | grep foo')).toEqual(['ls', 'grep foo'])
+    it('is case-insensitive', () => {
+      expect(safeRegexpTest('RM -RF', 'rm -rf /')).toBe(true)
     })
 
-    it('filters empty segments', () => {
-      const pm = new PatternMatcher()
-      expect(pm.splitSegments('cmd1;; cmd2')).toEqual(['cmd1', 'cmd2'])
-    })
-  })
-
-  // ── Additive whitespace normalization (fixed evasion class) ──
-  describe('collapseWhitespaceForMatching + additive match', () => {
-    it('collapses runs of spaces/tabs/newlines to one space and trims', () => {
-      expect(collapseWhitespaceForMatching('  rm \t-rf\n/tmp  ')).toBe(
-        'rm -rf /tmp'
-      )
-      expect(collapseWhitespaceForMatching('single  spaces')).toBe(
-        'single spaces'
-      )
-      expect(collapseWhitespaceForMatching('as-is')).toBe('as-is')
-      expect(collapseWhitespaceForMatching('   ')).toBe('')
-    })
-
-    it('still matches the raw text exactly as before', () => {
-      const pm = new PatternMatcher()
-      expect(pm.match('rm -rf', 'sudo rm -rf /tmp')).toBe(true)
-      expect(pm.match('docker', 'rm -rf /tmp')).toBe(false)
-    })
-
-    it('matches substring literals only via the collapsed form', () => {
-      const pm = new PatternMatcher()
-      expect(pm.match('rm -rf', 'rm \t-rf /')).toBe(true)
-      expect(pm.match('git reset --hard', 'git  reset \t --hard')).toBe(true)
-    })
-
-    it('matches glob patterns via the collapsed form', () => {
-      const pm = new PatternMatcher()
-      // Raw glob 'cat .*id_rsa' needs a literal space; tab evades raw only.
-      expect(pm.match('cat *id_rsa', 'cat\tid_rsa')).toBe(true)
-    })
-
-    it('matches regex: patterns via the collapsed form', () => {
-      const pm = new PatternMatcher()
-      expect(pm.match('regex:rm -rf', 'rm  -rf')).toBe(true)
-    })
-
-    it('collapses newlines too at matcher level (opaque text)', () => {
-      const pm = new PatternMatcher()
-      expect(pm.match('rm -rf', 'rm\n-rf')).toBe(true)
-    })
-
-    it('additivity: absent literals stay false even after collapsing', () => {
-      const pm = new PatternMatcher()
-      expect(pm.match('rm -rf', 'rm -r /tmp')).toBe(false)
-      expect(pm.match('rm -rf', 'rm  - r f')).toBe(false)
-      expect(pm.match('echo hello world', 'echo   world')).toBe(false)
-    })
-  })
-
-  // ── H6: splitSegments must agree with the gate's quote-aware segmentCommand ──
-  describe('splitSegments parity with segmentCommand (H6)', () => {
-    const cases = ['a && b', 'a | b', 'sh -c "x; y"', 'echo "a;b"', 'a || b']
-    for (const cmd of cases) {
-      it(
-        'produces the same segments as segmentCommand for ' +
-          JSON.stringify(cmd),
-        () => {
-          const pm = new PatternMatcher()
-          expect(pm.splitSegments(cmd)).toEqual(
-            segmentCommand(cmd).map((s) => s.value)
-          )
-        }
-      )
-    }
-
-    it('is quote-aware: a semicolon inside a quoted literal is not a separator', () => {
-      const pm = new PatternMatcher()
-      expect(pm.splitSegments('echo "a;b" | cat')).toEqual(
-        segmentCommand('echo "a;b" | cat').map((s) => s.value)
-      )
+    it('handles glob-converted patterns (anchored .* bodies)', () => {
+      expect(safeRegexpTest('^cat.*id_rsa$', 'cat ~/.ssh/id_rsa')).toBe(true)
+      expect(safeRegexpTest('^cat.*id_rsa$', 'cat /etc/passwd')).toBe(false)
     })
   })
 
   // ── C3 regression: ReDoS safety ──────────────────────────────
   describe('ReDoS safety (C3)', () => {
-    it('does not hang on nested-quantifier pattern (a+)+$', () => {
-      const pm = new PatternMatcher()
-      const input = 'a'.repeat(50) + '!'
-      const start = performance.now()
-      const result = pm.match('regex:(a+)+$', input)
-      const elapsed = performance.now() - start
-      expect(elapsed).toBeLessThan(100)
-      // Should return false (safe fallback) or at least not hang
-      expect(result).toBeFalsy()
-    })
+    // Structurally catastrophic shapes: rejected by `looksReDoSy` before the
+    // RegExp ever runs, so the verdict is a clean false.
+    const catastrophic = [
+      '(a+)+$',
+      '([a-z]+)*$',
+      '(a|a?)+',
+      '(a*)*$',
+      '(a+){2,}$',
+      '((a)+)+',
+      'a**',
+    ]
+    // Not catastrophic — simply uncompilable: they throw at compile time, and
+    // that path fails closed (true), the opposite verdict from the above.
+    const MALFORMED = ['(unclosed', 'a[a-z]+)+', '(?<)', 'a{2,1}', '*leading']
 
-    it('does not hang on ([a-z]+)*$ pattern', () => {
-      const pm = new PatternMatcher()
-      const input = 'a'.repeat(50) + '!'
-      const start = performance.now()
-      const result = pm.match('regex:([a-z]+)*$', input)
-      const elapsed = performance.now() - start
-      expect(elapsed).toBeLessThan(100)
-      expect(result).toBeFalsy()
-    })
+    it.each(catastrophic)(
+      'does not hang on catastrophic pattern %s',
+      (body) => {
+        const input = 'a'.repeat(60) + '!'
+        const start = performance.now()
+        const result = safeRegexpTest(body, input)
+        const elapsed = performance.now() - start
+        expect(elapsed).toBeLessThan(100)
+        // Structurally unsafe patterns are rejected outright, not executed.
+        expect(result).toBeFalsy()
+      }
+    )
 
-    it('does not hang on (a|a?)+ pattern', () => {
-      const pm = new PatternMatcher()
-      const input = 'a'.repeat(50) + '!'
-      const start = performance.now()
-      pm.match('regex:(a|a?)+', input)
-      const elapsed = performance.now() - start
-      expect(elapsed).toBeLessThan(100)
-    })
-
-    it('match() NEVER throws, even for pathological input', () => {
-      const pm = new PatternMatcher()
-      const patterns = [
-        'regex:(a+)+$',
-        'regex:([a-z]+)*$',
-        'regex:(a|a?)+',
-        'regex:(a*)*$',
-        'regex:(a+){2,}$',
-        'regex:.*.*.*.*.*',
-        'regex:((a)+)+',
-      ]
-      const input = 'a'.repeat(100) + '!'
-      for (const pattern of patterns) {
-        expect(() => pm.match(pattern, input)).not.toThrow()
+    it('never throws, even for pathological input', () => {
+      const input = 'a'.repeat(120) + '!'
+      for (const body of catastrophic.concat(MALFORMED, ['.*.*.*.*.*'])) {
+        expect(() => safeRegexpTest(body, input)).not.toThrow()
       }
     })
-  })
-})
 
-describe('StrictPatternMatcher (allow paths stay whitespace-strict)', () => {
-  it('does NOT match a whitespace-mangled command', () => {
-    const strict = new StrictPatternMatcher()
-    expect(strict.match('rm -rf', 'rm  -rf /')).toBe(false)
-    expect(strict.match('rm -rf', 'rm\t-rf /')).toBe(false)
-    expect(strict.match('git reset --hard', 'git  reset  --hard')).toBe(false)
-  })
-
-  it('still matches the exact text it was written with', () => {
-    const strict = new StrictPatternMatcher()
-    expect(strict.match('rm -rf', 'rm -rf /')).toBe(true)
-    expect(strict.match('git reset --hard', 'sudo git reset --hard now')).toBe(
-      true
+    it.each(MALFORMED)(
+      'fails closed on a pattern that cannot compile: %s',
+      (body) => {
+        // A broken pattern must not become a silent miss.
+        expect(safeRegexpTest(body, 'anything')).toBe(true)
+      }
     )
-  })
 
-  it('is exactly the pre-normalization PatternMatcher (deny side differs)', () => {
-    const loose = new PatternMatcher()
-    const strict = new StrictPatternMatcher()
-    // The loose matcher is additive, so it matches strictly more than strict.
-    expect(loose.match('rm -rf', 'rm  -rf /')).toBe(true)
-    expect(strict.match('rm -rf', 'rm  -rf /')).toBe(false)
+    it('aborts a runaway match within the wall-clock budget', () => {
+      // Nested quantifiers written to dodge the structural check's shape by
+      // keeping depth low: the timeout is the backstop being exercised here.
+      const body = '(a+)+b'
+      const input = 'a'.repeat(50)
+      const start = performance.now()
+      safeRegexpTest(body, input, 5)
+      expect(performance.now() - start).toBeLessThan(200)
+    })
   })
 })

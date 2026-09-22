@@ -69,15 +69,15 @@ A tool call goes through **four layers** in order before executing. The first th
 
    - Evaluates `PatternRule[]` (from the global and the active sets in cascade) against the normalized tool call using exact `toolName` keys.
    - Actions: `allow` | `ask` | `deny`.
-   - Includes trust boundary (`/etc`, `~/.ssh`, `~/.env`, `sudo`, `rm -rf`, `git push --force`), allow-exceptions (cover the whole compound command), block rules (first match wins; critical severity → block), wrapper unwrapping (`sh -c`, `eval`, `sudo`, …) and interpolation detection → `ask` (fail-closed).
-   - Implementation: `src/permission/visibility.ts`, `src/permission/wildcard-matcher.ts`, `src/permission/compose.ts`, `src/permission/evaluate.ts`, `src/permission/rule.ts`.
+   - **No rule is hardcoded in the repository**: every pattern comes from your config. `deny`/`ask` rules additionally match the whitespace-collapsed command (so `rm  -rf /` cannot evade `rm -rf *`); `allow` rules match only the exact text you wrote, so normalization can never widen a grant.
+   - Implementation: `src/permission/visibility.ts`, `src/permission/wildcard-matcher.ts`, `src/permission/compose.ts`, `src/permission/evaluate.ts`, `src/permission/rule.ts`, `src/classifier/pattern-matcher.ts` (shared safe-regex + whitespace primitives).
 
 3. **Layer 3 — LLM classifier** (optional, only when cascade = `ask`; only hardens `ask`: an explicit cascade `allow` is final and never consults the LLM).
 
-   - When Layer 2 returns `ask`, the LLM classifier runs with two prior sub-steps: secret guard and rule-based block rules.
+   - When Layer 2 returns `ask`, the LLM classifier runs with one prior sub-step: the secret guard (redaction). The classifier has no policy of its own.
    - **File extraction**: if the tool carries a `command` field (shell), the classifier tries to read the first path-like referenced file (≤8KB), applying the trust boundary and a suspicious-content redactor (`eval(`, `child_process`, `exec(`, `Buffer.from`, `os.system`, …). Content never reaches the LLM if it falls inside the boundary or looks suspicious. **Never throws**: any error becomes `{ kind: 'unsupported' }`.
    - Fallback in `classifier.fallback.onTimeout` / `classifier.fallback.onError` (see [Classifier fallback](#classifier-fallback)).
-   - Implementation: `src/classifier/llm-layer.ts`, `src/classifier/file-extraction.ts`, `src/classifier/pattern-matcher.ts`, `src/classifier/rule-evaluator.ts`, `src/classifier/secret-guard.ts`, `src/classifier/llm-client.ts`.
+   - Implementation: `src/classifier/llm-layer.ts`, `src/classifier/file-extraction.ts`, `src/classifier/secret-guard.ts`, `src/classifier/llm-client.ts`.
 
 4. **Layer 4 — Deny strategy**.
 
@@ -121,7 +121,7 @@ The main blocks of `config.example.json`:
 - **`permissionSets`** — named sets that extend/override the global one. Each set accepts the same three blocks (`tools`, `skills`, `mcps`) with the same structure. **No `priority`**: evaluation order is defined by `activePermissionSets`.
 - **`activePermissionSets`** — array of strings (set names). **Order matters**: they evaluate in sequence after the global one; last match wins (cascade).
 - **`mode`** (top-level, Layer 1) — global visibility mode: `default` (honors the maps as-is), `strict` (collapses `ask` → `deny`), `yolo` (collapses `ask` → `allow`, keeps explicit `deny`s). Switchable live via `/auto-mode:mode`.
-- **`classifier`** — optional LLM layer (`llm`: provider/model/apiKey). **`provider` is a free-form string** (any Pi modelRegistry ID). `ruleBased` block **removed** (trust boundary, allow-exceptions, block rules live in Layer 2). The `fallback` block defines behavior on `onTimeout` / `onError`: `ask-user` (default, fail-closed), `deny` (fail-closed, silent block) or `allow` (opt-in fail-open, rejected by `isSecurityWeakening()` on reload). `onBlock` and `onBlockUserOverride` control what happens after a classifier block.
+- **`classifier`** — optional LLM layer (`llm`: provider/model/apiKey). **`provider` is a free-form string** (any Pi modelRegistry ID). `ruleBased` block **removed**: the classifier ships no policy of its own, every allow/deny comes from `permissions`. The `fallback` block defines behavior on `onTimeout` / `onError`: `ask-user` (default, fail-closed), `deny` (fail-closed, silent block) or `allow` (opt-in fail-open, rejected by `isSecurityWeakening()` on reload). `onBlock` and `onBlockUserOverride` control what happens after a classifier block.
 - **`denyStrategy`** — post-block strategy (Layer 4): `auto-retry` (canonical, formerly `deny-and-continue`), `ask-user` (immediate modal) or `both` (auto-retry with escalation). See [Deny strategy](#deny-strategy).
 - **`ui`** — confirmation UI behavior (`promptMaxRows`, `promptFieldMaxWidth`, `showClassifierRisk`, `modalTimeoutMs`, `subagentModalTimeoutMs`, `noUiAsks`). **`doublePressToConfirm` removed** (deprecated).
 - **`telemetry`** — event logging (enableable with optional path; see [Telemetry with default path](#telemetry-with-default-path)).
@@ -253,7 +253,7 @@ The extension works passively: once loaded in the runtime, it intercepts every `
 
 1. **Normalize** the tool call (name + input).
 2. **Filter visibility** on `before_agent_start` (Layer 1): combine global `permissions.tools/skills/mcps` + active sets in cascade (`activePermissionSets` order), apply the global `mode`, call `setActiveTools(...)` and rewrite the system prompt (`Available tools:` and `<available_skills>` sections).
-3. **Evaluate rules** (Layer 2): classify the tool call against `PatternRule[]` from the global and active sets (cascade), with trust boundary, allow-exceptions, block rules and wrapper unwrapping. Result: `allow` | `ask` | `deny`.
+3. **Evaluate rules** (Layer 2): match the tool call against the `PatternRule[]` from the global and active sets (cascade) using the wildcard matcher, first match wins; `deny`/`ask` also test the whitespace-collapsed command. Result: `allow` | `ask` | `deny`.
 4. **Consult the LLM classifier** (Layer 3, optional): **only if Layer 2 = `ask`**. If the tool carries a `command` field, the referenced file is extracted (≤8KB, trust-check, secret redactor) and injected into the LLM prompt. `onTimeout` / `onError` apply the configured `fallback`.
 5. **Apply the deny strategy** (Layer 4) after a `deny`: `auto-retry` (deny + reason to the LLM), `ask-user` (immediate modal) or `both` (auto-retry with escalation).
 6. **Decide** `allow` / `deny` / `ask` and act (block with reason, prompt for confirmation via modal, or log to telemetry).
@@ -636,9 +636,9 @@ src/            Extension code (entry: src/index.ts)
                 visibility, active-tools, skill-filter, modes,
                 wildcard-matcher, compose, evaluate, rule,
                 session-rules, external-directory (+ git-worktrees)
-  classifier/   Layer 3: rule-based (block-rules, pattern-matcher,
-                rule-evaluator, secret-guard) + LLM (llm-layer,
-                llm-client, file-extraction)
+  classifier/   Layer 3: LLM (llm-layer, llm-client), secret-guard,
+                file-extraction; pattern-matcher holds the shared
+                safe-regex + whitespace primitives used by Layer 2
   handlers/     SDK hooks: before-agent-start,
                 system-prompt-sanitizer, skill-prompt-sanitizer
   config/       Config loading + zod validation (fail-closed)

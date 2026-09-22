@@ -57,8 +57,7 @@ function isPatternRuleArray(perm: ToolPermission): perm is PatternRule[] {
  * slip past a rule the user wrote with literal single spaces, so `deny`/`ask`
  * rules also match the whitespace-collapsed value. `allow` rules stay strict:
  * normalizing them would silently grant a call whose text the user never
- * wrote, turning a prompt into a pass. Same asymmetry as `StrictPatternMatcher`
- * in the classifier — normalization may only ever harden.
+ * wrote, turning a prompt into a pass. Normalization may only ever harden.
  */
 function ruleMatchesCall(rule: PatternRule, value: string): boolean {
   if (wildcardMatch(rule.pattern, value)) return true

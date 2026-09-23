@@ -242,9 +242,8 @@ const uiConfig = z
 // (stat inicial + bytes acumulados por batch) pasa de maxBytes.
 // 5 MiB: con ~94 KB/día medidos en máquina real, ~2 meses de historia por
 // archivo antes de rotar (5 MiB / 94 KB ≈ 55 días).
-// Para desactivar la rotación en la práctica, poner un valor enorme
-// (p. ej. 1073741824 = 1 GiB): la rotación solo es size-based, así que un
-// maxBytes que el archivo no alcance nunca equivale a rotación apagada.
+// Para desactivar la rotación existe el flag explícito `rotationEnabled`
+// (false = el archivo crece sin límite); no uses centinelas numéricos.
 export const DEFAULT_ROTATION_MAX_BYTES = 5 * 1024 * 1024
 // Número de BACKUPS rotados que se conservan (path.1 ... path.N) cuando el
 // archivo activo supera maxBytes. Techo total de disco: maxBytes*(maxFiles+1)
@@ -254,6 +253,12 @@ export const DEFAULT_ROTATION_MAX_FILES = 3
 // Fuente única de verdad de los campos de rotación: telemetry y debug los
 // componen del mismo objeto, así sus schemas no pueden divergir.
 const rotationFields = {
+  // Interruptor explícito de la rotación. Default true = comportamiento de
+  // siempre. Con false el log crece sin límite (coste medido: ~94 KB/día) y
+  // `maxBytes`/`maxFiles` quedan sin efecto. SE LLAMA rotationEnabled, no
+  // `enabled`, porque este objeto se propaga en bloques que ya tienen su
+  // propio `enabled` (telemetry.enabled / debug.enabled) y chocaría.
+  rotationEnabled: z.boolean().default(true),
   maxBytes: z.number().int().positive().default(DEFAULT_ROTATION_MAX_BYTES),
   maxFiles: z.number().int().positive().default(DEFAULT_ROTATION_MAX_FILES),
 }
@@ -272,6 +277,7 @@ const telemetryConfig = z
   .default({
     enabled: false,
     path: DEFAULT_TELEMETRY_PATH,
+    rotationEnabled: true,
     maxBytes: DEFAULT_ROTATION_MAX_BYTES,
     maxFiles: DEFAULT_ROTATION_MAX_FILES,
   })
@@ -293,6 +299,7 @@ const debugConfig = z
   .default({
     enabled: false,
     path: DEFAULT_DEBUG_PATH,
+    rotationEnabled: true,
     maxBytes: DEFAULT_ROTATION_MAX_BYTES,
     maxFiles: DEFAULT_ROTATION_MAX_FILES,
   })
@@ -477,6 +484,7 @@ export interface SoundConfig {
 export interface TelemetryConfig {
   enabled: boolean
   path: string
+  rotationEnabled: boolean
   maxBytes: number
   maxFiles: number
 }
@@ -485,6 +493,7 @@ export interface TelemetryConfig {
 export interface DebugConfig {
   enabled: boolean
   path: string
+  rotationEnabled: boolean
   maxBytes: number
   maxFiles: number
 }

@@ -112,11 +112,15 @@ interface PendingLine {
 
 /** Size-based rotation options (mirrors the shared `rotationFields` zod shape). */
 export interface TelemetryRotation {
+  // false = sin rotación: el archivo crece sin límite y maxBytes/maxFiles
+  // quedan sin efecto. Undefined = true (comportamiento de siempre).
+  rotationEnabled?: boolean
   maxBytes: number
   maxFiles: number
 }
 
 export const DEFAULT_ROTATION: TelemetryRotation = {
+  rotationEnabled: true,
   maxBytes: DEFAULT_ROTATION_MAX_BYTES,
   maxFiles: DEFAULT_ROTATION_MAX_FILES,
 }
@@ -414,6 +418,9 @@ export class TelemetryLogger {
    * persistent handle.
    */
   private async rotateIfNeeded(target: string): Promise<void> {
+    // Interruptor explícito: con rotationEnabled === false se sale ANTES del
+    // stat que siembra la estimación (ni stat, ni rename, ni rm, ni cooldown).
+    if (this.rotation.rotationEnabled === false) return
     if (Date.now() < this.rotationRetryAt) return
     let size = this.sizes.get(target)
     if (size === undefined) {

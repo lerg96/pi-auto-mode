@@ -889,6 +889,67 @@ describe('TelemetryLogger', () => {
       expect(existsSync(`${p}.1`)).toBe(false)
       cleanupLog(p)
     }, 30000)
+
+    // rotationEnabled: false — el log crece sin límite (corpus de
+    // entrenamiento). Prohibido stat, rename, rm y bookkeeping de cooldown.
+    it('rotationEnabled: false on an oversized file: no stat, no rename, no rm, batch still appended to the same file', async () => {
+      const p = tempPath()
+      // Archivo preexistente MUY por encima de maxBytes, más un backup .3
+      // que la rotación destruiría (rm force) si llegara a correr.
+      writeFileSync(p, 'x'.repeat(5000))
+      writeFileSync(`${p}.3`, 'OLD-BACKUP')
+      const statSpy = jest.spyOn(promises, 'stat')
+      const renameSpy = jest.spyOn(promises, 'rename')
+      const rmSpy = jest.spyOn(promises, 'rm')
+      const logger = new TelemetryLogger(true, p, {
+        rotationEnabled: false,
+        maxBytes: 100,
+        maxFiles: 3,
+      })
+      logger.record('g:0', { seq: 0 })
+      await logger.flush()
+      logger.record('g:1', { seq: 1 })
+      await logger.flush()
+      // Ninguna primitiva de rotación fue invocada (el flag corta ANTES del
+      // stat que siembra la estimación de tamaño).
+      expect(statSpy).not.toHaveBeenCalled()
+      expect(renameSpy).not.toHaveBeenCalled()
+      expect(rmSpy).not.toHaveBeenCalled()
+      // No se creó .1 y el backup preexistente intacto: nada borrado.
+      expect(existsSync(`${p}.1`)).toBe(false)
+      expect(readFileSync(`${p}.3`, 'utf8')).toBe('OLD-BACKUP')
+      // El contenido antiguo sigue ahí y los eventos nuevos se añadieron.
+      const content = readFileSync(p, 'utf8')
+      expect(content.startsWith('x'.repeat(5000))).toBe(true)
+      const seqs = content
+        .slice(5000)
+        .split('\n')
+        .filter((l) => l.length > 0)
+        .map((l) => (JSON.parse(l) as { payload: { seq: number } }).payload.seq)
+      expect(seqs).toEqual([0, 1])
+      statSpy.mockRestore()
+      renameSpy.mockRestore()
+      rmSpy.mockRestore()
+      cleanupLog(p)
+    }, 30000)
+
+    // Control en la dirección opuesta: el mismo escenario con el flag a true
+    // SÍ rota (si no, el test de arriba no tendría dientes).
+    it('rotationEnabled: true on the same oversized file still rotates (control)', async () => {
+      const p = tempPath()
+      writeFileSync(p, 'x'.repeat(5000))
+      const logger = new TelemetryLogger(true, p, {
+        rotationEnabled: true,
+        maxBytes: 100,
+        maxFiles: 3,
+      })
+      logger.record('g:0', { seq: 0 })
+      await logger.flush()
+      expect(existsSync(`${p}.1`)).toBe(true)
+      // El backup .1 conserva el contenido previo al rotate.
+      expect(readFileSync(`${p}.1`, 'utf8')).toBe('x'.repeat(5000))
+      cleanupLog(p)
+    }, 30000)
   })
 })
 

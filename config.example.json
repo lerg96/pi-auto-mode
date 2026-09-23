@@ -85,12 +85,14 @@
   "telemetry": {
     "enabled": false,
     "path": "",
+    "rotationEnabled": true,
     "maxBytes": 5242880,
     "maxFiles": 3
   },
   "debug": {
     "enabled": false,
     "path": "",
+    "rotationEnabled": true,
     "maxBytes": 5242880,
     "maxFiles": 3
   }

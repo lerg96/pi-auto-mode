@@ -58,6 +58,36 @@ describe('log rotation config (telemetry + debug)', () => {
     expect(cfg.debug.maxFiles).toBe(5)
   })
 
+  it('defaults rotationEnabled to true for BOTH blocks (rotation on by default)', () => {
+    const cfg = parseConfig({})
+    expect(cfg.telemetry.rotationEnabled).toBe(true)
+    expect(cfg.debug.rotationEnabled).toBe(true)
+  })
+
+  it('parses explicit rotationEnabled: false on both blocks and survives', () => {
+    const cfg = parseConfig({
+      telemetry: { rotationEnabled: false },
+      debug: { rotationEnabled: false },
+    })
+    expect(cfg.telemetry.rotationEnabled).toBe(false)
+    expect(cfg.debug.rotationEnabled).toBe(false)
+    // El flag es INDEPENDIENTE de `enabled` (el del bloque): apagar la
+    // rotación no apaga el log, y viceversa.
+    expect(cfg.telemetry.enabled).toBe(false)
+    const cfg2 = parseConfig({
+      telemetry: { enabled: true, rotationEnabled: false },
+    })
+    expect(cfg2.telemetry.enabled).toBe(true)
+    expect(cfg2.telemetry.rotationEnabled).toBe(false)
+  })
+
+  it('keeps rotationEnabled out of the root: unknown root-level keys are rejected (.strict() intact)', () => {
+    // `rotationEnabled` vive SOLO dentro de telemetry/debug; un flag raíz no
+    // existe y .strict() debe seguir rechazándolo (pin: no relajar strictness).
+    expect(() => parseConfig({ rotationEnabled: false })).toThrow()
+    expect(() => parseConfig({ totallyUnknownKey: 1 })).toThrow()
+  })
+
   // Shared shape: both schemas compose the SAME rotationFields object, so
   // invalid values must be rejected identically by both blocks.
   for (const bad of [0, -1, 1.5, '1024']) {
@@ -77,6 +107,8 @@ describe('log rotation config (telemetry + debug)', () => {
     expect(raw.telemetry.maxFiles).toBe(DEFAULT_ROTATION_MAX_FILES)
     expect(raw.debug.maxBytes).toBe(DEFAULT_ROTATION_MAX_BYTES)
     expect(raw.debug.maxFiles).toBe(DEFAULT_ROTATION_MAX_FILES)
+    expect(raw.telemetry.rotationEnabled).toBe(true)
+    expect(raw.debug.rotationEnabled).toBe(true)
   })
 
   it('DEFAULT_CONFIG exposes the rotation fields', () => {

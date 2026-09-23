@@ -275,11 +275,16 @@ describe('config reload (S3 fail-closed)', () => {
     expect(telemetryUpdate).not.toHaveBeenCalled()
   })
 
-  it('applies a non-weakening reload', () => {
+  it('applies a non-weakening reload (rotation flags forwarded to telemetry AND debug)', () => {
     configState.set({ ...DEFAULT_CONFIG })
     const denyService = new DenyAndContinueService(DEFAULT_CONFIG.denyStrategy)
     const telemetryUpdate = jest.fn()
     const telemetry = { update: telemetryUpdate } as Pick<
+      import('../src/telemetry/telemetry.ts').TelemetryLogger,
+      'update'
+    >
+    const debugUpdate = jest.fn()
+    const debug = { update: debugUpdate } as Pick<
       import('../src/telemetry/telemetry.ts').TelemetryLogger,
       'update'
     >
@@ -290,6 +295,13 @@ describe('config reload (S3 fail-closed)', () => {
         ...DEFAULT_CONFIG.telemetry,
         enabled: true,
         path: 'out.log',
+        rotationEnabled: false,
+      },
+      debug: {
+        ...DEFAULT_CONFIG.debug,
+        enabled: true,
+        path: 'dbg.log',
+        rotationEnabled: false,
       },
     }
 
@@ -297,13 +309,20 @@ describe('config reload (S3 fail-closed)', () => {
       configState,
       denyService,
       telemetry,
+      debug,
       pi,
     })
     expect(result).toBe(true)
     expect(configState.get().telemetry.enabled).toBe(true)
     expect(telemetryUpdate).toHaveBeenCalledWith(true, 'out.log', {
+      rotationEnabled: false,
       maxBytes: DEFAULT_CONFIG.telemetry.maxBytes,
       maxFiles: DEFAULT_CONFIG.telemetry.maxFiles,
+    })
+    expect(debugUpdate).toHaveBeenCalledWith(true, 'dbg.log', {
+      rotationEnabled: false,
+      maxBytes: DEFAULT_CONFIG.debug.maxBytes,
+      maxFiles: DEFAULT_CONFIG.debug.maxFiles,
     })
   })
 })

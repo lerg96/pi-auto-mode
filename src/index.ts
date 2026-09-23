@@ -192,10 +192,12 @@ export function applyConfigReload(next: Config, deps: ReloadDeps): boolean {
   deps.configState.set(next)
   deps.denyService.updateConfig(next.denyStrategy)
   deps.telemetry.update(next.telemetry.enabled, next.telemetry.path, {
+    rotationEnabled: next.telemetry.rotationEnabled,
     maxBytes: next.telemetry.maxBytes,
     maxFiles: next.telemetry.maxFiles,
   })
   deps.debug?.update(next.debug.enabled, next.debug.path, {
+    rotationEnabled: next.debug.rotationEnabled,
     maxBytes: next.debug.maxBytes,
     maxFiles: next.debug.maxFiles,
   })
@@ -303,6 +305,7 @@ export default function piAutoMode(pi: ExtensionAPI): void {
     initialConfig.telemetry.enabled,
     initialConfig.telemetry.path,
     {
+      rotationEnabled: initialConfig.telemetry.rotationEnabled,
       maxBytes: initialConfig.telemetry.maxBytes,
       maxFiles: initialConfig.telemetry.maxFiles,
     }
@@ -314,6 +317,7 @@ export default function piAutoMode(pi: ExtensionAPI): void {
     initialConfig.debug.enabled,
     initialConfig.debug.path,
     {
+      rotationEnabled: initialConfig.debug.rotationEnabled,
       maxBytes: initialConfig.debug.maxBytes,
       maxFiles: initialConfig.debug.maxFiles,
     }

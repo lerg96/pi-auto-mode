@@ -9,6 +9,7 @@ export interface Rule {
   reason?: string
   origin?: string
   priority?: number
+  isExact?: boolean
 }
 
 export type Ruleset = Rule[]

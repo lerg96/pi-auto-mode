@@ -1,6 +1,9 @@
 import type { ClassifierResult } from '../classifier/llm-layer.ts'
 import type { PermissionState } from '../permission/rule.ts'
-import { wildcardMatch } from '../permission/wildcard-matcher.ts'
+import {
+  wildcardMatch,
+  sessionPatternMatches,
+} from '../permission/wildcard-matcher.ts'
 import { externalDirSurfaceFor } from '../permission/external-directory.ts'
 import { addExternalDirAllow } from '../state/external-dir-allowlist.ts'
 import { getAskResolver, normalizeAskDecision } from './ask.ts'
@@ -78,7 +81,7 @@ type AllowDecision =
 
 // Session allow short-circuit (Bug A fix)
 // Check if there's a session allow rule matching this surface and value
-function trySessionAllow(
+export function trySessionAllow(
   deps: GateDeps,
   surface: string,
   value: string,
@@ -87,15 +90,20 @@ function trySessionAllow(
   startedAt: number | undefined,
   requestId: string
 ): boolean {
-  const sessionApproved = deps.sessionRules
-    .snapshot()
-    .find(
-      (r) =>
-        r.origin === 'session' &&
-        r.action === 'allow' &&
-        r.surface === surface &&
-        wildcardMatch(r.pattern, value)
-    )
+  const sessionApproved = deps.sessionRules.snapshot().find((r) => {
+    if (
+      r.origin !== 'session' ||
+      r.action !== 'allow' ||
+      r.surface !== surface
+    ) {
+      return false
+    }
+    return r.isExact
+      ? process.platform === 'win32'
+        ? r.pattern.toLowerCase() === value.toLowerCase()
+        : r.pattern === value
+      : sessionPatternMatches(r.pattern, value)
+  })
   if (!sessionApproved) return false
   emit(deps.hooks, surface, value, 'allow', 'session_allow', {
     requestId,
@@ -121,16 +129,17 @@ function applyAllowDecision(
   surface: string,
   value: string,
   externalDir: ExternalDirAsk | undefined,
-  toolName: string | undefined
+  toolName: string | undefined,
+  chosenPattern?: string
 ): AskVerdict {
   deps.denyService?.onContinueSucceeded()
   if (decision === 'allow') {
     return 'allow'
   }
   if (decision === 'allow_session') {
-    // Persist exact value for catch-all patterns
-    const safePattern = value
-    deps.sessionRules.approveForSession(surface, safePattern, 'allow')
+    const safePattern = chosenPattern ?? value
+    const isExact = chosenPattern ? chosenPattern === value : true
+    deps.sessionRules.approveForSession(surface, safePattern, 'allow', isExact)
     return 'allow_session'
   }
   if (decision === 'allow_dir_tool') {
@@ -149,6 +158,12 @@ function applyAllowDecision(
   return 'allow_dir_all'
 }
 
+export interface ResolveAskExtra {
+  sessionPatterns?: string[]
+  segmentIndex?: number
+  segmentTotal?: number
+}
+
 export async function resolveAsk(
   surface: string,
   value: string,
@@ -158,7 +173,8 @@ export async function resolveAsk(
   toolName?: string,
   fullCommand?: string,
   startedAt?: number,
-  externalDir?: ExternalDirAsk
+  externalDir?: ExternalDirAsk,
+  extra?: ResolveAskExtra
 ): Promise<{ requestId: string; verdict: AskVerdict; via: AskAudit['via'] }> {
   const requestId =
     globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)
@@ -188,8 +204,11 @@ export async function resolveAsk(
     fullCommand,
     type: externalDir?.isExternalDir ? 'external-directory' : 'tool-permission',
     externalDir: externalDir?.externalGrantDir ?? externalDir?.externalDirPath,
+    sessionPatterns: extra?.sessionPatterns,
+    segmentIndex: extra?.segmentIndex,
+    segmentTotal: extra?.segmentTotal,
   })
-  const { decision, reason, via } = normalizeAskDecision(res)
+  const { decision, reason, via, pattern } = normalizeAskDecision(res)
 
   if (decision !== 'deny') {
     return {
@@ -201,7 +220,8 @@ export async function resolveAsk(
         surface,
         value,
         externalDir,
-        toolName
+        toolName,
+        pattern
       ),
     }
   }

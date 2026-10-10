@@ -1,30 +1,31 @@
 import type { Rule, PermissionState } from './rule.ts'
-import { globToRegex } from './rule.ts'
+import { sessionPatternMatches } from './wildcard-matcher.ts'
 
 type SessionRule = Rule
 
-/**
- * Check if a pattern glob-matches an existing session rule pattern.
- * H4: glob-aware dedup to avoid fragmenting rules like `/tmp/*` vs `/tmp/secret`.
- */
-function patternsDedupe(existing: string, candidate: string): boolean {
-  // Exact match is still a dedup
-  if (existing === candidate) return true
-  // Check if existing pattern glob-matches the candidate
-  try {
-    const body = globToRegex(existing)
-    if (new RegExp(body).test(candidate)) return true
-  } catch {
-    /* invalid glob, fall through to exact */
+interface PatternCandidate {
+  pattern: string
+  isExact?: boolean
+}
+
+function patternCovers(
+  broad: PatternCandidate,
+  narrow: PatternCandidate
+): boolean {
+  if (broad.isExact) {
+    if (!narrow.isExact) return false
+    return process.platform === 'win32'
+      ? broad.pattern.toLowerCase() === narrow.pattern.toLowerCase()
+      : broad.pattern === narrow.pattern
   }
-  // Check if candidate glob-matches the existing
-  try {
-    const body = globToRegex(candidate)
-    if (new RegExp(body).test(existing)) return true
-  } catch {
-    /* invalid glob, fall through to exact */
+  if (
+    process.platform === 'win32'
+      ? broad.pattern.toLowerCase() === narrow.pattern.toLowerCase()
+      : broad.pattern === narrow.pattern
+  ) {
+    return true
   }
-  return false
+  return sessionPatternMatches(broad.pattern, narrow.pattern)
 }
 
 export class SessionRules {
@@ -37,20 +38,35 @@ export class SessionRules {
   approveForSession(
     surface: string,
     pattern: string,
-    action: PermissionState
+    action: PermissionState,
+    isExact?: boolean
   ): void {
-    // H4: dedupe by glob-aware matching (not just exact string).
-    // The gate re-persists an allow after the permission modal already
-    // approved-for-session, so without this guard the same pair would be
-    // added twice. Using glob matching prevents fragmentation.
-    if (
-      this.rules.some(
-        (r) => r.surface === surface && patternsDedupe(r.pattern, pattern)
-      )
-    ) {
+    const incoming: PatternCandidate = { pattern, isExact }
+    const alreadyCovered = this.rules.some(
+      (r) =>
+        r.surface === surface &&
+        r.action === action &&
+        patternCovers(r, incoming)
+    )
+    if (alreadyCovered) {
       return
     }
-    this.add({ surface, pattern, action, origin: 'session' } as SessionRule)
+
+    this.rules = this.rules.filter(
+      (r) =>
+        !(
+          r.surface === surface &&
+          r.action === action &&
+          r.origin === 'session' &&
+          patternCovers(incoming, r)
+        )
+    )
+
+    const rule: SessionRule = { surface, pattern, action, origin: 'session' }
+    if (isExact !== undefined) {
+      rule.isExact = isExact
+    }
+    this.add(rule)
   }
 
   snapshot(): Rule[] {

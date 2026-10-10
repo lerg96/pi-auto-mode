@@ -104,4 +104,102 @@ describe('SessionRules', () => {
       expect(evaluate('shell', 'rm -rf /tmp', snap).origin).toBe('session')
     })
   })
+
+  describe('approveForSession hierarchy and deduplication', () => {
+    it('narrow-then-broad keeps broad and drops narrow', () => {
+      rules.approveForSession('shell', 'aws s3 ls', 'allow')
+      expect(rules.size()).toBe(1)
+      rules.approveForSession('shell', 'aws *', 'allow')
+      expect(rules.size()).toBe(1)
+      expect(rules.snapshot()).toEqual([
+        {
+          surface: 'shell',
+          pattern: 'aws *',
+          action: 'allow',
+          origin: 'session',
+        },
+      ])
+    })
+
+    it('broad-then-narrow keeps only broad', () => {
+      rules.approveForSession('shell', 'aws *', 'allow')
+      expect(rules.size()).toBe(1)
+      rules.approveForSession('shell', 'aws s3 ls', 'allow')
+      expect(rules.size()).toBe(1)
+      expect(rules.snapshot()).toEqual([
+        {
+          surface: 'shell',
+          pattern: 'aws *',
+          action: 'allow',
+          origin: 'session',
+        },
+      ])
+    })
+
+    it('keeps different surfaces independent', () => {
+      rules.approveForSession('shell', 'aws *', 'allow')
+      rules.approveForSession('fs', 'aws *', 'allow')
+      expect(rules.size()).toBe(2)
+
+      rules.approveForSession('fs', 'aws', 'allow')
+      expect(rules.size()).toBe(2)
+      const snap = rules.snapshot()
+      expect(snap.find((r) => r.surface === 'shell')?.pattern).toBe('aws *')
+      expect(snap.find((r) => r.surface === 'fs')?.pattern).toBe('aws *')
+    })
+
+    it('handles aws * vs aws and awsx', () => {
+      rules.approveForSession('shell', 'aws', 'allow')
+      expect(rules.size()).toBe(1)
+
+      // aws * covers aws -> drops aws and keeps aws *
+      rules.approveForSession('shell', 'aws *', 'allow')
+      expect(rules.size()).toBe(1)
+      expect(rules.snapshot()[0]?.pattern).toBe('aws *')
+
+      // aws * does NOT cover awsx -> both are kept
+      rules.approveForSession('shell', 'awsx', 'allow')
+      expect(rules.size()).toBe(2)
+      const patterns = rules.snapshot().map((r) => r.pattern)
+      expect(patterns).toContain('aws *')
+      expect(patterns).toContain('awsx')
+    })
+
+    it('multiple narrower rules are cleaned up by a broad pattern', () => {
+      rules.approveForSession('shell', 'aws s3 ls', 'allow')
+      rules.approveForSession('shell', 'aws ec2 describe', 'allow')
+      expect(rules.size()).toBe(2)
+
+      rules.approveForSession('shell', 'aws *', 'allow')
+      expect(rules.size()).toBe(1)
+      expect(rules.snapshot()[0]?.pattern).toBe('aws *')
+    })
+
+    it('exact command with wildcards (isExact: true) does not cover other commands as glob', () => {
+      rules.approveForSession('shell', 'rm *.log', 'allow', true)
+      expect(rules.size()).toBe(1)
+      expect(rules.snapshot()[0].isExact).toBe(true)
+
+      // rm a.log must NOT be covered by exact 'rm *.log'
+      rules.approveForSession('shell', 'rm a.log', 'allow', true)
+      expect(rules.size()).toBe(2)
+      const patterns = rules.snapshot().map((r) => r.pattern)
+      expect(patterns).toContain('rm *.log')
+      expect(patterns).toContain('rm a.log')
+    })
+
+    it('exact command deduplicates identical exact pattern', () => {
+      rules.approveForSession('shell', 'rm *.log', 'allow', true)
+      rules.approveForSession('shell', 'rm *.log', 'allow', true)
+      expect(rules.size()).toBe(1)
+    })
+
+    it('broad wildcard pattern covers narrower exact command with wildcard chars', () => {
+      rules.approveForSession('shell', 'rm *.log', 'allow', true)
+      expect(rules.size()).toBe(1)
+      rules.approveForSession('shell', 'rm *', 'allow')
+      expect(rules.size()).toBe(1)
+      expect(rules.snapshot()[0]?.pattern).toBe('rm *')
+    })
+  })
 })

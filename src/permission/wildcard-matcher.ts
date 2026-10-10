@@ -83,3 +83,15 @@ function matchGreedy(p: string, v: string): boolean {
   while (pi < p.length && p.charCodeAt(pi) === 42) pi++
   return pi === p.length
 }
+
+export function sessionPatternMatches(pattern: string, value: string): boolean {
+  if (typeof pattern !== 'string' || typeof value !== 'string') return false
+  if (wildcardMatch(pattern, value)) return true
+  if (pattern.endsWith(' *')) {
+    const prefix = pattern.slice(0, -2)
+    return process.platform === 'win32'
+      ? prefix.toLowerCase() === value.toLowerCase()
+      : prefix === value
+  }
+  return false
+}

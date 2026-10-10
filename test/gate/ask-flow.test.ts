@@ -90,9 +90,48 @@ describe('resolveAsk', () => {
     const rules = deps.sessionRules
       .snapshot()
       .filter((r) => r.origin === 'session' && r.action === 'allow')
-    expect(
-      rules.some((r) => r.surface === 'shell' && r.pattern === 'echo hi')
-    ).toBe(true)
+    const rule = rules.find(
+      (r) => r.surface === 'shell' && r.pattern === 'echo hi'
+    )
+    expect(rule).toBeDefined()
+    expect(rule?.isExact).toBe(true)
+  })
+
+  it('persists chosen wildcard pattern on allow_session with isExact false', async () => {
+    const { deps, onContinueSucceeded } = makeDeps()
+    setAskResolver(async () => ({
+      decision: 'allow_session',
+      pattern: 'echo *',
+    }))
+    const res = await resolveAsk('shell', 'echo hi', undefined, deps)
+    expect(res.verdict).toBe('allow_session')
+    expect(onContinueSucceeded).toHaveBeenCalledTimes(1)
+    const rules = deps.sessionRules
+      .snapshot()
+      .filter((r) => r.origin === 'session' && r.action === 'allow')
+    const rule = rules.find(
+      (r) => r.surface === 'shell' && r.pattern === 'echo *'
+    )
+    expect(rule).toBeDefined()
+    expect(rule?.isExact).toBe(false)
+  })
+
+  it('persists chosen exact pattern on allow_session with isExact true', async () => {
+    const { deps } = makeDeps()
+    setAskResolver(async () => ({
+      decision: 'allow_session',
+      pattern: 'echo hi',
+    }))
+    const res = await resolveAsk('shell', 'echo hi', undefined, deps)
+    expect(res.verdict).toBe('allow_session')
+    const rules = deps.sessionRules
+      .snapshot()
+      .filter((r) => r.origin === 'session' && r.action === 'allow')
+    const rule = rules.find(
+      (r) => r.surface === 'shell' && r.pattern === 'echo hi'
+    )
+    expect(rule).toBeDefined()
+    expect(rule?.isExact).toBe(true)
   })
 
   it('inherits a denial reason from the matched rule', async () => {

@@ -54,63 +54,74 @@ const ALL_DECISION_IDS: readonly string[] = [
   'deny_reason',
 ]
 
-function isDecisionId(v: unknown): v is DecisionId {
-  return typeof v === 'string' && ALL_DECISION_IDS.includes(v)
+function isDecisionId(v: unknown): boolean {
+  if (typeof v !== 'string') return false
+  return ALL_DECISION_IDS.includes(v) || v.startsWith('allow_session:')
 }
 
-/**
- * Build the decision list. Each row is an "action" row: a single
- * sentinel value in `values` so Enter fires `onChange(id, '❯')` exactly
- * once. We dispatch on `id`, ignoring the value.
- *
- * `currentValue` is the short right-side hint shown for the highlighted
- * row. The request context (tool/rule/command/reason) lives in the static
- * header above the list (see `buildHeader`), so each row's `description`
- * only explains what that choice does.
- */
-function buildDecisionItems(type: AskType): SettingItem[] {
-  if (type === 'external-directory') {
-    return [
-      {
-        id: 'allow',
-        label: 'Allow this call',
-        description: 'Grant once — nothing is remembered.',
-        currentValue: 'grant once',
-        values: ['❯'],
-      },
-      {
-        id: 'allow_dir_tool',
-        label: 'Allow for this tool',
+function buildSessionPatternItems(patterns: string[]): SettingItem[] {
+  return patterns.map((pat, i) => {
+    if (i === 0) {
+      return {
+        id: 'allow_session:0',
+        label: `Allow for session "${pat}"`,
         description:
-          'Remember for this tool — identical calls skip the prompt.',
-        currentValue: 'remember for tool',
+          'Remember for this session — identical calls skip the prompt.',
+        currentValue: 'remember exact',
         values: ['❯'],
-      },
-      {
-        id: 'allow_dir_all',
-        label: 'Allow for all tools',
-        description:
-          'Remember for all tools — identical calls skip the prompt.',
-        currentValue: 'remember for all',
-        values: ['❯'],
-      },
-      {
-        id: 'deny',
-        label: 'Deny',
-        description: 'Block once — the model sees the reason above.',
-        currentValue: 'block once',
-        values: ['❯'],
-      },
-      {
-        id: 'deny_reason',
-        label: 'Deny with reason',
-        description: 'Block and attach your reason for the model.',
-        currentValue: 'block & tell the model why',
-        values: ['❯'],
-      },
-    ]
-  }
-  // tool-permission (default)
+      }
+    }
+    return {
+      id: `allow_session:${i}`,
+      label: `Allow for session "${pat}"`,
+      description: `Remember for this session — calls matching "${pat}" skip the prompt.`,
+      currentValue: 'remember wildcard',
+      values: ['❯'],
+    }
+  })
+}
+
+function buildExternalDirItems(): SettingItem[] {
+  return [
+    {
+      id: 'allow',
+      label: 'Allow this call',
+      description: 'Grant once — nothing is remembered.',
+      currentValue: 'grant once',
+      values: ['❯'],
+    },
+    {
+      id: 'allow_dir_tool',
+      label: 'Allow for this tool',
+      description: 'Remember for this tool — identical calls skip the prompt.',
+      currentValue: 'remember for tool',
+      values: ['❯'],
+    },
+    {
+      id: 'allow_dir_all',
+      label: 'Allow for all tools',
+      description: 'Remember for all tools — identical calls skip the prompt.',
+      currentValue: 'remember for all',
+      values: ['❯'],
+    },
+    {
+      id: 'deny',
+      label: 'Deny',
+      description: 'Block once — the model sees the reason above.',
+      currentValue: 'block once',
+      values: ['❯'],
+    },
+    {
+      id: 'deny_reason',
+      label: 'Deny with reason',
+      description: 'Block and attach your reason for the model.',
+      currentValue: 'block & tell the model why',
+      values: ['❯'],
+    },
+  ]
+}
+
+function buildLegacyToolItems(): SettingItem[] {
   return [
     {
       id: 'allow',
@@ -142,6 +153,52 @@ function buildDecisionItems(type: AskType): SettingItem[] {
       values: ['❯'],
     },
   ]
+}
+
+/**
+ * Build the decision list. Each row is an "action" row: a single
+ * sentinel value in `values` so Enter fires `onChange(id, '❯')` exactly
+ * once. We dispatch on `id`, ignoring the value.
+ *
+ * `currentValue` is the short right-side hint shown for the highlighted
+ * row. The request context (tool/rule/command/reason) lives in the static
+ * header above the list (see `buildHeader`), so each row's `description`
+ * only explains what that choice does.
+ */
+function buildDecisionItems(
+  type: AskType,
+  sessionPatterns?: string[]
+): SettingItem[] {
+  if (type === 'external-directory') {
+    return buildExternalDirItems()
+  }
+  if (sessionPatterns && sessionPatterns.length > 0) {
+    return [
+      {
+        id: 'allow',
+        label: 'Allow',
+        description: 'Grant once — nothing is remembered.',
+        currentValue: 'grant once',
+        values: ['❯'],
+      },
+      ...buildSessionPatternItems(sessionPatterns),
+      {
+        id: 'deny',
+        label: 'Deny',
+        description: 'Block once — the model sees the reason above.',
+        currentValue: 'block once',
+        values: ['❯'],
+      },
+      {
+        id: 'deny_reason',
+        label: 'Deny with reason',
+        description: 'Block and attach your reason for the model.',
+        currentValue: 'block & tell the model why',
+        values: ['❯'],
+      },
+    ]
+  }
+  return buildLegacyToolItems()
 }
 
 /** Field-name column width for the header block (fits 'full command'). */
@@ -197,12 +254,16 @@ function buildHeader(
 ): string[] {
   const lines: string[] = []
   const isExternalDir = req.type === 'external-directory'
+  const segmentSuffix =
+    req.segmentIndex && req.segmentTotal && req.segmentTotal > 1
+      ? ` [${req.segmentIndex} of ${req.segmentTotal}]`
+      : ''
 
   // Title
   lines.push(
     isExternalDir
-      ? slTheme.label('External directory access', true)
-      : slTheme.label('Permission Required', true)
+      ? slTheme.label(`External directory access${segmentSuffix}`, true)
+      : slTheme.label(`Permission Required${segmentSuffix}`, true)
   )
   // A prompt borrowed into the parent session must say so: the user is being
   // asked about a tool call that is NOT from the session in front of them.
@@ -251,8 +312,12 @@ function buildHeader(
 }
 
 /** Footer hint rendered below the decision list. */
-function buildFooter(slTheme: SettingsListTheme): string[] {
-  return [slTheme.hint('↑/↓ move · enter confirm · esc deny')]
+function buildFooter(slTheme: SettingsListTheme, req?: AskRequest): string[] {
+  const prefix =
+    req?.segmentIndex && req?.segmentTotal && req?.segmentTotal > 1
+      ? `[${req.segmentIndex} of ${req.segmentTotal}] · `
+      : ''
+  return [slTheme.hint(`${prefix}↑/↓ move · enter confirm · esc deny`)]
 }
 
 /** Inner list surface: the real SettingsList plus the optional slots of
@@ -474,9 +539,12 @@ export function createModalAskResolver(
                   ? 'raised by a child session (this one has no UI)'
                   : undefined
               ),
-              buildFooter(slTheme),
+              buildFooter(slTheme, req),
               new SettingsList(
-                buildDecisionItems(req.type ?? 'tool-permission'),
+                buildDecisionItems(
+                  req.type ?? 'tool-permission',
+                  req.sessionPatterns
+                ),
                 8,
                 slTheme,
                 async (itemId, _newValue) => {
@@ -485,6 +553,15 @@ export function createModalAskResolver(
                   if (!isDecisionId(itemId)) {
                     // Unknown row id → fail-closed.
                     finish('deny')
+                    return
+                  }
+                  if (itemId.startsWith('allow_session:')) {
+                    const idx = parseInt(
+                      itemId.slice('allow_session:'.length),
+                      10
+                    )
+                    const pattern = req.sessionPatterns?.[idx] ?? req.value
+                    finish({ decision: 'allow_session', pattern })
                     return
                   }
                   switch (itemId) {
@@ -499,7 +576,17 @@ export function createModalAskResolver(
                       // The gate (gate.ts) records the session approval via
                       // SessionRules.approveForSession(). The modal only
                       // returns the decision; persistence is the gate's job.
-                      finish('allow_session')
+                      if (
+                        req.sessionPatterns &&
+                        req.sessionPatterns.length > 0
+                      ) {
+                        finish({
+                          decision: 'allow_session',
+                          pattern: req.sessionPatterns[0] ?? req.value,
+                        })
+                      } else {
+                        finish('allow_session')
+                      }
                       return
 
                     case 'allow_dir_tool':

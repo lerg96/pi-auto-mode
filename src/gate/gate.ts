@@ -16,8 +16,10 @@ import {
   resolveAsk,
   verdictExtra,
   askDeniedAudit,
+  trySessionAllow,
   type ExternalDirAsk,
 } from './ask-flow.ts'
+import { buildSessionPatterns } from '../permission/command-prefix.ts'
 import { applyDenyStrategy } from './deny-strategy.ts'
 import { aggregateClassify, mostRestrictive } from './risk-aggregation.ts'
 import { handleClassifierBlock } from './classifier-block.ts'
@@ -438,12 +440,156 @@ function toExternalDirAsk(
     : undefined
 }
 
+function evaluateSegmentAction(
+  ctx: GateCtx,
+  intent: AccessIntent
+): {
+  action: 'allow' | 'ask' | 'deny'
+  extVerdict?: ReturnType<typeof evaluateExternalDirectory>
+} {
+  const evalResult = evaluatePermission(
+    ctx.cfg,
+    'tools',
+    ctx.toolName,
+    intent.value
+  )
+  const cascadeAction = evalResult.action
+  let action: 'allow' | 'ask' | 'deny' =
+    cascadeAction && cascadeAction !== 'unknown' ? cascadeAction : 'allow'
+  const extVerdict = evaluateExternalDirectory(ctx.cfg, [intent], {
+    toolName: ctx.toolName,
+    sessionRules: ctx.deps.sessionRules,
+  })
+  if (extVerdict) {
+    const rank = { allow: 0, ask: 1, deny: 2 } as const
+    if (rank[extVerdict.action] > rank[action]) {
+      action = extVerdict.action
+    }
+  }
+  return { action, extVerdict }
+}
+
+function findUnapprovedShellSegments(
+  ctx: GateCtx,
+  agg: AggResult
+): Array<{
+  intent: AccessIntent
+  extVerdict?: ReturnType<typeof evaluateExternalDirectory>
+}> {
+  const { deps, toolName, startedAt } = ctx
+  const unapproved: Array<{
+    intent: AccessIntent
+    extVerdict?: ReturnType<typeof evaluateExternalDirectory>
+  }> = []
+  for (const intent of ctx.intents) {
+    const { action, extVerdict } = evaluateSegmentAction(ctx, intent)
+    if (action === 'allow') {
+      continue
+    }
+    const reqId =
+      globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)
+    const approved = trySessionAllow(
+      deps,
+      intent.surface,
+      intent.value,
+      agg.risk,
+      toolName,
+      startedAt,
+      reqId
+    )
+    if (!approved) {
+      unapproved.push({ intent, extVerdict })
+    }
+  }
+  return unapproved
+}
+
+async function promptAskMultiSegmentShell(
+  ctx: GateCtx,
+  state: CascadeState,
+  external: ExternalScopeResult,
+  agg: AggResult
+): Promise<void> {
+  const unapproved = findUnapprovedShellSegments(ctx, agg)
+  const totalAsks = unapproved.length
+  if (totalAsks === 0) return
+
+  const { deps, toolName, fullCommand, startedAt } = ctx
+  const { resolution } = planAsk(ctx, state, agg)
+  const defaultExternalDirAsk = toExternalDirAsk(external)
+
+  for (let k = 1; k <= totalAsks; k++) {
+    const { intent: seg, extVerdict } = unapproved[k - 1]
+    const sessionPatterns = buildSessionPatterns(seg.value)
+    const matchedRule = {
+      surface: toolName,
+      pattern: state.rulePattern,
+      reason: state.ruleReason,
+    }
+    const detailArgs = {
+      toolName,
+      matchedSurface: seg.surface,
+      matchedValue: seg.value,
+      rule: matchedRule,
+      risk: agg.risk,
+      startedAt,
+    }
+    const segExternalDirAsk =
+      extVerdict && extVerdict.action === 'ask'
+        ? {
+            isExternalDir: true,
+            externalDirPath: extVerdict.absPath,
+            externalGrantDir: grantDirFor(extVerdict.absPath),
+          }
+        : defaultExternalDirAsk
+
+    try {
+      const { requestId, verdict, via } = await resolveAsk(
+        seg.surface,
+        seg.value,
+        agg.risk,
+        deps,
+        matchedRule,
+        toolName,
+        fullCommand,
+        startedAt,
+        segExternalDirAsk,
+        {
+          sessionPatterns,
+          segmentIndex: k,
+          segmentTotal: totalAsks,
+        }
+      )
+      emit(deps.hooks, seg.surface, seg.value, 'allow', resolution, {
+        requestId,
+        decidedBy: askActor(via),
+        via,
+        ...verdictExtra(verdict),
+        ...buildDecisionDetail(detailArgs),
+      })
+    } catch (err) {
+      emit(deps.hooks, seg.surface, seg.value, 'deny', resolution, {
+        ...askDeniedAudit(err),
+        ...buildDecisionDetail(detailArgs),
+      })
+      throw err
+    }
+  }
+}
+
 async function promptAskAfterClassifier(
   ctx: GateCtx,
   state: CascadeState,
   external: ExternalScopeResult,
   agg: AggResult
 ): Promise<void> {
+  if (
+    ctx.intents.length > 1 &&
+    ctx.intents.every((i) => i.surface === 'shell')
+  ) {
+    return promptAskMultiSegmentShell(ctx, state, external, agg)
+  }
+
   const { deps, toolName, fullCommand, startedAt } = ctx
   const { askSurface, askValue, resolution, matchedRuleForAsk } = planAsk(
     ctx,
@@ -459,6 +605,12 @@ async function promptAskAfterClassifier(
     startedAt,
   }
   const externalDirAsk = toExternalDirAsk(external)
+  const isShell =
+    askSurface === 'shell' ||
+    ctx.intents.some((i) => i.surface === 'shell') ||
+    toolName === 'bash'
+  const sessionPatterns = isShell ? buildSessionPatterns(askValue) : undefined
+
   try {
     const { requestId, verdict, via } = await resolveAsk(
       askSurface,
@@ -469,7 +621,8 @@ async function promptAskAfterClassifier(
       toolName,
       fullCommand,
       startedAt,
-      externalDirAsk
+      externalDirAsk,
+      sessionPatterns ? { sessionPatterns } : undefined
     )
     emit(deps.hooks, askSurface, askValue, 'allow', resolution, {
       requestId,

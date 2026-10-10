@@ -1573,4 +1573,108 @@ describe('E2E: allow_dir_tool and allow_dir_all per-tool scoping', () => {
     expect(snap[initialSize].surface).toBe('external_directory:write')
     expect(snap[initialSize].action).toBe('allow')
   })
+
+  describe('compound shell commands sequential ask', () => {
+    let prevResolver: typeof defaultAskResolver
+    const compoundAskConfig: Config = {
+      ...config,
+      activePermissionSets: [],
+      permissions: {
+        tools: {
+          bash: [{ pattern: '*', action: 'ask' }],
+        },
+      },
+    }
+
+    beforeEach(() => {
+      prevResolver = getAskResolver()
+      configState.set(compoundAskConfig)
+    })
+
+    afterEach(() => {
+      setAskResolver(prevResolver)
+    })
+
+    it('both asked sequentially with [1 of 2] and [2 of 2]', async () => {
+      const deps = makeDeps()
+      const requests: Array<{
+        value: string
+        segmentIndex?: number
+        segmentTotal?: number
+      }> = []
+
+      setAskResolver(async (req) => {
+        requests.push({
+          value: req.value,
+          segmentIndex: req.segmentIndex,
+          segmentTotal: req.segmentTotal,
+        })
+        return 'allow'
+      })
+
+      await gateToolCall('bash', { command: 'git status && git log' }, deps)
+
+      expect(requests).toHaveLength(2)
+      expect(requests[0]).toEqual({
+        value: 'git status',
+        segmentIndex: 1,
+        segmentTotal: 2,
+      })
+      expect(requests[1]).toEqual({
+        value: 'git log',
+        segmentIndex: 2,
+        segmentTotal: 2,
+      })
+    })
+
+    it('2nd segment denied -> entire call fails (throws error)', async () => {
+      const deps = makeDeps()
+      const requests: string[] = []
+
+      setAskResolver(async (req) => {
+        requests.push(req.value)
+        if (req.value === 'git log') {
+          return 'deny'
+        }
+        return 'allow'
+      })
+
+      await expect(
+        gateToolCall('bash', { command: 'git status && git log' }, deps)
+      ).rejects.toThrow()
+
+      expect(requests).toEqual(['git status', 'git log'])
+    })
+
+    it('1st segment in session -> only 2nd segment is asked (1 modal)', async () => {
+      const deps = makeDeps()
+      // Approve 1st segment in session
+      deps.sessionRules.approveForSession('shell', 'git status', 'allow', true)
+
+      const requests: Array<{
+        value: string
+        segmentIndex?: number
+        segmentTotal?: number
+      }> = []
+
+      setAskResolver(async (req) => {
+        requests.push({
+          value: req.value,
+          segmentIndex: req.segmentIndex,
+          segmentTotal: req.segmentTotal,
+        })
+        return 'allow'
+      })
+
+      await gateToolCall('bash', { command: 'git status && git log' }, deps)
+
+      // Only 2nd segment asked, total is 1
+      expect(requests).toHaveLength(1)
+      expect(requests[0]).toEqual({
+        value: 'git log',
+        segmentIndex: 1,
+        segmentTotal: 1,
+      })
+    })
+  })
 })

@@ -1085,6 +1085,75 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       expect(isExternalDirAllowed('/tmp/outside/file.txt')).toBe(false)
     })
   })
+
+  describe('custom sessionPatterns & multi-segment indicator', () => {
+    it('renders custom sessionPatterns with exact and wildcard labels and hints', async () => {
+      const { settle, promise } = renderModal({
+        surface: 'shell',
+        value: 'git commit -m "test"',
+        sessionPatterns: ['git commit -m "test"', 'git commit *', 'git *'],
+      })
+      expect(captures.items).toHaveLength(6)
+      expect(captures.items![0].id).toBe('allow')
+      expect(captures.items![1].id).toBe('allow_session:0')
+      expect(captures.items![1].label).toBe(
+        'Allow for session "git commit -m "test""'
+      )
+      expect(captures.items![1].currentValue).toBe('remember exact')
+      expect(captures.items![2].id).toBe('allow_session:1')
+      expect(captures.items![2].label).toBe('Allow for session "git commit *"')
+      expect(captures.items![2].currentValue).toBe('remember wildcard')
+      expect(captures.items![3].id).toBe('allow_session:2')
+      expect(captures.items![3].label).toBe('Allow for session "git *"')
+      expect(captures.items![3].currentValue).toBe('remember wildcard')
+      expect(captures.items![4].id).toBe('deny')
+      expect(captures.items![5].id).toBe('deny_reason')
+
+      settle('allow_session:1')
+      expect(await promise).toEqual({
+        decision: 'allow_session',
+        pattern: 'git commit *',
+      })
+    })
+
+    it('resolves allow_session:0 with exact pattern', async () => {
+      const { settle, promise } = renderModal({
+        surface: 'shell',
+        value: 'npm test',
+        sessionPatterns: ['npm test', 'npm *'],
+      })
+      settle('allow_session:0')
+      expect(await promise).toEqual({
+        decision: 'allow_session',
+        pattern: 'npm test',
+      })
+    })
+
+    it('displays [1 of 2] in header and footer when segmentTotal > 1', () => {
+      const { lines } = renderModal({
+        surface: 'shell',
+        value: 'echo a',
+        segmentIndex: 1,
+        segmentTotal: 2,
+      })
+      const text = lines.join('\n')
+      expect(text).toContain('Permission Required [1 of 2]')
+      expect(text).toContain('[1 of 2] · ↑/↓ move · enter confirm · esc deny')
+    })
+
+    it('does not display [1 of 1] when segmentTotal <= 1', () => {
+      const { lines } = renderModal({
+        surface: 'shell',
+        value: 'echo a',
+        segmentIndex: 1,
+        segmentTotal: 1,
+      })
+      const text = lines.join('\n')
+      expect(text).not.toContain('[1 of 1]')
+      expect(text).toContain('Permission Required')
+      expect(text).toContain('↑/↓ move · enter confirm · esc deny')
+    })
+  })
 })
 
 afterEach(() => {

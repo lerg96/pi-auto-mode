@@ -27,6 +27,9 @@ export interface AskRequest {
    * Only used when type === 'external-directory'.
    */
   externalDir?: string
+  sessionPatterns?: string[]
+  segmentIndex?: number
+  segmentTotal?: number
 }
 
 // NUEVO: una negación puede llevar una razón legible (se muestra al modelo).
@@ -52,21 +55,30 @@ export type AskDecision =
         'allow' | 'allow_session' | 'allow_dir_tool' | 'allow_dir_all' | 'deny'
       reason?: string
       via?: AskVia
+      pattern?: string
     }
+
+export interface CanonicalAskResult {
+  decision:
+    'allow' | 'allow_session' | 'allow_dir_tool' | 'allow_dir_all' | 'deny'
+  reason?: string
+  via: AskVia
+  pattern?: string
+}
 
 /**
  * Formas de respuesta de un resolver → forma canónica para el gate.
  * Un string suelto se trata como `modal` (decisión humana); el resolver por
  * defecto devuelve el objeto con `via: 'no-ui'`, que es lo que realmente pasó.
  */
-export function normalizeAskDecision(res: AskDecision): {
-  decision:
-    'allow' | 'allow_session' | 'allow_dir_tool' | 'allow_dir_all' | 'deny'
-  reason?: string
-  via: AskVia
-} {
+export function normalizeAskDecision(res: AskDecision): CanonicalAskResult {
   if (typeof res === 'string') return { decision: res, via: 'modal' }
-  return { decision: res.decision, reason: res.reason, via: res.via ?? 'modal' }
+  return {
+    decision: res.decision,
+    reason: res.reason,
+    via: res.via ?? 'modal',
+    pattern: res.pattern,
+  }
 }
 
 export type AskResolver = (req: AskRequest) => Promise<AskDecision>

@@ -1,4 +1,7 @@
-import { wildcardMatch } from '../../src/permission/wildcard-matcher.ts'
+import {
+  wildcardMatch,
+  sessionPatternMatches,
+} from '../../src/permission/wildcard-matcher.ts'
 
 describe('wildcardMatch / literal', () => {
   it('matches an identical string', () => {
@@ -246,6 +249,63 @@ describe('wildcardMatch / differential fuzz vs old recursive implementation', ()
           )
         }
       }
+    } finally {
+      Object.defineProperty(process, 'platform', { value: before })
+    }
+  })
+})
+
+describe('sessionPatternMatches', () => {
+  it('matches via standard wildcardMatch', () => {
+    expect(sessionPatternMatches('*', 'anything')).toBe(true)
+    expect(sessionPatternMatches('echo *', 'echo hello')).toBe(true)
+    expect(sessionPatternMatches('git commit *', 'git commit -m msg')).toBe(
+      true
+    )
+  })
+
+  it('matches base command when pattern ends with " *"', () => {
+    expect(sessionPatternMatches('aws *', 'aws')).toBe(true)
+    expect(sessionPatternMatches('aws *', 'aws s3')).toBe(true)
+    expect(sessionPatternMatches('aws *', 'aws s3 ls')).toBe(true)
+    expect(sessionPatternMatches('echo *', 'echo')).toBe(true)
+    expect(sessionPatternMatches('git commit *', 'git commit')).toBe(true)
+  })
+
+  it('does NOT match partial word prefixes like awsx or aws-cli', () => {
+    expect(sessionPatternMatches('aws *', 'awsx')).toBe(false)
+    expect(sessionPatternMatches('aws *', 'aws-cli')).toBe(false)
+    expect(sessionPatternMatches('echo *', 'echox')).toBe(false)
+  })
+
+  it('does not collapse whitespace', () => {
+    // Exact space boundary is required; no arbitrary stripping
+    expect(sessionPatternMatches('aws s3 *', 'awss3')).toBe(false)
+  })
+
+  it('returns false for non-string inputs', () => {
+    expect(sessionPatternMatches('aws *', undefined as unknown as string)).toBe(
+      false
+    )
+    expect(sessionPatternMatches(undefined as unknown as string, 'aws')).toBe(
+      false
+    )
+  })
+
+  it('handles platform case sensitivity for exact prefix match', () => {
+    const before = process.platform
+    Object.defineProperty(process, 'platform', { value: 'linux' })
+    try {
+      expect(sessionPatternMatches('AWS *', 'aws')).toBe(false)
+      expect(sessionPatternMatches('aws *', 'aws')).toBe(true)
+    } finally {
+      Object.defineProperty(process, 'platform', { value: before })
+    }
+
+    Object.defineProperty(process, 'platform', { value: 'win32' })
+    try {
+      expect(sessionPatternMatches('AWS *', 'aws')).toBe(true)
+      expect(sessionPatternMatches('aws *', 'AWS')).toBe(true)
     } finally {
       Object.defineProperty(process, 'platform', { value: before })
     }

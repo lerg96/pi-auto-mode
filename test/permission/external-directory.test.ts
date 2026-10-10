@@ -1088,4 +1088,34 @@ describe('Tool-scoped session rules (external_directory:<toolName>)', () => {
     expect(verdict?.action).toBe('ask')
     expect(verdict?.absPath).toBe(evil)
   })
+
+  it('heuristic engine (extractBashPaths): descriptor dups and redirect variants produce no bogus path debris', () => {
+    expect(extractBashPaths('agy --help 2>&1')).toEqual([])
+    expect(extractBashPaths('cmd 2>&1')).toEqual([])
+    expect(extractBashPaths('cmd >&2')).toEqual([])
+    expect(extractBashPaths('cmd <&0')).toEqual([])
+    expect(extractBashPaths('cmd >&-')).toEqual([])
+    expect(extractBashPaths('cmd <&-')).toEqual([])
+    expect(extractBashPaths('cmd 1>&2')).toEqual([])
+    expect(extractBashPaths('echo "---EXIT:$?---"')).toEqual([])
+
+    const target = outside('all.log')
+    expect(extractBashPaths(`cmd &> ${target}`)).toContain(target)
+    expect(extractBashPaths(`cmd &>> ${target}`)).toContain(target)
+    expect(extractBashPaths(`cmd >& ${target}`)).toContain(target)
+  })
+
+  it('heuristic engine: compound example intents produce no external directory verdict', () => {
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: { tools: { bash: 'allow' } },
+    })
+    const exampleCmd =
+      'agy --help 2>&1 | head -n 200; echo "---EXIT:$?---"; which agy; agy models list 2>&1 | head -n 100 || agy model list 2>&1 | head -n 100'
+    const intents = normalizeToolCall('bash', { command: exampleCmd })
+    for (const intent of intents) {
+      const paths = extractBashPaths(intent.rawValue ?? intent.value)
+      expect(paths).toEqual([])
+    }
+  })
 })

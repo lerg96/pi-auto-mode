@@ -116,4 +116,30 @@ describe('tree-sitter shell extractor', () => {
     expect(verdict?.engine).toBe('tree-sitter')
     expect(verdict?.matchedValue).toBe(`cmd 2> ${target}`)
   })
+
+  it('redirection descriptor duplicates and variants produce no bogus path debris', () => {
+    expect(extractTreePaths('agy --help 2>&1')).toEqual([])
+    expect(extractTreePaths('cmd 2>&1')).toEqual([])
+    expect(extractTreePaths('cmd >&2')).toEqual([])
+    expect(extractTreePaths('cmd <&0')).toEqual([])
+    expect(extractTreePaths('cmd >&-')).toEqual([])
+    expect(extractTreePaths('cmd <&-')).toEqual([])
+    expect(extractTreePaths('cmd 1>&2')).toEqual([])
+    expect(extractTreePaths('echo "---EXIT:$?---"')).toEqual([])
+
+    const target = outside('all.log')
+    expect(extractTreePaths(`cmd &> ${target}`)).toContain(target)
+    expect(extractTreePaths(`cmd &>> ${target}`)).toContain(target)
+    expect(extractTreePaths(`cmd >& ${target}`)).toContain(target)
+  })
+
+  it('example compound pipeline through normalizeToolCall has no verdict under tree-sitter', () => {
+    const cfg = confineBash()
+    const exampleCmd =
+      'agy --help 2>&1 | head -n 200; echo "---EXIT:$?---"; which agy; agy models list 2>&1 | head -n 100 || agy model list 2>&1 | head -n 100'
+    const intents = normalizeToolCall('bash', { command: exampleCmd })
+    expect(intents).toHaveLength(8)
+    expect(intents.map((i) => i.value)).not.toContain('1')
+    expect(evaluateExternalDirectory(cfg, intents)).toBeUndefined()
+  })
 })

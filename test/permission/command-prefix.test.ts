@@ -65,11 +65,24 @@ describe('extractArgv', () => {
   it('drops standalone and attached redirection forms', () => {
     expect(extractArgv('echo hi 2>&1')).toEqual(['echo', 'hi'])
     expect(extractArgv('echo hi 1>&2')).toEqual(['echo', 'hi'])
+    expect(extractArgv('echo hi >&2')).toEqual(['echo', 'hi'])
+    expect(extractArgv('echo hi >&-')).toEqual(['echo', 'hi'])
+    expect(extractArgv('echo hi <&-')).toEqual(['echo', 'hi'])
+    expect(extractArgv('echo hi 2>&-')).toEqual(['echo', 'hi'])
+    expect(extractArgv('echo hi 0<&-')).toEqual(['echo', 'hi'])
+    expect(extractArgv('echo hi <&0')).toEqual(['echo', 'hi'])
+    expect(extractArgv('echo hi 0<&1')).toEqual(['echo', 'hi'])
+    expect(extractArgv('echo hi >& file')).toEqual(['echo', 'hi'])
+    expect(extractArgv('echo hi >&file')).toEqual(['echo', 'hi'])
+    expect(extractArgv('echo hi 2>& 1')).toEqual(['echo', 'hi'])
     expect(extractArgv('echo hi >out.txt')).toEqual(['echo', 'hi'])
     expect(extractArgv('echo hi >>out.txt')).toEqual(['echo', 'hi'])
     expect(extractArgv('echo hi 2>err.log')).toEqual(['echo', 'hi'])
     expect(extractArgv('cmd &>out.txt')).toEqual(['cmd'])
+    expect(extractArgv('cmd &> out.txt')).toEqual(['cmd'])
+    expect(extractArgv('cmd &>> out.txt')).toEqual(['cmd'])
     expect(extractArgv('cmd <in.txt')).toEqual(['cmd'])
+    expect(extractArgv('agy --help 2>&1')).toEqual(['agy', '--help'])
   })
 
   it('preserves quoted redirection symbols as arguments', () => {
@@ -174,5 +187,46 @@ describe('buildSessionPatterns', () => {
       'sudo service nginx *',
       'sudo service *',
     ])
+  })
+
+  it('excludes redirections from wildcard prefix levels', () => {
+    expect(buildSessionPatterns('agy --help 2>&1')).toEqual([
+      'agy --help 2>&1',
+      'agy *',
+    ])
+    expect(buildSessionPatterns('agy models list 2>&1')).toEqual([
+      'agy models list 2>&1',
+      'agy models *',
+      'agy *',
+    ])
+    expect(buildSessionPatterns('cmd 2>&1')).toEqual(['cmd 2>&1'])
+    expect(buildSessionPatterns('cmd foo 2>&1')).toEqual([
+      'cmd foo 2>&1',
+      'cmd *',
+    ])
+    expect(buildSessionPatterns('cmd foo >&2')).toEqual([
+      'cmd foo >&2',
+      'cmd *',
+    ])
+    expect(buildSessionPatterns('cmd foo >&-')).toEqual([
+      'cmd foo >&-',
+      'cmd *',
+    ])
+    expect(buildSessionPatterns('cmd foo <&0')).toEqual([
+      'cmd foo <&0',
+      'cmd *',
+    ])
+    expect(buildSessionPatterns('cmd foo &>file.log')).toEqual([
+      'cmd foo &>file.log',
+      'cmd *',
+    ])
+    expect(buildSessionPatterns('cmd foo >& file.log')).toEqual([
+      'cmd foo >& file.log',
+      'cmd *',
+    ])
+    const patterns = buildSessionPatterns('agy models list 2>&1')
+    expect(patterns.some((p) => p.includes('2>&1 *'))).toBe(false)
+    expect(patterns).not.toContain('2>&1 *')
+    expect(patterns).not.toContain('2>&1')
   })
 })

@@ -1676,5 +1676,42 @@ describe('E2E: allow_dir_tool and allow_dir_all per-tool scoping', () => {
         segmentTotal: 1,
       })
     })
+
+    it('compound command with 2>&1 and pipes asks for real commands and never asks for "1"', async () => {
+      const deps = makeDeps()
+      const exampleCmd =
+        'agy --help 2>&1 | head -n 200; echo "---EXIT:$?---"; which agy; agy models list 2>&1 | head -n 100 || agy model list 2>&1 | head -n 100'
+
+      const requests: Array<{
+        value: string
+        segmentIndex?: number
+        segmentTotal?: number
+      }> = []
+
+      setAskResolver(async (req) => {
+        requests.push({
+          value: req.value,
+          segmentIndex: req.segmentIndex,
+          segmentTotal: req.segmentTotal,
+        })
+        return 'allow'
+      })
+
+      await gateToolCall('bash', { command: exampleCmd }, deps)
+
+      const values = requests.map((r) => r.value)
+      expect(values).not.toContain('1')
+      expect(requests).toHaveLength(8)
+      expect(values).toEqual([
+        'agy --help 2>&1',
+        'head -n 200',
+        'echo ---EXIT:$?---',
+        'which agy',
+        'agy models list 2>&1',
+        'head -n 100',
+        'agy model list 2>&1',
+        'head -n 100',
+      ])
+    })
   })
 })

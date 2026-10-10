@@ -35,10 +35,12 @@ function tokenizeCommand(segment: string): string[] {
   return tokens
 }
 
-const REDIR_TARGET_RE = /^(?:>{1,2}|<{1,3}|&>{1,2}|[0-9]+>{1,2}|[0-9]+<)$/
+const REDIR_TARGET_RE =
+  /^(?:>{1,2}|<{1,3}|&>{1,2}|>&|<&|<>|[0-9]+>{1,2}|[0-9]+<{1,3}|[0-9]+>&|[0-9]+<&|[0-9]+<>)$/
 const REDIR_STANDALONE_RE =
   /^(?:[0-9]*>&[0-9]+-?|[0-9]*<&[0-9]+-?|[0-9]*>&-|[0-9]*<&-)$/
-const REDIR_ATTACHED_RE = /^(?:>{1,2}|<{1,2}|&>{1,2}|[0-9]+>{1,2}|[0-9]+<)\S+$/
+const REDIR_ATTACHED_RE =
+  /^(?:>{1,2}|<{1,3}|&>{1,2}|>&|<&|<>|[0-9]+>{1,2}|[0-9]+<{1,3}|[0-9]+>&|[0-9]+<&|[0-9]+<>)\S+$/
 
 function filterRedirections(tokens: string[]): string[] {
   const filtered: string[] = []

@@ -203,3 +203,114 @@ describe('normalizeToolCall surface mapping', () => {
     expect(intents).toEqual([{ surface: 'unknown_thing', value: '*' }])
   })
 })
+
+describe('redirections and compound command splitting', () => {
+  const exampleCmd =
+    'agy --help 2>&1 | head -n 200; echo "---EXIT:$?---"; which agy; agy models list 2>&1 | head -n 100 || agy model list 2>&1 | head -n 100'
+
+  it('correctly splits compound command without treating "1" as a separate command', () => {
+    const rawSegs = segmentCommand(exampleCmd, { keepQuotes: true }).map(
+      (s) => s.value
+    )
+    expect(rawSegs).toEqual([
+      'agy --help 2>&1',
+      'head -n 200',
+      'echo "---EXIT:$?---"',
+      'which agy',
+      'agy models list 2>&1',
+      'head -n 100',
+      'agy model list 2>&1',
+      'head -n 100',
+    ])
+    expect(rawSegs).not.toContain('1')
+
+    const segs = splitShellSegments(exampleCmd)
+    expect(segs).toEqual([
+      'agy --help 2>&1',
+      'head -n 200',
+      'echo ---EXIT:$?---',
+      'which agy',
+      'agy models list 2>&1',
+      'head -n 100',
+      'agy model list 2>&1',
+      'head -n 100',
+    ])
+    expect(segs).not.toContain('1')
+  })
+
+  it('normalizes compound command into 8 intents with proper rawValue', () => {
+    const intents = normalizeToolCall('bash', { command: exampleCmd })
+    expect(intents).toHaveLength(8)
+    expect(intents.map((i) => i.value)).not.toContain('1')
+    expect(intents[0]).toEqual({
+      surface: 'shell',
+      value: 'agy --help 2>&1',
+    })
+    expect(intents[2]).toEqual({
+      surface: 'shell',
+      value: 'echo ---EXIT:$?---',
+      rawValue: 'echo "---EXIT:$?---"',
+    })
+  })
+
+  it('handles all redirection variants without splitting & as background operator', () => {
+    expect(splitShellSegments('cmd 2>&1 | next')).toEqual(['cmd 2>&1', 'next'])
+    expect(splitShellSegments('cmd >&2 | next')).toEqual(['cmd >&2', 'next'])
+    expect(splitShellSegments('cmd &>file | next')).toEqual([
+      'cmd &>file',
+      'next',
+    ])
+    expect(splitShellSegments('cmd &>>file | next')).toEqual([
+      'cmd &>>file',
+      'next',
+    ])
+    expect(splitShellSegments('cmd <&0 | next')).toEqual(['cmd <&0', 'next'])
+    expect(splitShellSegments('cmd >&- | next')).toEqual(['cmd >&-', 'next'])
+    expect(splitShellSegments('cmd <&- | next')).toEqual(['cmd <&-', 'next'])
+    expect(splitShellSegments('cmd 1>&2 | next')).toEqual(['cmd 1>&2', 'next'])
+    expect(splitShellSegments('cmd 2>&- | next')).toEqual(['cmd 2>&-', 'next'])
+    expect(splitShellSegments('cmd 0<&- | next')).toEqual(['cmd 0<&-', 'next'])
+    expect(splitShellSegments('cmd &> file | next')).toEqual([
+      'cmd &> file',
+      'next',
+    ])
+    expect(splitShellSegments('cmd &>> file | next')).toEqual([
+      'cmd &>> file',
+      'next',
+    ])
+    expect(splitShellSegments('cmd >& file | next')).toEqual([
+      'cmd >& file',
+      'next',
+    ])
+    expect(splitShellSegments('cmd >&file | next')).toEqual([
+      'cmd >&file',
+      'next',
+    ])
+  })
+
+  it('splits on background & following a redirection', () => {
+    expect(splitShellSegments('cmd 2>&1 & next')).toEqual(['cmd 2>&1', 'next'])
+    expect(splitShellSegments('cmd 2>&1& next')).toEqual(['cmd 2>&1', 'next'])
+    expect(splitShellSegments('cmd &>out & next')).toEqual([
+      'cmd &>out',
+      'next',
+    ])
+  })
+
+  it('preserves $? inside quotes and splits on || properly', () => {
+    expect(splitShellSegments('echo "$?" || echo fallback')).toEqual([
+      'echo $?',
+      'echo fallback',
+    ])
+    expect(
+      segmentCommand('echo "$?" || echo fallback', { keepQuotes: true }).map(
+        (s) => s.value
+      )
+    ).toEqual(['echo "$?"', 'echo fallback'])
+  })
+
+  it('does not treat <<< herestring as heredoc', () => {
+    const segs = splitShellSegments('cat <<< "hello"; echo done')
+    expect(segs).toEqual(['cat <<< hello', 'echo done'])
+  })
+})

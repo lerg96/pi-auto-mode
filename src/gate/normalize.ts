@@ -106,8 +106,13 @@ export function segmentCommand(
   while (i < command.length) {
     const c = command[i]
 
-    // heredoc handling — look for << delimiter
-    if (command[i] === '<' && command[i + 1] === '<') {
+    // heredoc handling — look for << delimiter (not <<< herestring)
+    if (
+      (i === 0 || command[i - 1] !== '<') &&
+      command[i] === '<' &&
+      command[i + 1] === '<' &&
+      command[i + 2] !== '<'
+    ) {
       // flush current buffer
       flush()
       // skip <<
@@ -227,6 +232,17 @@ export function segmentCommand(
     if (c === '&' && command[i + 1] === '&') {
       flush()
       i += 2
+      continue
+    }
+    // Redirections using &:
+    // - &> or &>> (redirect stdout and stderr)
+    // - >& or <& (duplicate or close file descriptor, e.g. 2>&1, >&2, <&0, >&-, <&-)
+    if (
+      (c === '&' && command[i + 1] === '>') ||
+      (c === '&' && (buf.endsWith('>') || buf.endsWith('<')))
+    ) {
+      buf += c
+      i++
       continue
     }
     if (c === '&') {

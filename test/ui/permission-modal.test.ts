@@ -976,8 +976,8 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       resetExternalDirAllowlist()
     })
 
-    it('header muestra "External directory access"', () => {
-      const { lines } = renderModal({
+    it('header muestra "External directory access"', async () => {
+      const { lines, settle, promise } = renderModal({
         type: 'external-directory',
         externalDir: '/mnt/shared',
         tool: 'bash',
@@ -987,10 +987,12 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       const text = lines.join('\n')
       expect(text).toContain('External directory access')
       expect(text).toContain('/mnt/shared')
+      settle('allow')
+      expect(await promise).toBe('allow')
     })
 
-    it('no muestra "command" en header cuando es external-directory', () => {
-      const { lines } = renderModal({
+    it('no muestra "command" en header cuando es external-directory', async () => {
+      const { lines, settle, promise } = renderModal({
         type: 'external-directory',
         externalDir: '/mnt/shared',
         tool: 'bash',
@@ -1000,10 +1002,12 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       const text = lines.join('\n')
       expect(text).not.toContain('command')
       expect(text).toContain('path')
+      settle('allow')
+      expect(await promise).toBe('allow')
     })
 
-    it('SettingsList recibe los 5 items correctos de decision', () => {
-      renderModal({
+    it('SettingsList recibe los 5 items correctos de decision', async () => {
+      const { settle, promise } = renderModal({
         type: 'external-directory',
         externalDir: '/mnt/shared',
         tool: 'bash',
@@ -1021,10 +1025,12 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       expect(captures.items![3].label).toBe('Deny')
       expect(captures.items![4].id).toBe('deny_reason')
       expect(captures.items![4].label).toBe('Deny with reason')
+      settle('allow')
+      expect(await promise).toBe('allow')
     })
 
-    it('tool-permission tiene 4 items de decision', () => {
-      renderModal({
+    it('tool-permission tiene 4 items de decision', async () => {
+      const { settle, promise } = renderModal({
         surface: 'shell',
         value: 'cat /etc/passwd',
       })
@@ -1037,6 +1043,8 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       expect(captures.items![2].label).toBe('Deny')
       expect(captures.items![3].id).toBe('deny_reason')
       expect(captures.items![3].label).toBe('Deny with reason')
+      settle('allow')
+      expect(await promise).toBe('allow')
     })
 
     it('allow_dir_tool devuelve el id y NO muta sessionRules (la persistencia es del gate)', async () => {
@@ -1129,8 +1137,8 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       })
     })
 
-    it('displays [1 of 2] in header and footer when segmentTotal > 1', () => {
-      const { lines } = renderModal({
+    it('displays [1 of 2] in header and footer when segmentTotal > 1', async () => {
+      const { lines, settle, promise } = renderModal({
         surface: 'shell',
         value: 'echo a',
         segmentIndex: 1,
@@ -1139,10 +1147,12 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       const text = lines.join('\n')
       expect(text).toContain('Permission Required [1 of 2]')
       expect(text).toContain('[1 of 2] · ↑/↓ move · enter confirm · esc deny')
+      settle('allow')
+      expect(await promise).toBe('allow')
     })
 
-    it('does not display [1 of 1] when segmentTotal <= 1', () => {
-      const { lines } = renderModal({
+    it('does not display [1 of 1] when segmentTotal <= 1', async () => {
+      const { lines, settle, promise } = renderModal({
         surface: 'shell',
         value: 'echo a',
         segmentIndex: 1,
@@ -1152,6 +1162,8 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       expect(text).not.toContain('[1 of 1]')
       expect(text).toContain('Permission Required')
       expect(text).toContain('↑/↓ move · enter confirm · esc deny')
+      settle('allow')
+      expect(await promise).toBe('allow')
     })
   })
 })

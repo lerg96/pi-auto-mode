@@ -22,11 +22,8 @@ let language: Parser.Language | null = null
 let ready = false
 let initPromise: Promise<void> | null = null
 
-// Heredoc constructs (`<<EOF … EOF`) crash the 0.20.x wasm scanner with a
-// catchable TypeError, so they never reach the parser: heredoc bodies are
-// data anyway (SKIP_TYPES) and the heuristic engine handles the segment.
-// Herestrings (`<<<`) parse fine and must NOT match — hence [^<].
-const HEREDOC_OP = /(^|[^<])<<[^<]/
+import { HEREDOC_OP } from './command-prefix.ts'
+export { HEREDOC_OP }
 
 // Lazily loads the bash grammar (wasm bytes read from the installed
 // wasm pack) and caches the Parser plus Language. Never throws: any

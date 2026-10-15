@@ -140,25 +140,25 @@ describe('normalizeToolCall edge cases', () => {
 })
 
 describe('heredoc handling', () => {
-  // L1: heredoc body is extracted as a scannable segment
-  it('extracts heredoc body as a segment', () => {
+  it('attaches heredoc body to the consumer segment', () => {
     const cmd = `cat <<EOF
 rm -rf /tmp
 EOF
 echo done`
     const segs = segmentCommand(cmd)
-    const values = segs.map((s) => s.value)
-    expect(values).toContain('rm -rf /tmp')
+    expect(segs).toHaveLength(2)
+    expect(segs[0].value).toBe(`cat <<EOF\nrm -rf /tmp\nEOF`)
+    expect(segs[1].value).toBe('echo done')
   })
 
-  it('heredoc body is flagged unquoted for scanning', () => {
+  it('keeps heredoc body within consumer command without creating standalone segment', () => {
     const cmd = `cat <<EOF
 rm -rf /tmp
 EOF`
     const segs = segmentCommand(cmd)
-    const heredocSeg = segs.find((s) => s.value.includes('rm -rf'))
-    expect(heredocSeg).toBeDefined()
-    expect(heredocSeg!.quoted).toBe(false)
+    expect(segs).toHaveLength(1)
+    expect(segs[0].value).toBe(`cat <<EOF\nrm -rf /tmp\nEOF`)
+    expect(segs[0].quoted).toBe(false)
   })
 })
 

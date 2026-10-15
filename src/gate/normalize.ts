@@ -47,6 +47,132 @@ export interface CommandSegment {
  * quoted string, so callers can treat it as data rather than a command.
  * Surrounding quotes are stripped from each segment value.
  */
+export {
+  DATA_SINK_COMMANDS,
+  isDataSinkCommand,
+} from '../permission/command-prefix.ts'
+
+interface PendingHeredoc {
+  target: number
+  delim: string
+  isQuoted: boolean
+  stripTabs: boolean
+}
+
+function parseHeredocDelimiter(
+  command: string,
+  from: number
+): {
+  delim: string
+  isQuoted: boolean
+  stripTabs: boolean
+  nextIndex: number
+  rawSpec: string
+} {
+  let i = from + 2 // skip <<
+  let stripTabs = false
+  if (command[i] === '-') {
+    stripTabs = true
+    i++
+  }
+  while (i < command.length && (command[i] === ' ' || command[i] === '\t')) {
+    i++
+  }
+
+  let delim = ''
+  let isQuoted = false
+  const startSpec = from
+  while (i < command.length) {
+    const c = command[i]
+    if (c === "'" || c === '"') {
+      isQuoted = true
+      const q = c
+      i++
+      while (i < command.length && command[i] !== q) {
+        delim += command[i]
+        i++
+      }
+      if (i < command.length) i++ // skip closing quote
+    } else if (
+      c === '\\' &&
+      i + 1 < command.length &&
+      command[i + 1] !== '\n'
+    ) {
+      isQuoted = true
+      i++
+      delim += command[i]
+      i++
+    } else if (
+      c === ' ' ||
+      c === '\t' ||
+      c === '\n' ||
+      c === '\r' ||
+      c === ';' ||
+      c === '&' ||
+      c === '|' ||
+      c === '(' ||
+      c === ')' ||
+      c === '<' ||
+      c === '>'
+    ) {
+      break
+    } else {
+      delim += c
+      i++
+    }
+  }
+
+  const rawSpec = command.slice(startSpec, i)
+  return { delim, isQuoted, stripTabs, nextIndex: i, rawSpec }
+}
+
+function scanSubshells(
+  body: string,
+  opts?: { keepQuotes?: boolean }
+): CommandSegment[] {
+  const extraSegments: CommandSegment[] = []
+  let j = 0
+  while (j < body.length) {
+    if (body[j] === '$' && body[j + 1] === '(') {
+      let depth = 1
+      let sub = ''
+      j += 2
+      while (j < body.length && depth > 0) {
+        const sc = body[j]
+        if (sc === '(') depth++
+        else if (sc === ')') depth--
+        if (depth > 0) sub += sc
+        j++
+      }
+      const trimmed = sub.trim()
+      if (trimmed.length > 0) {
+        for (const seg of segmentCommand(trimmed, opts)) {
+          extraSegments.push(seg)
+        }
+      }
+      continue
+    }
+    if (body[j] === '`') {
+      let sub = ''
+      j++
+      while (j < body.length && body[j] !== '`') {
+        sub += body[j]
+        j++
+      }
+      if (j < body.length && body[j] === '`') j++
+      const trimmed = sub.trim()
+      if (trimmed.length > 0) {
+        for (const seg of segmentCommand(trimmed, opts)) {
+          extraSegments.push(seg)
+        }
+      }
+      continue
+    }
+    j++
+  }
+  return extraSegments
+}
+
 export function segmentCommand(
   command: string,
   opts?: { keepQuotes?: boolean }
@@ -56,9 +182,19 @@ export function segmentCommand(
   let buf = ''
   let quoted = false
   let quote: "'" | '"' | null = null
+  let pendingHeredocs: PendingHeredoc[] = []
+
   const flush = () => {
     const value = buf.trim()
-    if (value.length > 0) segments.push({ value, quoted })
+    if (value.length > 0) {
+      segments.push({ value, quoted })
+      const segIndex = segments.length - 1
+      for (const h of pendingHeredocs) {
+        if (h.target === -1) {
+          h.target = segIndex
+        }
+      }
+    }
     buf = ''
     quoted = false
   }
@@ -92,85 +228,27 @@ export function segmentCommand(
     return [sub.trim(), j + 1]
   }
 
-  // heredoc state: body text waiting to be flushed as a scannable segment
-  let heredocBody = ''
-  const flushHeredoc = () => {
-    const trimmed = heredocBody.trim()
-    if (trimmed.length > 0) {
-      segments.push({ value: trimmed, quoted: false })
-      heredocBody = ''
-    }
-  }
-
   let i = 0
   while (i < command.length) {
     const c = command[i]
 
-    // heredoc handling — look for << delimiter (not <<< herestring)
+    // heredoc operator — look for << delimiter (not <<< herestring, and outside quotes)
     if (
+      !quote &&
       (i === 0 || command[i - 1] !== '<') &&
       command[i] === '<' &&
       command[i + 1] === '<' &&
       command[i + 2] !== '<'
     ) {
-      // flush current buffer
-      flush()
-      // skip <<
-      i += 2
-      // skip optional - for <<- (strip leading tabs)
-      if (command[i] === '-') i++
-      // read delimiter word
-      let delim = ''
-      while (
-        i < command.length &&
-        command[i] !== ' ' &&
-        command[i] !== '\t' &&
-        command[i] !== '\n'
-      ) {
-        if (command[i] === "'" || command[i] === '"') {
-          // quoted delimiter — read until closing quote, skip quotes
-          const q = command[i]
-          i++
-          while (i < command.length && command[i] !== q) {
-            delim += command[i]
-            i++
-          }
-          if (i < command.length) i++ // skip closing quote
-        } else {
-          delim += command[i]
-          i++
-        }
-      }
-      // skip whitespace after delimiter (may span newline)
-      while (i < command.length && (command[i] === ' ' || command[i] === '\t'))
-        i++
-      // consume trailing newline so heredoc body starts on next line
-      if (i < command.length && command[i] === '\n') i++
-      // read heredoc body until delimiter on its own line
-      heredocBody = ''
-      let heredocDone = false
-      let line = ''
-      while (i < command.length && !heredocDone) {
-        if (command[i] === '\n') {
-          if (line.trimEnd() === delim) {
-            heredocDone = true
-          } else {
-            if (heredocBody.length > 0) heredocBody += '\n'
-            heredocBody += line
-          }
-          line = ''
-          i++
-        } else {
-          line += command[i]
-          i++
-        }
-      }
-      // handle EOF without trailing newline after delimiter
-      if (!heredocDone && line.trimEnd() !== delim) {
-        if (heredocBody.length > 0) heredocBody += '\n'
-        heredocBody += line
-      }
-      flushHeredoc()
+      const parsed = parseHeredocDelimiter(command, i)
+      buf += parsed.rawSpec
+      pendingHeredocs.push({
+        target: -1,
+        delim: parsed.delim,
+        isQuoted: parsed.isQuoted,
+        stripTabs: parsed.stripTabs,
+      })
+      i = parsed.nextIndex
       continue
     }
 
@@ -210,10 +288,82 @@ export function segmentCommand(
       continue
     }
     if (c === ';' || c === '\n') {
+      if (c === '\n' && pendingHeredocs.length > 0) {
+        flush()
+        let curPos = i + 1
+        const extraSegments: CommandSegment[] = []
+        for (const h of pendingHeredocs) {
+          const bodyStart = curPos
+          let lineStart = curPos
+          let foundDelim = false
+          let delimLineEnd = curPos
+
+          while (curPos < command.length && !foundDelim) {
+            if (command[curPos] === '\n') {
+              let line = command.slice(lineStart, curPos)
+              if (line.endsWith('\r')) line = line.slice(0, -1)
+              const lineCheck = h.stripTabs ? line.replace(/^\t+/, '') : line
+              if (lineCheck.trimEnd() === h.delim) {
+                foundDelim = true
+                delimLineEnd = curPos + 1
+                break
+              }
+              curPos++
+              lineStart = curPos
+            } else {
+              curPos++
+            }
+          }
+
+          if (!foundDelim) {
+            let line = command.slice(lineStart, curPos)
+            if (line.endsWith('\r')) line = line.slice(0, -1)
+            const lineCheck = h.stripTabs ? line.replace(/^\t+/, '') : line
+            if (lineCheck.trimEnd() === h.delim) {
+              foundDelim = true
+              delimLineEnd = curPos
+            }
+          }
+
+          let heredocChunk = ''
+          let bodyText = ''
+          if (foundDelim) {
+            heredocChunk = command.slice(bodyStart - 1, delimLineEnd)
+            bodyText = command.slice(
+              bodyStart,
+              lineStart > bodyStart ? lineStart - 1 : bodyStart
+            )
+            curPos = delimLineEnd
+          } else {
+            heredocChunk = command.slice(bodyStart - 1)
+            bodyText = command.slice(bodyStart)
+            curPos = command.length
+          }
+
+          if (h.target >= 0 && h.target < segments.length) {
+            segments[h.target].value += heredocChunk.trimEnd()
+          }
+
+          if (!h.isQuoted) {
+            const subs = scanSubshells(bodyText, opts)
+            for (const s of subs) extraSegments.push(s)
+          }
+        }
+
+        for (const s of extraSegments) {
+          segments.push(s)
+        }
+
+        pendingHeredocs = []
+        i = curPos
+        continue
+      }
+
       flush()
       i++
       continue
     }
+
     if (c === '`') {
       flush()
       const [sub, next] = readBacktickSub(i + 1)

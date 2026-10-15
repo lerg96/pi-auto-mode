@@ -68,8 +68,38 @@ function filterRedirections(tokens: string[]): string[] {
 
 const ENV_ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/
 
+export const HEREDOC_OP = /(^|[^<])<<[^<]/
+
+export const DATA_SINK_COMMANDS: ReadonlySet<string> = new Set(['cat', 'tee'])
+
+export function isDataSinkCommand(segment: string): boolean {
+  const firstLine = segment.split('\n')[0].trim()
+  const argv = extractArgv(firstLine)
+  if (argv.length === 0) return false
+  const base = argv[0]
+    .split(/[/\\]/)
+    .pop()
+    ?.replace(/\.exe$/i, '')
+    .toLowerCase()
+  if (!base || !DATA_SINK_COMMANDS.has(base)) return false
+  for (let i = 1; i < argv.length; i++) {
+    const arg = argv[i]
+    if (
+      arg === '-c' ||
+      arg === '-e' ||
+      arg.startsWith('--exec') ||
+      arg.startsWith('--eval') ||
+      arg.startsWith('--command')
+    ) {
+      return false
+    }
+  }
+  return true
+}
+
 export function extractArgv(segment: string): string[] {
-  const rawTokens = tokenizeCommand(segment)
+  const target = HEREDOC_OP.test(segment) ? segment.split('\n')[0] : segment
+  const rawTokens = tokenizeCommand(target)
   const nonRedir = filterRedirections(rawTokens)
   let start = 0
   while (start < nonRedir.length && ENV_ASSIGN_RE.test(nonRedir[start])) {
@@ -91,7 +121,13 @@ function isPrivileged(cmd: string): boolean {
 
 export function buildSessionPatterns(segment: string): string[] {
   const exact = segment.trim()
-  const argv = extractArgv(segment)
+  const hasHeredoc = HEREDOC_OP.test(segment)
+  if (hasHeredoc && !isDataSinkCommand(segment)) {
+    return [exact]
+  }
+
+  const firstLine = hasHeredoc ? segment.split('\n')[0] : segment
+  const argv = extractArgv(firstLine)
   if (argv.length === 0) {
     return [exact]
   }

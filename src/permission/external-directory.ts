@@ -9,6 +9,7 @@ import {
 } from './git-worktrees.ts'
 import { isExternalDirAllowed } from '../state/external-dir-allowlist.ts'
 import type { SessionRules } from './session-rules.ts'
+import { HEREDOC_OP, isDataSinkCommand } from './command-prefix.ts'
 
 // Local structural intent — deliberately NOT imported from gate/normalize.ts
 // to avoid an import cycle (gate imports this module).
@@ -306,6 +307,10 @@ export function isPathLike(token: string): boolean {
  * considered.
  */
 export function extractBashPaths(segment: string): string[] {
+  if (HEREDOC_OP.test(segment) && isDataSinkCommand(segment)) {
+    const firstLine = segment.split('\n')[0]
+    return selectPathCandidates(tokenizeShell(firstLine))
+  }
   return selectPathCandidates(tokenizeShell(segment))
 }
 

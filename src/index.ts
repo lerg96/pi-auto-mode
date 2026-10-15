@@ -81,9 +81,11 @@ export function loadInitialConfig(
 
 // ─── Session lifecycle (M3) ─────────────────────────────────────
 /**
- * Begins a session: clears per-session permission rules AND resets the
- * deny-service counters so denials from a previous session can't carry over and
- * force escalation in the new one.
+ * Begins a session: resets the deny-service counters so denials from a previous
+ * session can't carry over and force escalation in the new one.
+ * Note: sessionRules is NOT cleared here because session allow rules are
+ * process-wide across subagents and session resumes/switches for the lifetime
+ * of the running Pi instance.
  */
 export function beginSession(
   sessionRules: SessionRules,
@@ -92,7 +94,6 @@ export function beginSession(
   event: PiEventData,
   ctx: ExtensionContext
 ): void {
-  sessionRules.clear()
   denyService.reset()
   void base(event, ctx)
 }

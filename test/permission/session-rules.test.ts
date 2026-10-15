@@ -1,10 +1,14 @@
-import { SessionRules } from '../../src/permission/session-rules.ts'
+import {
+  SessionRules,
+  resetSessionRulesRegistry,
+} from '../../src/permission/session-rules.ts'
 import { evaluate } from '../../src/permission/evaluate.ts'
 
 describe('SessionRules', () => {
   let rules: SessionRules
 
   beforeEach(() => {
+    resetSessionRulesRegistry()
     rules = new SessionRules()
   })
 
@@ -69,12 +73,55 @@ describe('SessionRules', () => {
     })
   })
 
-  it('clear does not affect other instances (isolation)', () => {
-    const other = new SessionRules()
-    rules.approveForSession('fs', '/tmp/*', 'allow')
-    rules.clear()
-    // other was never touched
-    expect(other.size()).toBe(0)
+  it('shares rules across multiple SessionRules instances via process-wide registry', () => {
+    const instanceA = new SessionRules()
+    const instanceB = new SessionRules()
+    instanceA.approveForSession('shell', 'git status', 'allow')
+    expect(instanceB.size()).toBe(1)
+    expect(instanceB.snapshot()).toHaveLength(1)
+    expect(instanceB.snapshot()[0].pattern).toBe('git status')
+  })
+
+  it('resetSessionRulesRegistry clears the shared store across all instances', () => {
+    const instanceA = new SessionRules()
+    const instanceB = new SessionRules()
+    instanceA.approveForSession('shell', 'git status', 'allow')
+    expect(instanceB.size()).toBe(1)
+    resetSessionRulesRegistry()
+    expect(instanceA.size()).toBe(0)
+    expect(instanceB.size()).toBe(0)
+    expect(new SessionRules().size()).toBe(0)
+  })
+
+  it('clear() empties rules across all instances', () => {
+    const instanceA = new SessionRules()
+    const instanceB = new SessionRules()
+    instanceA.approveForSession('shell', 'git status', 'allow')
+    expect(instanceB.size()).toBe(1)
+    instanceA.clear()
+    expect(instanceB.size()).toBe(0)
+    expect(new SessionRules().size()).toBe(0)
+  })
+
+  it('patternCovers treats commands with quotes and without quotes as covering each other', () => {
+    rules.approveForSession('shell', 'cat "test.txt"', 'allow', true)
+    expect(rules.size()).toBe(1)
+    rules.approveForSession('shell', 'cat test.txt', 'allow', true)
+    expect(rules.size()).toBe(1)
+  })
+
+  it('patternCovers treats commands without quotes as covering commands with quotes', () => {
+    rules.approveForSession('shell', 'cat test.txt', 'allow', true)
+    expect(rules.size()).toBe(1)
+    rules.approveForSession('shell', 'cat "test.txt"', 'allow', true)
+    expect(rules.size()).toBe(1)
+  })
+
+  it('patternCovers collapses multiple whitespace differences', () => {
+    rules.approveForSession('shell', 'cat   test.txt', 'allow', true)
+    expect(rules.size()).toBe(1)
+    rules.approveForSession('shell', 'cat test.txt', 'allow', true)
+    expect(rules.size()).toBe(1)
   })
 
   describe('approveForSession is bounded to the exact (surface, value) pair (L3)', () => {

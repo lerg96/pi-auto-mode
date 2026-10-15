@@ -16,7 +16,10 @@ import type {
 } from '@earendil-works/pi-coding-agent'
 import { configState } from '../src/state/config-state.ts'
 import { DEFAULT_CONFIG } from '../src/types/config.ts'
-import { SessionRules } from '../src/permission/session-rules.ts'
+import {
+  SessionRules,
+  resetSessionRulesRegistry,
+} from '../src/permission/session-rules.ts'
 import { DenyAndContinueService } from '../src/deny/deny-service.ts'
 import { setUiContext, getUiContext } from '../src/state/ui-context.ts'
 import { SHUTDOWN_FLUSH_TIMEOUT_MS } from '../src/index.ts'
@@ -77,6 +80,24 @@ describe('createFailClosedToolCall', () => {
 })
 
 describe('session lifecycle (M3)', () => {
+  beforeEach(() => {
+    resetSessionRulesRegistry()
+  })
+
+  it('beginSession does NOT clear sessionRules (process-wide across subagents and session events)', () => {
+    const sessionRules = new SessionRules()
+    sessionRules.approveForSession('shell', 'cat file.txt', 'allow')
+    expect(sessionRules.size()).toBe(1)
+    const denyService = new DenyAndContinueService({
+      mode: 'both',
+      escalation: { consecutive: 3, total: 20 },
+    })
+    const noop = (async () => {}) as unknown as PiEventHandler
+    beginSession(sessionRules, denyService, noop, event, ctx)
+    expect(sessionRules.size()).toBe(1)
+    expect(sessionRules.snapshot()[0].pattern).toBe('cat file.txt')
+  })
+
   it('reset() between sessions prevents denial escalation carry-over', () => {
     const sessionRules = new SessionRules()
     const denyService = new DenyAndContinueService({
@@ -111,6 +132,8 @@ describe('session lifecycle (M3)', () => {
 
   it('also resets on session_shutdown (endSession)', async () => {
     const sessionRules = new SessionRules()
+    sessionRules.approveForSession('shell', 'cat file.txt', 'allow')
+    expect(sessionRules.size()).toBe(1)
     const denyService = new DenyAndContinueService({
       mode: 'both',
       escalation: { consecutive: 3, total: 20 },
@@ -128,6 +151,7 @@ describe('session lifecycle (M3)', () => {
       ctx
     )
     expect(denyService.getStats()).toEqual({ consecutive: 0, total: 0 })
+    expect(sessionRules.size()).toBe(0)
   })
 })
 

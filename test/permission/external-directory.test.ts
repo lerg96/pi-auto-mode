@@ -10,7 +10,10 @@ import {
   isOutsideCwd,
   resolveFsPath,
 } from '../../src/permission/external-directory.ts'
-import { SessionRules } from '../../src/permission/session-rules.ts'
+import {
+  SessionRules,
+  resetSessionRulesRegistry,
+} from '../../src/permission/session-rules.ts'
 import {
   addExternalDirAllow,
   isExternalDirAllowed,
@@ -734,7 +737,10 @@ describe('external_directory × git worktrees', () => {
 // ─── BUG 1: multi-intent bypass (session rules) ───
 
 describe('BUG 1: session rule per-path (no multi-intent bypass)', () => {
-  afterEach(() => resetExternalDirAllowlist())
+  afterEach(() => {
+    resetExternalDirAllowlist()
+    resetSessionRulesRegistry()
+  })
 
   it('session rule allowing one path does NOT silence validation for another outside path', () => {
     // BUG 1 regression: previously, `return undefined` inside the session-rule
@@ -977,7 +983,10 @@ describe('BUG 2: global allowlist (isExternalDirAllowed) is wired in', () => {
 // ─── Tool-scoped session rules ────────────────────────────────────────────
 
 describe('Tool-scoped session rules (external_directory:<toolName>)', () => {
-  afterEach(() => resetExternalDirAllowlist())
+  afterEach(() => {
+    resetExternalDirAllowlist()
+    resetSessionRulesRegistry()
+  })
 
   it('session rule external_directory:write allowing <dir>/**: fs intent with toolName=write inside <dir> is NOT reported', () => {
     const sessionRules = new SessionRules()

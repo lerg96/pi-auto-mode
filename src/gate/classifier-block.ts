@@ -20,6 +20,7 @@ export interface ClassifierBlockCtx {
   risk?: ClassifierResult['risk']
   startedAt: number
   rule?: { surface: string; pattern: string; reason?: string }
+  cwd?: string
 }
 
 function blockMessage(ctx: ClassifierBlockCtx): string {
@@ -128,7 +129,7 @@ async function classifierOverrideAsk(
       undefined,
       ctx.startedAt,
       undefined,
-      { askOrigin: 'classifier-override' }
+      { askOrigin: 'classifier-override', cwd: ctx.cwd }
     ))
   } catch (err) {
     if (err instanceof AskDeniedError) overrideDenied(deps, ctx, err)

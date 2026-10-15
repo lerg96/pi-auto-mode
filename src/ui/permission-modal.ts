@@ -9,6 +9,8 @@ import {
   SettingsList,
   type SettingItem,
   type SettingsListTheme,
+  matchesKey,
+  isKeyRelease,
 } from '@earendil-works/pi-tui'
 import type { CustomComponent, ExtensionUI } from '../pi-sdk.ts'
 import { emitUiPrompt } from './ui-prompt.ts'
@@ -40,6 +42,7 @@ function sanitizeForLabel(val: string, maxWidth = 100): string {
 type DecisionId =
   | 'allow'
   | 'allow_session'
+  | 'allow_permanent'
   | 'allow_dir_tool'
   | 'allow_dir_all'
   | 'deny'
@@ -48,6 +51,7 @@ type DecisionId =
 const ALL_DECISION_IDS: readonly string[] = [
   'allow',
   'allow_session',
+  'allow_permanent',
   'allow_dir_tool',
   'allow_dir_all',
   'deny',
@@ -56,7 +60,11 @@ const ALL_DECISION_IDS: readonly string[] = [
 
 function isDecisionId(v: unknown): boolean {
   if (typeof v !== 'string') return false
-  return ALL_DECISION_IDS.includes(v) || v.startsWith('allow_session:')
+  return (
+    ALL_DECISION_IDS.includes(v) ||
+    v.startsWith('allow_session:') ||
+    v.startsWith('allow_permanent:')
+  )
 }
 
 function buildSessionPatternItems(patterns: string[]): SettingItem[] {
@@ -353,7 +361,21 @@ function buildFooter(slTheme: SettingsListTheme, req?: AskRequest): string[] {
     req?.segmentIndex && req?.segmentTotal && req?.segmentTotal > 1
       ? `[${req.segmentIndex} of ${req.segmentTotal}] · `
       : ''
-  return [slTheme.hint(`${prefix}↑/↓ move · enter confirm · esc deny`)]
+  return [
+    slTheme.hint(
+      `${prefix}↑/↓ move · enter confirm · alt+enter permanent · esc deny`
+    ),
+  ]
+}
+
+function hasAltModifier(data: string): boolean {
+  if (data === '\x1b\r' || data === '\x1b\n') return true
+  const match = data.match(/;(\d+)(?::\d+)?[u~]/)
+  if (match) {
+    const mod = parseInt(match[1], 10)
+    return ((mod - 1) & 2) !== 0
+  }
+  return false
 }
 
 /** Inner list surface: the real SettingsList plus the optional slots of
@@ -365,6 +387,7 @@ interface InnerList {
   handleInput?(data: string): void
   invalidate?(): void
   dispose?(): void
+  selectedIndex?: number
 }
 
 /**
@@ -373,19 +396,63 @@ interface InnerList {
  * delegated to the inner list, so interaction is unchanged (↑/↓ +
  * Enter, Esc deny).
  */
-class ModalView implements CustomComponent {
+export class ModalView implements CustomComponent {
   private readonly inner: InnerList
+  readonly wantsKeyRelease = true
+  isAltActive = false
+  private readonly items: SettingItem[]
+  private readonly req?: AskRequest
+  private readonly onDecision?: (decision: AskDecision) => void
+
+  private readonly originalLabels = new Map<string, string>()
+  private readonly originalDescriptions = new Map<string, string | undefined>()
+
   constructor(
     private readonly header: string[],
     private readonly footer: string[],
-    list: SettingsList
+    list: SettingsList,
+    items: SettingItem[] = [],
+    req?: AskRequest,
+    onDecision?: (decision: AskDecision) => void
   ) {
     // SAFETY: the compile-time stub declares only the constructor + render,
     // but the real SettingsList (and the jest.mock replacement) implements
     // the full CustomComponent surface. Every use goes through optional
     // chaining, so a missing slot degrades to a no-op instead of a crash.
     this.inner = list as unknown as InnerList
+    this.items = items
+    this.req = req
+    this.onDecision = onDecision
   }
+
+  setAltActive(active: boolean): void {
+    if (this.isAltActive === active) return
+    this.isAltActive = active
+    for (const item of this.items) {
+      if (item.id === 'allow_session' || item.id.startsWith('allow_session:')) {
+        if (active) {
+          if (!this.originalLabels.has(item.id)) {
+            this.originalLabels.set(item.id, item.label)
+          }
+          if (!this.originalDescriptions.has(item.id)) {
+            this.originalDescriptions.set(item.id, item.description)
+          }
+          item.label = item.label.replace(
+            'Allow for session',
+            'Allow permanently'
+          )
+          item.description = 'Save to permissions in config — permanent allow.'
+        } else {
+          const origLabel = this.originalLabels.get(item.id)
+          const origDesc = this.originalDescriptions.get(item.id)
+          if (origLabel !== undefined) item.label = origLabel
+          if (origDesc !== undefined) item.description = origDesc
+        }
+      }
+    }
+    this.invalidate()
+  }
+
   render(width: number): string[] {
     return [
       ...this.header,
@@ -393,12 +460,66 @@ class ModalView implements CustomComponent {
       ...this.footer,
     ]
   }
+
   handleInput(data: string): void {
+    // Detect Alt modifier / keypress:
+    // Kitty protocol left/right alt keys: codepoints 57441 / 57442
+    if (data.includes('57441') || data.includes('57442')) {
+      if (isKeyRelease(data)) {
+        this.setAltActive(false)
+      } else {
+        this.setAltActive(true)
+      }
+      return
+    }
+
+    if (isKeyRelease(data)) {
+      return
+    }
+
+    // Detect Alt + Enter:
+    const isAltEnter =
+      matchesKey(data, 'alt+enter') ||
+      data === '\x1b\r' ||
+      data === '\x1b\n' ||
+      ((data.includes(';3u') || data.includes(';3~') || data.includes(';9u')) &&
+        (data.includes('13') ||
+          data.includes('\r') ||
+          matchesKey(data, 'enter'))) ||
+      (this.isAltActive && (matchesKey(data, 'enter') || data === '\r'))
+
+    if (isAltEnter) {
+      const selectedIndex =
+        (this.inner as { selectedIndex?: number }).selectedIndex ?? 0
+      const selected = this.items[selectedIndex]
+      let pattern = this.req?.value ?? ''
+      if (selected) {
+        if (selected.id.startsWith('allow_session:')) {
+          const idx = parseInt(selected.id.slice('allow_session:'.length), 10)
+          pattern = this.req?.sessionPatterns?.[idx] ?? this.req?.value ?? ''
+        } else if (selected.id === 'allow_session') {
+          pattern = this.req?.sessionPatterns?.[0] ?? this.req?.value ?? ''
+        } else if (selected.id.startsWith('allow_dir_')) {
+          pattern = this.req?.externalDir ?? this.req?.value ?? ''
+        } else if (selected.id === 'allow') {
+          pattern = this.req?.sessionPatterns?.[0] ?? this.req?.value ?? ''
+        }
+      }
+      this.onDecision?.({ decision: 'allow_permanent', pattern })
+      return
+    }
+
+    if (!hasAltModifier(data) && this.isAltActive) {
+      this.setAltActive(false)
+    }
+
     this.inner.handleInput?.(data)
   }
+
   invalidate(): void {
     this.inner.invalidate?.()
   }
+
   dispose(): void {
     this.inner.dispose?.()
   }
@@ -567,116 +688,143 @@ export function createModalAskResolver(
           (_tui, theme, _keybindings, closeOverlay) => {
             close = closeOverlay
             const slTheme = buildSettingsListTheme(theme as GlobalTheme)
+            const items = buildDecisionItems(
+              req.type ?? 'tool-permission',
+              req.sessionPatterns
+            )
+            let modalViewRef: ModalView | undefined
+            const list = new SettingsList(
+              items,
+              8,
+              slTheme,
+              async (itemId, _newValue) => {
+                // _newValue is the sentinel from `values` ('❯'); we
+                // dispatch on `id`, ignoring the value.
+                if (!isDecisionId(itemId)) {
+                  // Unknown row id → fail-closed.
+                  finish('deny')
+                  return
+                }
+                if (itemId.startsWith('allow_permanent:')) {
+                  const idx = parseInt(
+                    itemId.slice('allow_permanent:'.length),
+                    10
+                  )
+                  const pattern = req.sessionPatterns?.[idx] ?? req.value
+                  finish({ decision: 'allow_permanent', pattern })
+                  return
+                }
+                if (itemId === 'allow_permanent') {
+                  const pattern = req.sessionPatterns?.[0] ?? req.value
+                  finish({ decision: 'allow_permanent', pattern })
+                  return
+                }
+                if (itemId.startsWith('allow_session:')) {
+                  const idx = parseInt(
+                    itemId.slice('allow_session:'.length),
+                    10
+                  )
+                  const pattern = req.sessionPatterns?.[idx] ?? req.value
+                  if (modalViewRef?.isAltActive) {
+                    finish({ decision: 'allow_permanent', pattern })
+                    return
+                  }
+                  finish({ decision: 'allow_session', pattern })
+                  return
+                }
+                switch (itemId) {
+                  case 'allow':
+                    // The gate (gate.ts) treats 'allow' as grant-once and
+                    // does NOT persist anything in SessionRules. The
+                    // permission record lives only in the audit trail.
+                    finish('allow')
+                    return
+
+                  case 'allow_session':
+                    // The gate (gate.ts) records the session approval via
+                    // SessionRules.approveForSession(). The modal only
+                    // returns the decision; persistence is the gate's job.
+                    if (modalViewRef?.isAltActive) {
+                      const pattern = req.sessionPatterns?.[0] ?? req.value
+                      finish({ decision: 'allow_permanent', pattern })
+                      return
+                    }
+                    if (req.sessionPatterns && req.sessionPatterns.length > 0) {
+                      finish({
+                        decision: 'allow_session',
+                        pattern: req.sessionPatterns[0] ?? req.value,
+                      })
+                    } else {
+                      finish('allow_session')
+                    }
+                    return
+
+                  case 'allow_dir_tool':
+                    // External-directory: allow this directory for this tool.
+                    // The gate (gate.ts) persists the session rule after
+                    // receiving this decision id. The modal only returns it.
+                    finish('allow_dir_tool')
+                    return
+
+                  case 'allow_dir_all':
+                    // External-directory: allow this directory for all tools.
+                    // The gate (gate.ts) adds to the global allowlist after
+                    // receiving this decision id. The modal only returns it.
+                    finish('allow_dir_all')
+                    return
+
+                  case 'deny':
+                    finish('deny')
+                    return
+
+                  case 'deny_reason': {
+                    // H5: capture an optional reason and return it as a
+                    // structured denial. Sanitize to prevent directive
+                    // injection into the message the model will see.
+                    let reason: string | undefined
+                    try {
+                      reason = await ui.input(
+                        'Reason for denial',
+                        'Why is this denied? Shown to the model.',
+                        ms === -1 ? {} : { timeout: ms }
+                      )
+                    } catch {
+                      finish('deny')
+                      return
+                    }
+                    if (reason && reason.trim()) {
+                      finish({
+                        decision: 'deny',
+                        reason: sanitizeForLabel(reason, 200),
+                      })
+                    } else {
+                      finish('deny')
+                    }
+                    return
+                  }
+                }
+              },
+              // onCancel / Esc: Pi's own SettingsList calls onCancel on
+              // Esc. The render is now visible (overlay:false + correct
+              // SettingItem/theme shapes), so Esc-as-deny matches the
+              // expected UX: dismissing the prompt is a deny.
+              () => finish('deny')
+            )
             const view = new ModalView(
               buildHeader(
                 req,
                 slTheme,
                 via === 'parent-modal'
-                  ? 'raised by a child session (this one has no UI)'
+                  ? '[child session: no direct UI]'
                   : undefined
               ),
               buildFooter(slTheme, req),
-              new SettingsList(
-                buildDecisionItems(
-                  req.type ?? 'tool-permission',
-                  req.sessionPatterns
-                ),
-                8,
-                slTheme,
-                async (itemId, _newValue) => {
-                  // _newValue is the sentinel from `values` ('❯'); we
-                  // dispatch on `id`, ignoring the value.
-                  if (!isDecisionId(itemId)) {
-                    // Unknown row id → fail-closed.
-                    finish('deny')
-                    return
-                  }
-                  if (itemId.startsWith('allow_session:')) {
-                    const idx = parseInt(
-                      itemId.slice('allow_session:'.length),
-                      10
-                    )
-                    const pattern = req.sessionPatterns?.[idx] ?? req.value
-                    finish({ decision: 'allow_session', pattern })
-                    return
-                  }
-                  switch (itemId) {
-                    case 'allow':
-                      // The gate (gate.ts) treats 'allow' as grant-once and
-                      // does NOT persist anything in SessionRules. The
-                      // permission record lives only in the audit trail.
-                      finish('allow')
-                      return
-
-                    case 'allow_session':
-                      // The gate (gate.ts) records the session approval via
-                      // SessionRules.approveForSession(). The modal only
-                      // returns the decision; persistence is the gate's job.
-                      if (
-                        req.sessionPatterns &&
-                        req.sessionPatterns.length > 0
-                      ) {
-                        finish({
-                          decision: 'allow_session',
-                          pattern: req.sessionPatterns[0] ?? req.value,
-                        })
-                      } else {
-                        finish('allow_session')
-                      }
-                      return
-
-                    case 'allow_dir_tool':
-                      // External-directory: allow this directory for this tool.
-                      // The gate (gate.ts) persists the session rule after
-                      // receiving this decision id. The modal only returns it.
-                      finish('allow_dir_tool')
-                      return
-
-                    case 'allow_dir_all':
-                      // External-directory: allow this directory for all tools.
-                      // The gate (gate.ts) adds to the global allowlist after
-                      // receiving this decision id. The modal only returns it.
-                      finish('allow_dir_all')
-                      return
-
-                    case 'deny':
-                      finish('deny')
-                      return
-
-                    case 'deny_reason': {
-                      // H5: capture an optional reason and return it as a
-                      // structured denial. Sanitize to prevent directive
-                      // injection into the message the model will see.
-                      let reason: string | undefined
-                      try {
-                        reason = await ui.input(
-                          'Reason for denial',
-                          'Why is this denied? Shown to the model.',
-                          ms === -1 ? {} : { timeout: ms }
-                        )
-                      } catch {
-                        finish('deny')
-                        return
-                      }
-                      if (reason && reason.trim()) {
-                        finish({
-                          decision: 'deny',
-                          reason: sanitizeForLabel(reason, 200),
-                        })
-                      } else {
-                        finish('deny')
-                      }
-                      return
-                    }
-                  }
-                },
-                // onCancel / Esc: Pi's own SettingsList calls onCancel on
-                // Esc. The render is now visible (overlay:false + correct
-                // SettingItem/theme shapes), so Esc-as-deny matches the
-                // expected UX: dismissing the prompt is a deny.
-                () => finish('deny')
-              )
+              list,
+              items,
+              req,
+              finish
             )
+            modalViewRef = view
             return view
           },
           // overlay:false is critical — overlay:true makes the modal close

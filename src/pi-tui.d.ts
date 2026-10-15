@@ -48,7 +48,12 @@ declare module '@earendil-works/pi-tui' {
    * The actual `render` body is supplied by the runtime; only the signature
    * matters for the stub.
    */
+  export function matchesKey(data: string, keyId: string): boolean
+  export function isKeyRelease(data: string): boolean
+
   export class SettingsList {
+    selectedIndex: number
+    items: SettingItem[]
     constructor(
       items: SettingItem[],
       pageLength: number,
@@ -57,5 +62,6 @@ declare module '@earendil-works/pi-tui' {
       onCancel: () => void
     )
     render(width: number): string[]
+    handleInput?(data: string): void
   }
 }

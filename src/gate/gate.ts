@@ -51,6 +51,7 @@ interface GateCtx {
   cfg: Config
   intents: AccessIntent[]
   fullCommand?: string
+  cwd?: string
 }
 
 interface CascadeState {
@@ -96,7 +97,7 @@ async function handleUnknownToolIntent(
       fullCommand,
       startedAt,
       undefined,
-      { askOrigin: 'unknown-tool' }
+      { askOrigin: 'unknown-tool', cwd: ctx.cwd }
     )
     emit(deps.hooks, toolName, value, 'allow', 'unknown_tool_ask', {
       requestId,
@@ -185,6 +186,7 @@ function applyExternalScope(
   const externalVerdict = evaluateExternalDirectory(cfg, intents, {
     toolName,
     sessionRules: deps.sessionRules,
+    cwd: ctx.cwd,
   })
   const externalDirPath =
     externalVerdict === undefined ? undefined : externalVerdict.absPath
@@ -299,6 +301,14 @@ async function handleDenyAskUser(
 ): Promise<void> {
   const { deps, toolName, fullCommand, startedAt } = ctx
   const { matchedSurface, matchedValue, ruleReason } = state
+  const isShell =
+    matchedSurface === 'shell' ||
+    ctx.intents.some((i) => i.surface === 'shell') ||
+    toolName === 'bash' ||
+    toolName === 'powershell'
+  const sessionPatterns = isShell
+    ? buildSessionPatterns(matchedValue)
+    : undefined
   const detail: DetailFn = (strategy) =>
     buildDecisionDetail({
       toolName,
@@ -313,7 +323,7 @@ async function handleDenyAskUser(
       strategy,
     })
   try {
-    const { requestId, verdict } = await resolveAsk(
+    const { requestId, verdict, via } = await resolveAsk(
       matchedSurface,
       matchedValue,
       undefined,
@@ -323,12 +333,16 @@ async function handleDenyAskUser(
       fullCommand,
       startedAt,
       undefined,
-      { askOrigin: 'deny-override' }
+      {
+        askOrigin: 'deny-override',
+        sessionPatterns,
+        cwd: ctx.cwd,
+      }
     )
     emit(deps.hooks, matchedSurface, matchedValue, 'allow', 'permission_ask', {
       requestId,
-      decidedBy: 'user',
-      via: 'modal',
+      decidedBy: askActor(via),
+      via,
       ...verdictExtra(verdict),
       ...detail('ask-user'),
     })
@@ -387,6 +401,7 @@ async function handleAskPath(
         pattern: state.rulePattern,
         reason: state.ruleReason,
       },
+      cwd: ctx.cwd,
     })
     if (proceeded) return
     throw new Error(
@@ -464,6 +479,7 @@ function evaluateSegmentAction(
   const extVerdict = evaluateExternalDirectory(ctx.cfg, [intent], {
     toolName: ctx.toolName,
     sessionRules: ctx.deps.sessionRules,
+    cwd: ctx.cwd,
   })
   if (extVerdict) {
     const rank = { allow: 0, ask: 1, deny: 2 } as const
@@ -570,6 +586,7 @@ async function promptAskMultiSegmentShell(
           segmentIndex: k,
           segmentTotal: totalAsks,
           askOrigin: segAskOrigin,
+          cwd: ctx.cwd,
         }
       )
       emit(deps.hooks, seg.surface, seg.value, 'allow', resolution, {
@@ -620,7 +637,8 @@ async function promptAskAfterClassifier(
   const isShell =
     askSurface === 'shell' ||
     ctx.intents.some((i) => i.surface === 'shell') ||
-    toolName === 'bash'
+    toolName === 'bash' ||
+    toolName === 'powershell'
   const sessionPatterns = isShell ? buildSessionPatterns(askValue) : undefined
 
   const askOrigin: AskOrigin = externalDirAsk?.isExternalDir
@@ -643,6 +661,7 @@ async function promptAskAfterClassifier(
       {
         sessionPatterns,
         askOrigin,
+        cwd: ctx.cwd,
       }
     )
     emit(deps.hooks, askSurface, askValue, 'allow', resolution, {
@@ -666,6 +685,16 @@ export async function gateToolCall(
   input: Record<string, unknown>,
   deps: GateDeps
 ): Promise<void> {
+  const rawCwd =
+    typeof input.cwd === 'string' && input.cwd.trim().length > 0
+      ? input.cwd.trim()
+      : typeof input.workdir === 'string' && input.workdir.trim().length > 0
+        ? input.workdir.trim()
+        : typeof input.workingDirectory === 'string' &&
+            input.workingDirectory.trim().length > 0
+          ? input.workingDirectory.trim()
+          : undefined
+
   const ctx: GateCtx = {
     toolName,
     input,
@@ -677,6 +706,7 @@ export async function gateToolCall(
       typeof input.command === 'string' && input.command.length > 0
         ? input.command
         : undefined,
+    cwd: rawCwd,
   }
 
   // Unknown tools (surface === 'denied') are visible and ask the user

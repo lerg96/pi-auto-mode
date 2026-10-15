@@ -10,6 +10,7 @@ import { getAskResolver, normalizeAskDecision, type AskOrigin } from './ask.ts'
 import { emit, type AskAudit } from './ask-audit.ts'
 import { buildDecisionDetail } from './decision-detail.ts'
 import type { GateDeps } from './gate.ts'
+import { persistPermanentAllow } from '../config/permanent-allow.ts'
 
 export class AskDeniedError extends Error {
   readonly audit: AskAudit
@@ -24,10 +25,20 @@ export class AskDeniedError extends Error {
 // directory-specific approvals. 'session' (no modal shown) maps to NO
 // userVerdict key at all.
 export type AskVerdict =
-  'allow' | 'allow_session' | 'allow_dir_tool' | 'allow_dir_all' | 'session'
+  | 'allow'
+  | 'allow_session'
+  | 'allow_permanent'
+  | 'allow_dir_tool'
+  | 'allow_dir_all'
+  | 'session'
 
 export function verdictExtra(verdict: AskVerdict): {
-  userVerdict?: 'allow' | 'allow_session' | 'allow_dir_tool' | 'allow_dir_all'
+  userVerdict?:
+    | 'allow'
+    | 'allow_session'
+    | 'allow_permanent'
+    | 'allow_dir_tool'
+    | 'allow_dir_all'
 } {
   return verdict === 'session' ? {} : { userVerdict: verdict }
 }
@@ -77,7 +88,16 @@ export interface ExternalDirAsk {
 }
 
 type AllowDecision =
-  'allow' | 'allow_session' | 'allow_dir_tool' | 'allow_dir_all'
+  | 'allow'
+  | 'allow_session'
+  | 'allow_permanent'
+  | 'allow_dir_tool'
+  | 'allow_dir_all'
+
+function normalizePatternOrValue(str: string): string {
+  const collapsed = str.replace(/["']/g, '').replace(/\s+/g, ' ').trim()
+  return process.platform === 'win32' ? collapsed.toLowerCase() : collapsed
+}
 
 // Session allow short-circuit (Bug A fix)
 // Check if there's a session allow rule matching this surface and value
@@ -98,11 +118,31 @@ export function trySessionAllow(
     ) {
       return false
     }
-    return r.isExact
-      ? process.platform === 'win32'
+    const isWin = process.platform === 'win32'
+    if (r.isExact) {
+      const exactMatch = isWin
         ? r.pattern.toLowerCase() === value.toLowerCase()
         : r.pattern === value
-      : sessionPatternMatches(r.pattern, value)
+      const normMatch =
+        normalizePatternOrValue(r.pattern) === normalizePatternOrValue(value)
+      return (
+        exactMatch ||
+        normMatch ||
+        sessionPatternMatches(r.pattern, value) ||
+        sessionPatternMatches(
+          normalizePatternOrValue(r.pattern),
+          normalizePatternOrValue(value)
+        )
+      )
+    }
+    return (
+      sessionPatternMatches(r.pattern, value) ||
+      sessionPatternMatches(
+        normalizePatternOrValue(r.pattern),
+        normalizePatternOrValue(value)
+      ) ||
+      normalizePatternOrValue(r.pattern) === normalizePatternOrValue(value)
+    )
   })
   if (!sessionApproved) return false
   emit(deps.hooks, surface, value, 'allow', 'session_allow', {
@@ -142,6 +182,22 @@ function applyAllowDecision(
     deps.sessionRules.approveForSession(surface, safePattern, 'allow', isExact)
     return 'allow_session'
   }
+  if (decision === 'allow_permanent') {
+    const safePattern =
+      chosenPattern ??
+      (externalDir?.isExternalDir && externalDir.externalGrantDir
+        ? `${externalDir.externalGrantDir}/**`
+        : value)
+    const isExact = chosenPattern ? chosenPattern === value : true
+    deps.sessionRules.approveForSession(surface, safePattern, 'allow', isExact)
+    persistPermanentAllow({
+      surface: externalDir?.isExternalDir ? 'external_directory' : surface,
+      pattern: safePattern,
+      toolName,
+      isExternalDir: externalDir?.isExternalDir,
+    })
+    return 'allow_permanent'
+  }
   if (decision === 'allow_dir_tool') {
     if (externalDir?.externalGrantDir && toolName !== undefined) {
       deps.sessionRules.approveForSession(
@@ -163,6 +219,7 @@ export interface ResolveAskExtra {
   segmentIndex?: number
   segmentTotal?: number
   askOrigin?: AskOrigin
+  cwd?: string
 }
 
 export async function resolveAsk(
@@ -213,6 +270,7 @@ export async function resolveAsk(
     segmentIndex: extra?.segmentIndex,
     segmentTotal: extra?.segmentTotal,
     askOrigin,
+    cwd: extra?.cwd,
   })
   const { decision, reason, via, pattern } = normalizeAskDecision(res)
 

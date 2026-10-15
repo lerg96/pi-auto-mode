@@ -28,7 +28,33 @@ var captures: {
 captures = { onChange: undefined, onCancel: undefined, items: undefined }
 
 jest.mock('@earendil-works/pi-tui', () => ({
+  matchesKey: (data: string, keyId: string) => {
+    if (keyId === 'alt+enter') {
+      return (
+        data === '\x1b\r' ||
+        data === '\x1b\n' ||
+        data.includes(';3u') ||
+        data.includes(';3~') ||
+        data.includes(';9u')
+      )
+    }
+    return false
+  },
+  isKeyRelease: (data: string) => {
+    return (
+      data.includes(':3u') ||
+      data.includes(':3~') ||
+      data.includes(':3A') ||
+      data.includes(':3B') ||
+      data.includes(':3C') ||
+      data.includes(':3D') ||
+      data.includes(':3H') ||
+      data.includes(':3F')
+    )
+  },
   SettingsList: class {
+    selectedIndex = 0
+    items: SettingItem[]
     constructor(
       items: SettingItem[],
       pageLength: number,
@@ -36,11 +62,22 @@ jest.mock('@earendil-works/pi-tui', () => ({
       onChange: (itemId: string, newValue: string) => void | Promise<void>,
       onCancel: () => void
     ) {
+      this.items = items
       captures.items = items
       captures.pageLength = pageLength
       captures.theme = theme
       captures.onChange = onChange
       captures.onCancel = onCancel
+    }
+    handleInput(data: string) {
+      if (data === '\x1b[A' || data === 'up') {
+        this.selectedIndex = Math.max(0, this.selectedIndex - 1)
+      } else if (data === '\x1b[B' || data === 'down') {
+        this.selectedIndex = Math.min(
+          this.items.length - 1,
+          this.selectedIndex + 1
+        )
+      }
     }
   },
 }))
@@ -845,6 +882,130 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
     expect(await promise).toEqual({ decision: 'allow', via: 'parent-modal' })
   })
 
+  it('child-session (via === parent-modal) external directory: displays Outside working directory, child badge, why, cwd, path, and 3 option labels', async () => {
+    const pending = makeFakeUi(jest.fn(() => new Promise<undefined>(() => {})))
+    asBorrowedSession(pending)
+
+    const resolver = makeResolver()
+    const promise = resolver({
+      type: 'external-directory',
+      surface: 'fs',
+      value: '/outside/workspace/secret.env',
+      externalDir: '/outside/workspace',
+      tool: 'read',
+      cwd: '/home/user/project',
+      askOrigin: 'external-directory',
+      rule: { surface: 'external_directory', pattern: '/outside/workspace/**' },
+    })
+
+    expect(pending.custom).toHaveBeenCalledTimes(1)
+    const render = pending.custom.mock.calls[0]?.[0] as RenderFn
+    const view = render(
+      undefined,
+      fakeGlobalTheme,
+      undefined,
+      () => {}
+    ) as unknown as { render(width: number): string[] }
+    const text = view.render(80).join('\n')
+
+    expect(text).toContain('Outside working directory')
+    expect(text).toContain('[child session: no direct UI]')
+    expect(text).toContain(
+      'why         : this call touches a path outside the working directory'
+    )
+    expect(text).toContain('tool        : read')
+    expect(text).toContain('cwd         : /home/user/project')
+    expect(text).toContain('path        : /outside/workspace')
+
+    const labels = captures.items?.map((i) => i.label)
+    expect(labels).toContain('Allow this path once')
+    expect(labels).toContain('Allow path for this tool')
+    expect(labels).toContain('Allow path for all tools')
+
+    const onChange = captures.onChange
+    expect(typeof onChange).toBe('function')
+    onChange!('allow', '❯')
+    expect(await promise).toEqual({ decision: 'allow', via: 'parent-modal' })
+  })
+
+  it('child-session (via === parent-modal) shell command: displays Command approval, child badge, why, command, and session patterns', async () => {
+    const pending = makeFakeUi(jest.fn(() => new Promise<undefined>(() => {})))
+    asBorrowedSession(pending)
+
+    const resolver = makeResolver()
+    const promise = resolver({
+      surface: 'shell',
+      tool: 'bash',
+      value: 'git push origin main',
+      askOrigin: 'rule',
+      sessionPatterns: ['git push origin *', 'git push *', 'git *'],
+    })
+
+    expect(pending.custom).toHaveBeenCalledTimes(1)
+    const render = pending.custom.mock.calls[0]?.[0] as RenderFn
+    const view = render(
+      undefined,
+      fakeGlobalTheme,
+      undefined,
+      () => {}
+    ) as unknown as { render(width: number): string[] }
+    const text = view.render(80).join('\n')
+
+    expect(text).toContain('Command approval')
+    expect(text).toContain('[child session: no direct UI]')
+    expect(text).toContain(
+      'why         : a permission rule requires confirmation'
+    )
+    expect(text).toContain('command     : git push origin main')
+
+    const labels = captures.items?.map((i) => i.label)
+    expect(labels).toContain('Allow')
+    expect(labels).toContain('Allow for session "git push origin *"')
+    expect(labels).toContain('Allow for session "git push *"')
+    expect(labels).toContain('Allow for session "git *"')
+    expect(labels).toContain('Deny')
+
+    const onChange = captures.onChange
+    expect(typeof onChange).toBe('function')
+    onChange!('allow', '❯')
+    expect(await promise).toEqual({ decision: 'allow', via: 'parent-modal' })
+  })
+
+  it('child-session (via === parent-modal) non-shell tool: displays Tool approval, child badge, why', async () => {
+    const pending = makeFakeUi(jest.fn(() => new Promise<undefined>(() => {})))
+    asBorrowedSession(pending)
+
+    const resolver = makeResolver()
+    const promise = resolver({
+      surface: 'fs',
+      tool: 'read',
+      value: '/inside/workspace/file.txt',
+      askOrigin: 'rule',
+    })
+
+    expect(pending.custom).toHaveBeenCalledTimes(1)
+    const render = pending.custom.mock.calls[0]?.[0] as RenderFn
+    const view = render(
+      undefined,
+      fakeGlobalTheme,
+      undefined,
+      () => {}
+    ) as unknown as { render(width: number): string[] }
+    const text = view.render(80).join('\n')
+
+    expect(text).toContain('Tool approval')
+    expect(text).toContain('[child session: no direct UI]')
+    expect(text).toContain(
+      'why         : a permission rule requires confirmation'
+    )
+    expect(text).toContain('tool        : read')
+
+    const onChange = captures.onChange
+    expect(typeof onChange).toBe('function')
+    onChange!('allow', '❯')
+    expect(await promise).toEqual({ decision: 'allow', via: 'parent-modal' })
+  })
+
   // ─── Plazo propio para prompts de sub-sesión ─────────────────
   it('uses subagentModalTimeoutMs (not modalTimeoutMs) for a borrowed prompt', async () => {
     jest.useFakeTimers()
@@ -1235,7 +1396,9 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       })
       const text = lines.join('\n')
       expect(text).toContain('Command approval [1 of 2]')
-      expect(text).toContain('[1 of 2] · ↑/↓ move · enter confirm · esc deny')
+      expect(text).toContain(
+        '[1 of 2] · ↑/↓ move · enter confirm · alt+enter permanent · esc deny'
+      )
       settle('allow')
       expect(await promise).toBe('allow')
     })
@@ -1250,9 +1413,160 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       const text = lines.join('\n')
       expect(text).not.toContain('[1 of 1]')
       expect(text).toContain('Command approval')
-      expect(text).toContain('↑/↓ move · enter confirm · esc deny')
+      expect(text).toContain(
+        '↑/↓ move · enter confirm · alt+enter permanent · esc deny'
+      )
       settle('allow')
       expect(await promise).toBe('allow')
+    })
+  })
+
+  describe('Alt modifier and allow permanently', () => {
+    it('toggles labels between Allow for session and Allow permanently on Alt press and release', async () => {
+      const resolver = makeResolver()
+      const promise = resolver({ surface: 'shell', value: 'git fetch' })
+      const view = renderCapture!(
+        undefined,
+        fakeGlobalTheme,
+        undefined,
+        () => {}
+      ) as unknown as { handleInput(data: string): void }
+
+      expect(captures.items![1].label).toBe('Allow for session')
+      expect(captures.items![1].description).toContain(
+        'Remember for this session'
+      )
+
+      // Alt keypress (Kitty codepoint 57441)
+      view.handleInput('\x1b[57441u')
+      expect(captures.items![1].label).toBe('Allow permanently')
+      expect(captures.items![1].description).toBe(
+        'Save to permissions in config — permanent allow.'
+      )
+
+      // Alt key release (Kitty event type 3)
+      view.handleInput('\x1b[57441;1:3u')
+      expect(captures.items![1].label).toBe('Allow for session')
+      expect(captures.items![1].description).toContain(
+        'Remember for this session'
+      )
+
+      choose('allow')
+      await promise
+    })
+
+    it('toggles all session pattern labels on Alt press', async () => {
+      const resolver = makeResolver()
+      const promise = resolver({
+        surface: 'shell',
+        value: 'npm test',
+        sessionPatterns: ['npm test', 'npm *'],
+      })
+      const view = renderCapture!(
+        undefined,
+        fakeGlobalTheme,
+        undefined,
+        () => {}
+      ) as unknown as { handleInput(data: string): void }
+
+      expect(captures.items![1].label).toBe('Allow for session "npm test"')
+      expect(captures.items![2].label).toBe('Allow for session "npm *"')
+
+      // Alt keypress
+      view.handleInput('\x1b[57441u')
+      expect(captures.items![1].label).toBe('Allow permanently "npm test"')
+      expect(captures.items![2].label).toBe('Allow permanently "npm *"')
+
+      // Alt release
+      view.handleInput('\x1b[57441;1:3u')
+      expect(captures.items![1].label).toBe('Allow for session "npm test"')
+      expect(captures.items![2].label).toBe('Allow for session "npm *"')
+
+      choose('allow')
+      await promise
+    })
+
+    it('returns allow_permanent when Alt + Enter is pressed', async () => {
+      const resolver = makeResolver()
+      const promise = resolver({ surface: 'shell', value: 'cargo build' })
+      const view = renderCapture!(
+        undefined,
+        fakeGlobalTheme,
+        undefined,
+        () => {}
+      ) as unknown as { handleInput(data: string): void }
+
+      view.handleInput('down') // move to allow_session
+      view.handleInput('\x1b\r') // Alt + Enter
+
+      expect(await promise).toEqual({
+        decision: 'allow_permanent',
+        pattern: 'cargo build',
+      })
+    })
+
+    it('returns allow_permanent with selected sessionPattern when Alt + Enter is pressed', async () => {
+      const resolver = makeResolver()
+      const promise = resolver({
+        surface: 'shell',
+        value: 'git push origin main',
+        sessionPatterns: ['git push origin main', 'git push *', 'git *'],
+      })
+      const view = renderCapture!(
+        undefined,
+        fakeGlobalTheme,
+        undefined,
+        () => {}
+      ) as unknown as { handleInput(data: string): void }
+
+      view.handleInput('down') // index 1: allow_session:0
+      view.handleInput('down') // index 2: allow_session:1 ("git push *")
+      view.handleInput('\x1b[13;3u') // Kitty Alt + Enter
+
+      expect(await promise).toEqual({
+        decision: 'allow_permanent',
+        pattern: 'git push *',
+      })
+    })
+
+    it('returns allow_permanent when Enter is pressed while Alt is active', async () => {
+      const resolver = makeResolver()
+      const promise = resolver({ surface: 'shell', value: 'pnpm test' })
+      const view = renderCapture!(
+        undefined,
+        fakeGlobalTheme,
+        undefined,
+        () => {}
+      ) as unknown as { handleInput(data: string): void }
+
+      view.handleInput('down') // move to allow_session
+      view.handleInput('\x1b[57441u') // Alt press
+      view.handleInput('\r') // Enter while Alt is active
+
+      expect(await promise).toEqual({
+        decision: 'allow_permanent',
+        pattern: 'pnpm test',
+      })
+    })
+
+    it('resets Alt active state if a non-alt key is pressed without Alt modifier', async () => {
+      const resolver = makeResolver()
+      const promise = resolver({ surface: 'shell', value: 'echo 123' })
+      const view = renderCapture!(
+        undefined,
+        fakeGlobalTheme,
+        undefined,
+        () => {}
+      ) as unknown as { handleInput(data: string): void }
+
+      view.handleInput('\x1b[57441u') // Alt press
+      expect(captures.items![1].label).toBe('Allow permanently')
+
+      view.handleInput('a') // Non-alt key pressed without Alt
+      expect(captures.items![1].label).toBe('Allow for session')
+
+      choose('allow')
+      await promise
     })
   })
 })

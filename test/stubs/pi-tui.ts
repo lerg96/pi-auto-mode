@@ -27,6 +27,32 @@ export interface SettingItem {
   ) => unknown
 }
 
+export function matchesKey(data: string, keyId: string): boolean {
+  if (keyId === 'alt+enter') {
+    return (
+      data === '\x1b\r' ||
+      data === '\x1b\n' ||
+      data.includes(';3u') ||
+      data.includes(';3~') ||
+      data.includes(';9u')
+    )
+  }
+  return false
+}
+
+export function isKeyRelease(data: string): boolean {
+  return (
+    data.includes(':3u') ||
+    data.includes(':3~') ||
+    data.includes(':3A') ||
+    data.includes(':3B') ||
+    data.includes(':3C') ||
+    data.includes(':3D') ||
+    data.includes(':3H') ||
+    data.includes(':3F')
+  )
+}
+
 /**
  * Stub of `SettingsList` that satisfies the `CustomComponent` contract the
  * `ctx.ui.custom()` factory must return (see `src/pi-sdk.d.ts`). The real
@@ -37,14 +63,19 @@ export interface SettingItem {
  * methods are never invoked.
  */
 export class SettingsList implements CustomComponent {
+  selectedIndex = 0
+  items: SettingItem[]
   constructor(
-    _items: SettingItem[],
+    items: SettingItem[],
     _pageLength: number,
     _theme: SettingsListTheme,
     _onChange: (id: string, newValue: string) => void | Promise<void>,
     _onCancel: () => void
-  ) {}
+  ) {
+    this.items = items
+  }
   render(_width: number): string[] {
     return []
   }
+  handleInput?(_data: string): void {}
 }

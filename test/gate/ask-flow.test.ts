@@ -6,8 +6,16 @@ import {
 } from '../../src/gate/ask-flow.ts'
 import type { GateDeps } from '../../src/gate/gate.ts'
 import { setAskResolver, defaultAskResolver } from '../../src/gate/ask.ts'
-import { SessionRules } from '../../src/permission/session-rules.ts'
+import {
+  SessionRules,
+  resetSessionRulesRegistry,
+} from '../../src/permission/session-rules.ts'
 import type { DenyAndContinueService } from '../../src/deny/deny-service.ts'
+import { persistPermanentAllow } from '../../src/config/permanent-allow.ts'
+
+jest.mock('../../src/config/permanent-allow.ts', () => ({
+  persistPermanentAllow: jest.fn(),
+}))
 
 function makeDeps(): {
   deps: GateDeps
@@ -28,12 +36,17 @@ function makeDeps(): {
 
 beforeEach(() => {
   setAskResolver(defaultAskResolver)
+  resetSessionRulesRegistry()
+  jest.clearAllMocks()
 })
 
 describe('verdictExtra', () => {
   it('omits userVerdict for session (no modal shown)', () => {
     expect(verdictExtra('session')).toEqual({})
     expect(verdictExtra('allow')).toEqual({ userVerdict: 'allow' })
+    expect(verdictExtra('allow_permanent')).toEqual({
+      userVerdict: 'allow_permanent',
+    })
     expect(verdictExtra('allow_dir_all')).toEqual({
       userVerdict: 'allow_dir_all',
     })
@@ -187,5 +200,124 @@ describe('resolveAsk', () => {
       { isExternalDir: true, externalDirPath: '/outside/file.txt' }
     )
     expect(capturedOrigin).toBe('external-directory')
+  })
+
+  it('threads cwd from extra through to AskRequest', async () => {
+    const { deps } = makeDeps()
+    let capturedCwd: string | undefined
+    setAskResolver(async (req) => {
+      capturedCwd = req.cwd
+      return 'allow'
+    })
+    await resolveAsk(
+      'shell',
+      'echo hi',
+      undefined,
+      deps,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { cwd: '/custom/working/dir' }
+    )
+    expect(capturedCwd).toBe('/custom/working/dir')
+  })
+
+  it('trySessionAllow matches commands with quotes when rule was approved without quotes', async () => {
+    const { deps, onContinueSucceeded } = makeDeps()
+    deps.sessionRules.approveForSession('shell', 'cat file.txt', 'allow', true)
+    const res = await resolveAsk('shell', 'cat "file.txt"', undefined, deps)
+    expect(res.verdict).toBe('session')
+    expect(res.via).toBe('session-rules')
+    expect(onContinueSucceeded).toHaveBeenCalledTimes(1)
+  })
+
+  it('trySessionAllow matches commands without quotes when rule was approved with quotes', async () => {
+    const { deps, onContinueSucceeded } = makeDeps()
+    deps.sessionRules.approveForSession(
+      'shell',
+      'cat "file.txt"',
+      'allow',
+      true
+    )
+    const res = await resolveAsk('shell', 'cat file.txt', undefined, deps)
+    expect(res.verdict).toBe('session')
+    expect(res.via).toBe('session-rules')
+    expect(onContinueSucceeded).toHaveBeenCalledTimes(1)
+  })
+
+  it('trySessionAllow collapses whitespace when matching', async () => {
+    const { deps, onContinueSucceeded } = makeDeps()
+    deps.sessionRules.approveForSession(
+      'shell',
+      'cat   file.txt',
+      'allow',
+      true
+    )
+    const res = await resolveAsk('shell', 'cat file.txt', undefined, deps)
+    expect(res.verdict).toBe('session')
+    expect(res.via).toBe('session-rules')
+    expect(onContinueSucceeded).toHaveBeenCalledTimes(1)
+  })
+
+  it('trySessionAllow shares session approval across different deps instances', async () => {
+    const { deps: deps1 } = makeDeps()
+    const { deps: deps2, onContinueSucceeded } = makeDeps()
+    deps1.sessionRules.approveForSession('shell', 'git status', 'allow', true)
+    const res = await resolveAsk('shell', 'git status', undefined, deps2)
+    expect(res.verdict).toBe('session')
+    expect(res.via).toBe('session-rules')
+    expect(onContinueSucceeded).toHaveBeenCalledTimes(1)
+  })
+
+  it('persists and approves for session on allow_permanent', async () => {
+    const { deps, onContinueSucceeded } = makeDeps()
+    setAskResolver(async () => 'allow_permanent')
+    const res = await resolveAsk('shell', 'git log', undefined, deps)
+    expect(res.verdict).toBe('allow_permanent')
+    expect(onContinueSucceeded).toHaveBeenCalledTimes(1)
+    expect(persistPermanentAllow).toHaveBeenCalledWith({
+      surface: 'shell',
+      pattern: 'git log',
+      toolName: undefined,
+      isExternalDir: undefined,
+    })
+    const rules = deps.sessionRules
+      .snapshot()
+      .filter((r) => r.origin === 'session' && r.action === 'allow')
+    const rule = rules.find(
+      (r) => r.surface === 'shell' && r.pattern === 'git log'
+    )
+    expect(rule).toBeDefined()
+  })
+
+  it('persists and approves pattern for session on object allow_permanent', async () => {
+    const { deps, onContinueSucceeded } = makeDeps()
+    setAskResolver(async () => ({
+      decision: 'allow_permanent',
+      pattern: 'git *',
+    }))
+    const res = await resolveAsk(
+      'shell',
+      'git commit -m "feat"',
+      undefined,
+      deps
+    )
+    expect(res.verdict).toBe('allow_permanent')
+    expect(onContinueSucceeded).toHaveBeenCalledTimes(1)
+    expect(persistPermanentAllow).toHaveBeenCalledWith({
+      surface: 'shell',
+      pattern: 'git *',
+      toolName: undefined,
+      isExternalDir: undefined,
+    })
+    const rules = deps.sessionRules
+      .snapshot()
+      .filter((r) => r.origin === 'session' && r.action === 'allow')
+    const rule = rules.find(
+      (r) => r.surface === 'shell' && r.pattern === 'git *'
+    )
+    expect(rule).toBeDefined()
   })
 })

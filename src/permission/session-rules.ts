@@ -8,31 +8,69 @@ interface PatternCandidate {
   isExact?: boolean
 }
 
+const REGISTRY_KEY = Symbol.for('pi-auto-mode:session-rules')
+
+interface SessionRulesRegistry {
+  rules: SessionRule[]
+}
+
+function registry(): SessionRulesRegistry {
+  const slot = globalThis as unknown as Record<
+    symbol,
+    SessionRulesRegistry | undefined
+  >
+  let reg = slot[REGISTRY_KEY]
+  if (!reg) {
+    reg = { rules: [] }
+    slot[REGISTRY_KEY] = reg
+  }
+  return reg
+}
+
+/** Test seam: forget the registry so tests start clean. */
+export function resetSessionRulesRegistry(): void {
+  const slot = globalThis as unknown as Record<
+    symbol,
+    SessionRulesRegistry | undefined
+  >
+  delete slot[REGISTRY_KEY]
+}
+
+function normalizePattern(p: string): string {
+  const collapsed = p.replace(/["']/g, '').replace(/\s+/g, ' ').trim()
+  return process.platform === 'win32' ? collapsed.toLowerCase() : collapsed
+}
+
 function patternCovers(
   broad: PatternCandidate,
   narrow: PatternCandidate
 ): boolean {
+  const isWin = process.platform === 'win32'
+  const broadExact = isWin ? broad.pattern.toLowerCase() : broad.pattern
+  const narrowExact = isWin ? narrow.pattern.toLowerCase() : narrow.pattern
+  const exactEq = broadExact === narrowExact
+  const normEq =
+    normalizePattern(broad.pattern) === normalizePattern(narrow.pattern)
+
   if (broad.isExact) {
     if (!narrow.isExact) return false
-    return process.platform === 'win32'
-      ? broad.pattern.toLowerCase() === narrow.pattern.toLowerCase()
-      : broad.pattern === narrow.pattern
+    return exactEq || normEq
   }
-  if (
-    process.platform === 'win32'
-      ? broad.pattern.toLowerCase() === narrow.pattern.toLowerCase()
-      : broad.pattern === narrow.pattern
-  ) {
+  if (exactEq || normEq) {
     return true
   }
-  return sessionPatternMatches(broad.pattern, narrow.pattern)
+  return (
+    sessionPatternMatches(broad.pattern, narrow.pattern) ||
+    sessionPatternMatches(
+      normalizePattern(broad.pattern),
+      normalizePattern(narrow.pattern)
+    )
+  )
 }
 
 export class SessionRules {
-  private rules: SessionRule[] = []
-
   add(rule: SessionRule): void {
-    this.rules.push(rule)
+    registry().rules.push(rule)
   }
 
   approveForSession(
@@ -41,8 +79,9 @@ export class SessionRules {
     action: PermissionState,
     isExact?: boolean
   ): void {
+    const reg = registry()
     const incoming: PatternCandidate = { pattern, isExact }
-    const alreadyCovered = this.rules.some(
+    const alreadyCovered = reg.rules.some(
       (r) =>
         r.surface === surface &&
         r.action === action &&
@@ -52,7 +91,7 @@ export class SessionRules {
       return
     }
 
-    this.rules = this.rules.filter(
+    reg.rules = reg.rules.filter(
       (r) =>
         !(
           r.surface === surface &&
@@ -70,14 +109,14 @@ export class SessionRules {
   }
 
   snapshot(): Rule[] {
-    return this.rules.map((r) => ({ ...r }))
+    return registry().rules.map((r) => ({ ...r }))
   }
 
   clear(): void {
-    this.rules = []
+    registry().rules = []
   }
 
   size(): number {
-    return this.rules.length
+    return registry().rules.length
   }
 }

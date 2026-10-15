@@ -1,7 +1,10 @@
 import { gateToolCall } from '../../src/gate/gate.ts'
 import type { GateDeps } from '../../src/gate/gate.ts'
 import { configState } from '../../src/state/config-state.ts'
-import { SessionRules } from '../../src/permission/session-rules.ts'
+import {
+  SessionRules,
+  resetSessionRulesRegistry,
+} from '../../src/permission/session-rules.ts'
 import { DenyAndContinueService } from '../../src/deny/deny-service.ts'
 import { resolve } from 'node:path'
 import {
@@ -85,6 +88,11 @@ function makeDeps(): GateDeps {
   }
   return { configState, sessionRules, hooks: {}, classify, denyService }
 }
+
+beforeEach(() => {
+  resetSessionRulesRegistry()
+  resetExternalDirAllowlist()
+})
 
 describe('gateToolCall', () => {
   beforeEach(() => {
@@ -1826,6 +1834,88 @@ describe('E2E: allow_dir_tool and allow_dir_all per-tool scoping', () => {
       await gateToolCall('bash', { command: `cat ${outsidePath}` }, makeDeps())
       expect(capturedType).toBe('external-directory')
       expect(capturedOrigin).toBe('external-directory')
+    })
+
+    it('handleDenyAskUser passes sessionPatterns and cwd, and forwards via on emit', async () => {
+      configState.set({
+        ...config,
+        denyStrategy: {
+          mode: 'ask-user',
+          escalation: { consecutive: 3, total: 20 },
+        },
+        permissions: {
+          tools: {
+            bash: [{ pattern: 'git push*', action: 'deny' }],
+          },
+        },
+      })
+      const denyService = new DenyAndContinueService({
+        mode: 'ask-user',
+        escalation: { consecutive: 3, total: 20 },
+      })
+      const events: Array<Record<string, unknown>> = []
+      const deps: GateDeps = {
+        ...makeDeps(),
+        denyService,
+        hooks: {
+          emit: (_channel: string, data: unknown) => {
+            events.push(data as Record<string, unknown>)
+          },
+        },
+      }
+      let capturedReq: AskRequest | undefined
+      setAskResolver(async (req) => {
+        capturedReq = req
+        return { decision: 'allow', via: 'parent-modal' }
+      })
+      await gateToolCall(
+        'bash',
+        { command: 'git push origin main', cwd: '/workspace/project' },
+        deps
+      )
+      expect(capturedReq).toBeDefined()
+      expect(capturedReq?.askOrigin).toBe('deny-override')
+      expect(capturedReq?.sessionPatterns).toBeDefined()
+      expect(capturedReq?.sessionPatterns?.length).toBeGreaterThan(0)
+      expect(capturedReq?.cwd).toBe('/workspace/project')
+
+      const approval = events.find((e) => e.result === 'allow')
+      expect(approval?.via).toBe('parent-modal')
+      expect(approval?.decidedBy).toBe('user')
+    })
+
+    it('session allow in one instance allows calls in a separate instance without prompting (process-wide)', async () => {
+      const deps1 = makeDeps()
+      const deps2 = makeDeps()
+      deps1.sessionRules.approveForSession('shell', 'git status', 'allow', true)
+
+      const askSpy = jest.fn()
+      setAskResolver(async () => {
+        askSpy()
+        return 'allow'
+      })
+
+      await gateToolCall('bash', { command: 'git status' }, deps2)
+      expect(askSpy).not.toHaveBeenCalled()
+    })
+
+    it('session allow with quotes matches execution without quotes (and vice versa)', async () => {
+      const deps = makeDeps()
+      deps.sessionRules.approveForSession(
+        'shell',
+        'cat "test.txt"',
+        'allow',
+        true
+      )
+
+      const askSpy = jest.fn()
+      setAskResolver(async () => {
+        askSpy()
+        return 'allow'
+      })
+
+      await gateToolCall('bash', { command: 'cat test.txt' }, deps)
+      expect(askSpy).not.toHaveBeenCalled()
     })
   })
 })

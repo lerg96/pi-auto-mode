@@ -57,12 +57,18 @@ export type AskVia = 'modal' | 'parent-modal' | 'no-ui' | 'timeout'
 export type AskDecision =
   | 'allow'
   | 'allow_session'
+  | 'allow_permanent'
   | 'allow_dir_tool'
   | 'allow_dir_all'
   | 'deny'
   | {
       decision:
-        'allow' | 'allow_session' | 'allow_dir_tool' | 'allow_dir_all' | 'deny'
+        | 'allow'
+        | 'allow_session'
+        | 'allow_permanent'
+        | 'allow_dir_tool'
+        | 'allow_dir_all'
+        | 'deny'
       reason?: string
       via?: AskVia
       pattern?: string
@@ -70,7 +76,12 @@ export type AskDecision =
 
 export interface CanonicalAskResult {
   decision:
-    'allow' | 'allow_session' | 'allow_dir_tool' | 'allow_dir_all' | 'deny'
+    | 'allow'
+    | 'allow_session'
+    | 'allow_permanent'
+    | 'allow_dir_tool'
+    | 'allow_dir_all'
+    | 'deny'
   reason?: string
   via: AskVia
   pattern?: string

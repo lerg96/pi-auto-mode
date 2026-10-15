@@ -1428,12 +1428,15 @@ describe('externalDirectoryTools × gate', () => {
         permissions: { tools: { bash: 'ask' } },
       })
       let capturedType: string | undefined
+      let capturedOrigin: string | undefined
       setAskResolver(async (req) => {
         capturedType = req.type
+        capturedOrigin = req.askOrigin
         return 'allow'
       })
       await gateToolCall('bash', { command: `cat ${outsidePath}` }, makeDeps())
       expect(capturedType).toBe('tool-permission')
+      expect(capturedOrigin).toBe('rule')
       setAskResolver(getAskResolver())
     })
   })
@@ -1712,6 +1715,117 @@ describe('E2E: allow_dir_tool and allow_dir_all per-tool scoping', () => {
         'agy model list 2>&1',
         'head -n 100',
       ])
+    })
+  })
+
+  describe('askOrigin on AskRequest', () => {
+    let prevResolver: ReturnType<typeof getAskResolver>
+
+    beforeEach(() => {
+      prevResolver = getAskResolver()
+      resetExternalDirAllowlist()
+    })
+    afterEach(() => {
+      setAskResolver(prevResolver)
+    })
+
+    it('sets askOrigin="rule" when a permission rule requires ask', async () => {
+      configState.set({
+        ...config,
+        permissions: { tools: { bash: 'ask' } },
+      })
+      let capturedOrigin: string | undefined
+      setAskResolver(async (req) => {
+        capturedOrigin = req.askOrigin
+        return 'allow'
+      })
+      await gateToolCall('bash', { command: 'echo hello' }, makeDeps())
+      expect(capturedOrigin).toBe('rule')
+    })
+
+    it('sets askOrigin="classifier" when classifier triggers ask', async () => {
+      configState.set({
+        ...config,
+        classifier: {
+          ...config.classifier,
+          enabled: true,
+        },
+        permissions: { tools: { bash: 'ask' } },
+      })
+      let capturedOrigin: string | undefined
+      setAskResolver(async (req) => {
+        capturedOrigin = req.askOrigin
+        return 'allow'
+      })
+      const deps: GateDeps = {
+        ...makeDeps(),
+        classify: async () => ({
+          decision: 'ask',
+          surface: 'shell',
+          value: 'echo risky',
+          risk: { score: 6, level: 'medium', reason: 'risky' },
+        }),
+      }
+      await gateToolCall('bash', { command: 'echo risky' }, deps)
+      expect(capturedOrigin).toBe('classifier')
+    })
+
+    it('sets askOrigin="unknown-tool" for unknown tool calls', async () => {
+      let capturedOrigin: string | undefined
+      setAskResolver(async (req) => {
+        capturedOrigin = req.askOrigin
+        return 'allow'
+      })
+      await gateToolCall('denied', { command: 'test-unknown' }, makeDeps())
+      expect(capturedOrigin).toBe('unknown-tool')
+    })
+
+    it('sets askOrigin="deny-override" when deny-strategy is ask-user', async () => {
+      configState.set({
+        ...config,
+        denyStrategy: {
+          mode: 'ask-user',
+          escalation: { consecutive: 3, total: 20 },
+        },
+      })
+      const denyService = new DenyAndContinueService({
+        mode: 'ask-user',
+        escalation: { consecutive: 3, total: 20 },
+      })
+      const deps: GateDeps = {
+        ...makeDeps(),
+        denyService,
+      }
+      let capturedOrigin: string | undefined
+      setAskResolver(async (req) => {
+        capturedOrigin = req.askOrigin
+        return 'allow'
+      })
+      await gateToolCall('bash', { command: 'echo spam a' }, deps)
+      expect(capturedOrigin).toBe('deny-override')
+    })
+
+    it('sets askOrigin="external-directory" when external path is accessed', async () => {
+      configState.set({
+        ...config,
+        confineToWorkingDirectory: true,
+        permissions: { tools: { bash: 'allow' } },
+      })
+      const outsidePath = resolve(
+        process.cwd(),
+        '..',
+        'pi-auto-mode-outside-test.txt'
+      )
+      let capturedOrigin: string | undefined
+      let capturedType: string | undefined
+      setAskResolver(async (req) => {
+        capturedOrigin = req.askOrigin
+        capturedType = req.type
+        return 'allow'
+      })
+      await gateToolCall('bash', { command: `cat ${outsidePath}` }, makeDeps())
+      expect(capturedType).toBe('external-directory')
+      expect(capturedOrigin).toBe('external-directory')
     })
   })
 })

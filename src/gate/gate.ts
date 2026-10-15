@@ -12,6 +12,7 @@ import { grantDirFor } from '../permission/path-scope.ts'
 import { normalizeToolCall, type AccessIntent } from './normalize.ts'
 import { emit, askActor, type GateHooks } from './ask-audit.ts'
 import { buildDecisionDetail } from './decision-detail.ts'
+import type { AskOrigin } from './ask.ts'
 import {
   resolveAsk,
   verdictExtra,
@@ -93,7 +94,9 @@ async function handleUnknownToolIntent(
       undefined,
       toolName,
       fullCommand,
-      startedAt
+      startedAt,
+      undefined,
+      { askOrigin: 'unknown-tool' }
     )
     emit(deps.hooks, toolName, value, 'allow', 'unknown_tool_ask', {
       requestId,
@@ -318,7 +321,9 @@ async function handleDenyAskUser(
       { surface: toolName, pattern: matchedValue, reason: ruleReason },
       toolName,
       fullCommand,
-      startedAt
+      startedAt,
+      undefined,
+      { askOrigin: 'deny-override' }
     )
     emit(deps.hooks, matchedSurface, matchedValue, 'allow', 'permission_ask', {
       requestId,
@@ -543,6 +548,12 @@ async function promptAskMultiSegmentShell(
           }
         : defaultExternalDirAsk
 
+    const segAskOrigin: AskOrigin = segExternalDirAsk?.isExternalDir
+      ? 'external-directory'
+      : resolution === 'classifier_ask'
+        ? 'classifier'
+        : 'rule'
+
     try {
       const { requestId, verdict, via } = await resolveAsk(
         seg.surface,
@@ -558,6 +569,7 @@ async function promptAskMultiSegmentShell(
           sessionPatterns,
           segmentIndex: k,
           segmentTotal: totalAsks,
+          askOrigin: segAskOrigin,
         }
       )
       emit(deps.hooks, seg.surface, seg.value, 'allow', resolution, {
@@ -611,6 +623,12 @@ async function promptAskAfterClassifier(
     toolName === 'bash'
   const sessionPatterns = isShell ? buildSessionPatterns(askValue) : undefined
 
+  const askOrigin: AskOrigin = externalDirAsk?.isExternalDir
+    ? 'external-directory'
+    : resolution === 'classifier_ask'
+      ? 'classifier'
+      : 'rule'
+
   try {
     const { requestId, verdict, via } = await resolveAsk(
       askSurface,
@@ -622,7 +640,10 @@ async function promptAskAfterClassifier(
       fullCommand,
       startedAt,
       externalDirAsk,
-      sessionPatterns ? { sessionPatterns } : undefined
+      {
+        sessionPatterns,
+        askOrigin,
+      }
     )
     emit(deps.hooks, askSurface, askValue, 'allow', resolution, {
       requestId,

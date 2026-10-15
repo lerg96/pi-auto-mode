@@ -6,7 +6,7 @@ import {
 } from '../permission/wildcard-matcher.ts'
 import { externalDirSurfaceFor } from '../permission/external-directory.ts'
 import { addExternalDirAllow } from '../state/external-dir-allowlist.ts'
-import { getAskResolver, normalizeAskDecision } from './ask.ts'
+import { getAskResolver, normalizeAskDecision, type AskOrigin } from './ask.ts'
 import { emit, type AskAudit } from './ask-audit.ts'
 import { buildDecisionDetail } from './decision-detail.ts'
 import type { GateDeps } from './gate.ts'
@@ -162,6 +162,7 @@ export interface ResolveAskExtra {
   sessionPatterns?: string[]
   segmentIndex?: number
   segmentTotal?: number
+  askOrigin?: AskOrigin
 }
 
 export async function resolveAsk(
@@ -194,6 +195,10 @@ export async function resolveAsk(
       }
     : undefined
 
+  const askOrigin: AskOrigin | undefined =
+    extra?.askOrigin ??
+    (externalDir?.isExternalDir ? 'external-directory' : undefined)
+
   const res = await getAskResolver()({
     surface,
     value,
@@ -207,6 +212,7 @@ export async function resolveAsk(
     sessionPatterns: extra?.sessionPatterns,
     segmentIndex: extra?.segmentIndex,
     segmentTotal: extra?.segmentTotal,
+    askOrigin,
   })
   const { decision, reason, via, pattern } = normalizeAskDecision(res)
 

@@ -617,12 +617,25 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       },
     })
     const text = lines.join('\n')
-    expect(text).toContain('Permission Required')
+    expect(text).toContain('Command approval')
     expect(text).toContain('bash')
     expect(text).toContain('shell / rm -rf *')
     expect(text).toContain('rm -rf /')
     expect(text).toContain('sudo rm -rf /')
     expect(text).toContain('destructive')
+    settle('allow')
+    expect(await promise).toBe('allow')
+  })
+
+  it('renders "Tool approval" for non-shell tools', async () => {
+    const { lines, settle, promise } = renderModal({
+      tool: 'read',
+      surface: 'fs',
+      value: '/etc/hosts',
+    })
+    const text = lines.join('\n')
+    expect(text).toContain('Tool approval')
+    expect(text).not.toContain('Command approval')
     settle('allow')
     expect(await promise).toBe('allow')
   })
@@ -669,6 +682,62 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
     expect(text).not.toContain('risk')
     settle('allow')
     expect(await promise).toBe('allow')
+  })
+
+  describe('askOrigin why explanations', () => {
+    it.each([
+      ['rule', 'a permission rule requires confirmation'],
+      ['unknown-tool', 'no permission rule matches this tool'],
+      ['classifier', 'the risk classifier flagged this call'],
+      ['deny-override', 'a deny rule matched; you may override it'],
+      [
+        'classifier-override',
+        'the classifier blocked this call; you may override it',
+      ],
+      [
+        'external-directory',
+        'this call touches a path outside the working directory',
+      ],
+    ] as const)(
+      'shows why line for askOrigin="%s"',
+      async (askOrigin, expectedWhy) => {
+        const { lines, settle, promise } = renderModal({
+          surface: 'shell',
+          value: 'ls',
+          askOrigin,
+        })
+        const text = lines.join('\n')
+        expect(text).toContain(`why         : ${expectedWhy}`)
+        settle('allow')
+        expect(await promise).toBe('allow')
+      }
+    )
+
+    it('falls back to "this call touches a path outside the working directory" when askOrigin is absent for external-directory', async () => {
+      const { lines, settle, promise } = renderModal({
+        type: 'external-directory',
+        externalDir: '/var/log',
+        surface: 'fs',
+        value: '/var/log',
+      })
+      const text = lines.join('\n')
+      expect(text).toContain(
+        'why         : this call touches a path outside the working directory'
+      )
+      settle('allow')
+      expect(await promise).toBe('allow')
+    })
+
+    it('falls back to "this call requires confirmation" when askOrigin is absent for tool-permission', async () => {
+      const { lines, settle, promise } = renderModal({
+        surface: 'shell',
+        value: 'ls',
+      })
+      const text = lines.join('\n')
+      expect(text).toContain('why         : this call requires confirmation')
+      settle('allow')
+      expect(await promise).toBe('allow')
+    })
   })
 
   // ─── No UI surface (root-cause fix: invisible modal) ─────────
@@ -879,9 +948,9 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
     expect(text).toContain('sleep 240; timeout 60 ssh')
     expect(text).toContain('termino')
     // Tail straddles the wrap boundary: rejoin continuation lines to
-    // prove nothing was cut (7 header lines + 1 footer = 8 total).
+    // prove nothing was cut (8 header lines + 1 footer = 9 total).
     expect(text.replace(/\n +/g, '')).toContain(tail)
-    expect(lines).toHaveLength(8)
+    expect(lines).toHaveLength(9)
     for (const line of lines) {
       expect(line).not.toContain('\n')
       expect(line).not.toContain('\r')
@@ -976,7 +1045,7 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       resetExternalDirAllowlist()
     })
 
-    it('header muestra "External directory access"', async () => {
+    it('header muestra "Outside working directory"', async () => {
       const { lines, settle, promise } = renderModal({
         type: 'external-directory',
         externalDir: '/mnt/shared',
@@ -985,23 +1054,43 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
         value: 'echo hi > ../other/file.txt',
       })
       const text = lines.join('\n')
-      expect(text).toContain('External directory access')
+      expect(text).toContain('Outside working directory')
+      expect(text).toContain(
+        'why         : this call touches a path outside the working directory'
+      )
       expect(text).toContain('/mnt/shared')
       settle('allow')
       expect(await promise).toBe('allow')
     })
 
-    it('no muestra "command" en header cuando es external-directory', async () => {
+    it('muestra cwd y command en header cuando value difiere de path', async () => {
       const { lines, settle, promise } = renderModal({
         type: 'external-directory',
         externalDir: '/mnt/shared',
         tool: 'bash',
         surface: 'shell',
         value: 'cat ../other/file.txt',
+        cwd: '/home/user/project',
       })
       const text = lines.join('\n')
+      expect(text).toContain('cwd         : /home/user/project')
+      expect(text).toContain('path        : /mnt/shared')
+      expect(text).toContain('command     : cat ../other/file.txt')
+      settle('allow')
+      expect(await promise).toBe('allow')
+    })
+
+    it('no muestra command en header cuando value es igual a path', async () => {
+      const { lines, settle, promise } = renderModal({
+        type: 'external-directory',
+        externalDir: '/mnt/shared',
+        tool: 'read',
+        surface: 'fs',
+        value: '/mnt/shared',
+      })
+      const text = lines.join('\n')
+      expect(text).toContain('path        : /mnt/shared')
       expect(text).not.toContain('command')
-      expect(text).toContain('path')
       settle('allow')
       expect(await promise).toBe('allow')
     })
@@ -1016,11 +1105,11 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       })
       expect(captures.items).toHaveLength(5)
       expect(captures.items![0].id).toBe('allow')
-      expect(captures.items![0].label).toBe('Allow this call')
+      expect(captures.items![0].label).toBe('Allow this path once')
       expect(captures.items![1].id).toBe('allow_dir_tool')
-      expect(captures.items![1].label).toBe('Allow for this tool')
+      expect(captures.items![1].label).toBe('Allow path for this tool')
       expect(captures.items![2].id).toBe('allow_dir_all')
-      expect(captures.items![2].label).toBe('Allow for all tools')
+      expect(captures.items![2].label).toBe('Allow path for all tools')
       expect(captures.items![3].id).toBe('deny')
       expect(captures.items![3].label).toBe('Deny')
       expect(captures.items![4].id).toBe('deny_reason')
@@ -1145,7 +1234,7 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
         segmentTotal: 2,
       })
       const text = lines.join('\n')
-      expect(text).toContain('Permission Required [1 of 2]')
+      expect(text).toContain('Command approval [1 of 2]')
       expect(text).toContain('[1 of 2] · ↑/↓ move · enter confirm · esc deny')
       settle('allow')
       expect(await promise).toBe('allow')
@@ -1160,7 +1249,7 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       })
       const text = lines.join('\n')
       expect(text).not.toContain('[1 of 1]')
-      expect(text).toContain('Permission Required')
+      expect(text).toContain('Command approval')
       expect(text).toContain('↑/↓ move · enter confirm · esc deny')
       settle('allow')
       expect(await promise).toBe('allow')

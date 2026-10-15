@@ -126,7 +126,9 @@ async function classifierOverrideAsk(
       undefined,
       ctx.toolName,
       undefined,
-      ctx.startedAt
+      ctx.startedAt,
+      undefined,
+      { askOrigin: 'classifier-override' }
     ))
   } catch (err) {
     if (err instanceof AskDeniedError) overrideDenied(deps, ctx, err)

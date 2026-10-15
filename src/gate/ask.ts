@@ -9,6 +9,14 @@ export interface ClassifierRisk {
 
 export type AskType = 'tool-permission' | 'external-directory'
 
+export type AskOrigin =
+  | 'rule'
+  | 'unknown-tool'
+  | 'classifier'
+  | 'deny-override'
+  | 'classifier-override'
+  | 'external-directory'
+
 export interface AskRequest {
   surface: string
   value: string
@@ -30,6 +38,8 @@ export interface AskRequest {
   sessionPatterns?: string[]
   segmentIndex?: number
   segmentTotal?: number
+  askOrigin?: AskOrigin
+  cwd?: string
 }
 
 // NUEVO: una negación puede llevar una razón legible (se muestra al modelo).

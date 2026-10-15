@@ -85,21 +85,21 @@ function buildExternalDirItems(): SettingItem[] {
   return [
     {
       id: 'allow',
-      label: 'Allow this call',
+      label: 'Allow this path once',
       description: 'Grant once — nothing is remembered.',
       currentValue: 'grant once',
       values: ['❯'],
     },
     {
       id: 'allow_dir_tool',
-      label: 'Allow for this tool',
+      label: 'Allow path for this tool',
       description: 'Remember for this tool — identical calls skip the prompt.',
       currentValue: 'remember for tool',
       values: ['❯'],
     },
     {
       id: 'allow_dir_all',
-      label: 'Allow for all tools',
+      label: 'Allow path for all tools',
       description: 'Remember for all tools — identical calls skip the prompt.',
       currentValue: 'remember for all',
       values: ['❯'],
@@ -240,12 +240,38 @@ function headerRow(
   return `${hint(key.padEnd(HEADER_KEY_WIDTH))}: ${value}`
 }
 
+function whyExplanation(req: AskRequest): string {
+  const origin = req.askOrigin
+  if (origin === 'external-directory') {
+    return 'this call touches a path outside the working directory'
+  }
+  if (origin === 'rule') {
+    return 'a permission rule requires confirmation'
+  }
+  if (origin === 'unknown-tool') {
+    return 'no permission rule matches this tool'
+  }
+  if (origin === 'classifier') {
+    return 'the risk classifier flagged this call'
+  }
+  if (origin === 'deny-override') {
+    return 'a deny rule matched; you may override it'
+  }
+  if (origin === 'classifier-override') {
+    return 'the classifier blocked this call; you may override it'
+  }
+  if (req.type === 'external-directory') {
+    return 'this call touches a path outside the working directory'
+  }
+  return 'this call requires confirmation'
+}
+
 /**
  * Static header block rendered above the decision list.
  *
  * Two layouts:
- * - `tool-permission`: tool / rule / command / full command / reason / risk
- * - `external-directory`: tool / path / rule / reason (no risk, no command)
+ * - `tool-permission`: why / tool / rule / command / full command / reason / risk
+ * - `external-directory`: why / tool / cwd / path / command (if differs) / reason / risk
  */
 function buildHeader(
   req: AskRequest,
@@ -259,22 +285,32 @@ function buildHeader(
       ? ` [${req.segmentIndex} of ${req.segmentTotal}]`
       : ''
 
+  const isShell =
+    req.surface === 'shell' || req.tool === 'bash' || req.tool === 'powershell'
+
   // Title
-  lines.push(
-    isExternalDir
-      ? slTheme.label(`External directory access${segmentSuffix}`, true)
-      : slTheme.label(`Permission Required${segmentSuffix}`, true)
-  )
+  const title = isExternalDir
+    ? `Outside working directory${segmentSuffix}`
+    : `${isShell ? 'Command approval' : 'Tool approval'}${segmentSuffix}`
+
+  lines.push(slTheme.label(title, true))
   // A prompt borrowed into the parent session must say so: the user is being
   // asked about a tool call that is NOT from the session in front of them.
   if (subtitle) lines.push(slTheme.hint(subtitle))
 
+  lines.push(headerRow(slTheme.hint, 'why', whyExplanation(req)))
+
   if (isExternalDir) {
-    // External-directory layout: tool + path (simplified)
+    // External-directory layout: tool + cwd + path (+ optional command)
     const toolLabel = sanitizeForLabel(req.tool ?? req.surface)
+    const cwd = req.cwd ?? process.cwd()
     const dirPath = req.externalDir ?? req.value
     lines.push(headerRow(slTheme.hint, 'tool', toolLabel))
+    lines.push(headerRow(slTheme.hint, 'cwd', sanitizeForLabel(cwd, 160)))
     lines.push(headerRow(slTheme.hint, 'path', sanitizeForLabel(dirPath, 160)))
+    if (req.value && req.value !== dirPath) {
+      lines.push(...headerRows(slTheme.hint, 'command', req.value))
+    }
   } else {
     // Tool-permission layout (existing)
     lines.push(

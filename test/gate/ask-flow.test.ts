@@ -145,4 +145,47 @@ describe('resolveAsk', () => {
       })
     ).rejects.toThrow('policy-nope')
   })
+
+  it('threads askOrigin through to the resolver', async () => {
+    const { deps } = makeDeps()
+    let capturedOrigin: string | undefined
+    setAskResolver(async (req) => {
+      capturedOrigin = req.askOrigin
+      return 'allow'
+    })
+    await resolveAsk(
+      'shell',
+      'echo hi',
+      undefined,
+      deps,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { askOrigin: 'rule' }
+    )
+    expect(capturedOrigin).toBe('rule')
+  })
+
+  it('defaults askOrigin to external-directory when externalDir is present and no askOrigin specified', async () => {
+    const { deps } = makeDeps()
+    let capturedOrigin: string | undefined
+    setAskResolver(async (req) => {
+      capturedOrigin = req.askOrigin
+      return 'allow'
+    })
+    await resolveAsk(
+      'fs',
+      '/outside/file.txt',
+      undefined,
+      deps,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { isExternalDir: true, externalDirPath: '/outside/file.txt' }
+    )
+    expect(capturedOrigin).toBe('external-directory')
+  })
 })

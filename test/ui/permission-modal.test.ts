@@ -29,14 +29,20 @@ captures = { onChange: undefined, onCancel: undefined, items: undefined }
 
 jest.mock('@earendil-works/pi-tui', () => ({
   matchesKey: (data: string, keyId: string) => {
-    if (keyId === 'alt+enter') {
+    if (keyId === 'shift+enter') {
       return (
+        data === '\x1b[13;2u' ||
+        data === '\x1b[27;2;13~' ||
         data === '\x1b\r' ||
-        data === '\x1b\n' ||
-        data.includes(';3u') ||
-        data.includes(';3~') ||
-        data.includes(';9u')
+        data.includes(';2u') ||
+        data.includes(';2~')
       )
+    }
+    if (keyId === 'tab') {
+      return data === '\t' || data === '\x1b[I'
+    }
+    if (keyId === 'enter') {
+      return data === '\r' || data === '\n'
     }
     return false
   },
@@ -77,6 +83,11 @@ jest.mock('@earendil-works/pi-tui', () => ({
           this.items.length - 1,
           this.selectedIndex + 1
         )
+      } else if (data === '\r' || data === '\n') {
+        const item = this.items[this.selectedIndex]
+        if (item) {
+          void captures.onChange?.(item.id, '❯')
+        }
       }
     }
   },
@@ -1397,7 +1408,7 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       const text = lines.join('\n')
       expect(text).toContain('Command approval [1 of 2]')
       expect(text).toContain(
-        '[1 of 2] · ↑/↓ move · enter confirm · alt+enter permanent · esc deny'
+        '[1 of 2] · ↑/↓ move · enter confirm · tab permanent mode · shift+enter permanent · esc deny'
       )
       settle('allow')
       expect(await promise).toBe('allow')
@@ -1414,15 +1425,15 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       expect(text).not.toContain('[1 of 1]')
       expect(text).toContain('Command approval')
       expect(text).toContain(
-        '↑/↓ move · enter confirm · alt+enter permanent · esc deny'
+        '↑/↓ move · enter confirm · tab permanent mode · shift+enter permanent · esc deny'
       )
       settle('allow')
       expect(await promise).toBe('allow')
     })
   })
 
-  describe('Alt modifier and allow permanently', () => {
-    it('toggles labels between Allow for session and Allow permanently on Alt press and release', async () => {
+  describe('Tab toggle and allow permanently', () => {
+    it('starts in session mode by default', async () => {
       const resolver = makeResolver()
       const promise = resolver({ surface: 'shell', value: 'git fetch' })
       const view = renderCapture!(
@@ -1430,32 +1441,26 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
         fakeGlobalTheme,
         undefined,
         () => {}
-      ) as unknown as { handleInput(data: string): void }
+      ) as unknown as {
+        isPermanentActive: boolean
+        render(width: number): string[]
+      }
 
+      expect(view.isPermanentActive).toBe(false)
       expect(captures.items![1].label).toBe('Allow for session')
       expect(captures.items![1].description).toContain(
         'Remember for this session'
       )
-
-      // Alt keypress (Kitty codepoint 57441)
-      view.handleInput('\x1b[57441u')
-      expect(captures.items![1].label).toBe('Allow permanently')
-      expect(captures.items![1].description).toBe(
-        'Save to permissions in config — permanent allow.'
-      )
-
-      // Alt key release (Kitty event type 3)
-      view.handleInput('\x1b[57441;1:3u')
-      expect(captures.items![1].label).toBe('Allow for session')
-      expect(captures.items![1].description).toContain(
-        'Remember for this session'
+      const lines = view.render(80)
+      expect(lines.join('\n')).toContain(
+        '↑/↓ move · enter confirm · tab permanent mode · shift+enter permanent · esc deny'
       )
 
       choose('allow')
       await promise
     })
 
-    it('toggles all session pattern labels on Alt press', async () => {
+    it('switches labels to Allow permanently and updates footer on Tab press', async () => {
       const resolver = makeResolver()
       const promise = resolver({
         surface: 'shell',
@@ -1467,45 +1472,73 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
         fakeGlobalTheme,
         undefined,
         () => {}
-      ) as unknown as { handleInput(data: string): void }
+      ) as unknown as {
+        isPermanentActive: boolean
+        handleInput(data: string): void
+        render(width: number): string[]
+      }
 
       expect(captures.items![1].label).toBe('Allow for session "npm test"')
       expect(captures.items![2].label).toBe('Allow for session "npm *"')
 
-      // Alt keypress
-      view.handleInput('\x1b[57441u')
+      // Press Tab
+      view.handleInput('\t')
+
+      expect(view.isPermanentActive).toBe(true)
       expect(captures.items![1].label).toBe('Allow permanently "npm test"')
+      expect(captures.items![1].description).toBe(
+        'Save to permissions in config — permanent allow.'
+      )
       expect(captures.items![2].label).toBe('Allow permanently "npm *"')
+      expect(captures.items![2].description).toBe(
+        'Save to permissions in config — permanent allow.'
+      )
 
-      // Alt release
-      view.handleInput('\x1b[57441;1:3u')
-      expect(captures.items![1].label).toBe('Allow for session "npm test"')
-      expect(captures.items![2].label).toBe('Allow for session "npm *"')
+      const lines = view.render(80)
+      expect(lines.join('\n')).toContain(
+        '[PERMANENT MODE] ↑/↓ move · enter confirm (permanent) · tab session mode · esc deny'
+      )
 
       choose('allow')
       await promise
     })
 
-    it('returns allow_permanent when Alt + Enter is pressed', async () => {
+    it('reverts labels to Allow for session when Tab is pressed again', async () => {
       const resolver = makeResolver()
-      const promise = resolver({ surface: 'shell', value: 'cargo build' })
+      const promise = resolver({ surface: 'shell', value: 'git fetch' })
       const view = renderCapture!(
         undefined,
         fakeGlobalTheme,
         undefined,
         () => {}
-      ) as unknown as { handleInput(data: string): void }
+      ) as unknown as {
+        isPermanentActive: boolean
+        handleInput(data: string): void
+        render(width: number): string[]
+      }
 
-      view.handleInput('down') // move to allow_session
-      view.handleInput('\x1b\r') // Alt + Enter
+      // First Tab -> permanent mode
+      view.handleInput('\t')
+      expect(view.isPermanentActive).toBe(true)
+      expect(captures.items![1].label).toBe('Allow permanently')
 
-      expect(await promise).toEqual({
-        decision: 'allow_permanent',
-        pattern: 'cargo build',
-      })
+      // Second Tab -> session mode
+      view.handleInput('\t')
+      expect(view.isPermanentActive).toBe(false)
+      expect(captures.items![1].label).toBe('Allow for session')
+      expect(captures.items![1].description).toContain(
+        'Remember for this session'
+      )
+      const lines = view.render(80)
+      expect(lines.join('\n')).toContain(
+        '↑/↓ move · enter confirm · tab permanent mode · shift+enter permanent · esc deny'
+      )
+
+      choose('allow')
+      await promise
     })
 
-    it('returns allow_permanent with selected sessionPattern when Alt + Enter is pressed', async () => {
+    it('resolves allow_permanent with pattern when Enter is pressed in permanent mode', async () => {
       const resolver = makeResolver()
       const promise = resolver({
         surface: 'shell',
@@ -1519,9 +1552,10 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
         () => {}
       ) as unknown as { handleInput(data: string): void }
 
+      view.handleInput('\t') // Switch to permanent mode
       view.handleInput('down') // index 1: allow_session:0
       view.handleInput('down') // index 2: allow_session:1 ("git push *")
-      view.handleInput('\x1b[13;3u') // Kitty Alt + Enter
+      view.handleInput('\r') // Enter
 
       expect(await promise).toEqual({
         decision: 'allow_permanent',
@@ -1529,29 +1563,98 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       })
     })
 
-    it('returns allow_permanent when Enter is pressed while Alt is active', async () => {
+    it('resolves allow_permanent on Shift+Enter regardless of current mode', async () => {
+      // Test in session mode (isPermanentActive = false)
       const resolver = makeResolver()
-      const promise = resolver({ surface: 'shell', value: 'pnpm test' })
+      const promise = resolver({
+        surface: 'shell',
+        value: 'git push origin main',
+        sessionPatterns: ['git push origin main', 'git push *', 'git *'],
+      })
       const view = renderCapture!(
         undefined,
         fakeGlobalTheme,
         undefined,
         () => {}
-      ) as unknown as { handleInput(data: string): void }
+      ) as unknown as {
+        isPermanentActive: boolean
+        handleInput(data: string): void
+      }
 
-      view.handleInput('down') // move to allow_session
-      view.handleInput('\x1b[57441u') // Alt press
-      view.handleInput('\r') // Enter while Alt is active
+      expect(view.isPermanentActive).toBe(false)
+      view.handleInput('down') // index 1: allow_session:0
+      view.handleInput('down') // index 2: allow_session:1 ("git push *")
+      view.handleInput('\x1b[13;2u') // Shift + Enter (Kitty protocol)
 
       expect(await promise).toEqual({
         decision: 'allow_permanent',
-        pattern: 'pnpm test',
+        pattern: 'git push *',
+      })
+
+      // Also test Shift+Enter while already in permanent mode
+      const resolver2 = makeResolver()
+      const promise2 = resolver2({ surface: 'shell', value: 'cargo build' })
+      const view2 = renderCapture!(
+        undefined,
+        fakeGlobalTheme,
+        undefined,
+        () => {}
+      ) as unknown as { handleInput(data: string): void }
+
+      view2.handleInput('\t') // Switch to permanent mode
+      view2.handleInput('down') // index 1: allow_session
+      view2.handleInput('\x1b[27;2;13~') // Shift + Enter (xterm format)
+
+      expect(await promise2).toEqual({
+        decision: 'allow_permanent',
+        pattern: 'cargo build',
       })
     })
 
-    it('resets Alt active state if a non-alt key is pressed without Alt modifier', async () => {
+    it('opens a second modal in session mode even if the first was toggled to permanent mode', async () => {
       const resolver = makeResolver()
-      const promise = resolver({ surface: 'shell', value: 'echo 123' })
+
+      // First modal
+      const promise1 = resolver({ surface: 'shell', value: 'echo first' })
+      const view1 = renderCapture!(
+        undefined,
+        fakeGlobalTheme,
+        undefined,
+        () => {}
+      ) as unknown as {
+        isPermanentActive: boolean
+        handleInput(data: string): void
+      }
+
+      expect(view1.isPermanentActive).toBe(false)
+      view1.handleInput('\t') // Toggle to permanent mode
+      expect(view1.isPermanentActive).toBe(true)
+
+      choose('allow')
+      await promise1
+
+      // Second modal
+      const promise2 = resolver({ surface: 'shell', value: 'echo second' })
+      const view2 = renderCapture!(
+        undefined,
+        fakeGlobalTheme,
+        undefined,
+        () => {}
+      ) as unknown as {
+        isPermanentActive: boolean
+      }
+
+      // Second modal MUST start in session mode (isPermanentActive = false)
+      expect(view2.isPermanentActive).toBe(false)
+      expect(captures.items![1].label).toBe('Allow for session')
+
+      choose('allow')
+      await promise2
+    })
+
+    it('denies when Enter is pressed on Deny while in permanent mode', async () => {
+      const resolver = makeResolver()
+      const promise = resolver({ surface: 'shell', value: 'rm -rf /' })
       const view = renderCapture!(
         undefined,
         fakeGlobalTheme,
@@ -1559,14 +1662,12 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
         () => {}
       ) as unknown as { handleInput(data: string): void }
 
-      view.handleInput('\x1b[57441u') // Alt press
-      expect(captures.items![1].label).toBe('Allow permanently')
+      view.handleInput('\t') // Toggle to permanent mode
+      view.handleInput('down') // allow_session
+      view.handleInput('down') // deny
+      view.handleInput('\r') // Enter on deny
 
-      view.handleInput('a') // Non-alt key pressed without Alt
-      expect(captures.items![1].label).toBe('Allow for session')
-
-      choose('allow')
-      await promise
+      expect(await promise).toBe('deny')
     })
   })
 })

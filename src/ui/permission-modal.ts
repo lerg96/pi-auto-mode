@@ -356,26 +356,27 @@ function buildHeader(
 }
 
 /** Footer hint rendered below the decision list. */
-function buildFooter(slTheme: SettingsListTheme, req?: AskRequest): string[] {
+function buildFooter(
+  slTheme: SettingsListTheme,
+  req?: AskRequest,
+  isPermanent = false
+): string[] {
   const prefix =
     req?.segmentIndex && req?.segmentTotal && req?.segmentTotal > 1
       ? `[${req.segmentIndex} of ${req.segmentTotal}] · `
       : ''
+  if (isPermanent) {
+    return [
+      slTheme.hint(
+        `${prefix}[PERMANENT MODE] ↑/↓ move · enter confirm (permanent) · tab session mode · esc deny`
+      ),
+    ]
+  }
   return [
     slTheme.hint(
-      `${prefix}↑/↓ move · enter confirm · alt+enter permanent · esc deny`
+      `${prefix}↑/↓ move · enter confirm · tab permanent mode · shift+enter permanent · esc deny`
     ),
   ]
-}
-
-function hasAltModifier(data: string): boolean {
-  if (data === '\x1b\r' || data === '\x1b\n') return true
-  const match = data.match(/;(\d+)(?::\d+)?[u~]/)
-  if (match) {
-    const mod = parseInt(match[1], 10)
-    return ((mod - 1) & 2) !== 0
-  }
-  return false
 }
 
 /** Inner list surface: the real SettingsList plus the optional slots of
@@ -398,39 +399,48 @@ interface InnerList {
  */
 export class ModalView implements CustomComponent {
   private readonly inner: InnerList
-  readonly wantsKeyRelease = true
-  isAltActive = false
+  isPermanentActive = false
   private readonly items: SettingItem[]
   private readonly req?: AskRequest
   private readonly onDecision?: (decision: AskDecision) => void
+  private readonly slTheme?: SettingsListTheme
+  private readonly footer?: string[]
 
   private readonly originalLabels = new Map<string, string>()
   private readonly originalDescriptions = new Map<string, string | undefined>()
 
   constructor(
     private readonly header: string[],
-    private readonly footer: string[],
+    themeOrFooter: SettingsListTheme | string[],
     list: SettingsList,
     items: SettingItem[] = [],
     req?: AskRequest,
-    onDecision?: (decision: AskDecision) => void
+    onDecision?: (decision: AskDecision) => void,
+    slTheme?: SettingsListTheme
   ) {
     // SAFETY: the compile-time stub declares only the constructor + render,
     // but the real SettingsList (and the jest.mock replacement) implements
     // the full CustomComponent surface. Every use goes through optional
     // chaining, so a missing slot degrades to a no-op instead of a crash.
+    if (slTheme) {
+      this.slTheme = slTheme
+      this.footer = Array.isArray(themeOrFooter) ? themeOrFooter : undefined
+    } else if (Array.isArray(themeOrFooter)) {
+      this.footer = themeOrFooter
+    } else {
+      this.slTheme = themeOrFooter
+    }
     this.inner = list as unknown as InnerList
     this.items = items
     this.req = req
     this.onDecision = onDecision
   }
 
-  setAltActive(active: boolean): void {
-    if (this.isAltActive === active) return
-    this.isAltActive = active
+  togglePermanentMode(): void {
+    this.isPermanentActive = !this.isPermanentActive
     for (const item of this.items) {
       if (item.id === 'allow_session' || item.id.startsWith('allow_session:')) {
-        if (active) {
+        if (this.isPermanentActive) {
           if (!this.originalLabels.has(item.id)) {
             this.originalLabels.set(item.id, item.label)
           }
@@ -446,7 +456,9 @@ export class ModalView implements CustomComponent {
           const origLabel = this.originalLabels.get(item.id)
           const origDesc = this.originalDescriptions.get(item.id)
           if (origLabel !== undefined) item.label = origLabel
-          if (origDesc !== undefined) item.description = origDesc
+          if (this.originalDescriptions.has(item.id)) {
+            item.description = origDesc
+          }
         }
       }
     }
@@ -454,46 +466,48 @@ export class ModalView implements CustomComponent {
   }
 
   render(width: number): string[] {
+    const footerLines = this.slTheme
+      ? buildFooter(this.slTheme, this.req, this.isPermanentActive)
+      : (this.footer ?? [])
     return [
       ...this.header,
       ...(this.inner.render?.(width) ?? []),
-      ...this.footer,
+      ...footerLines,
     ]
   }
 
   handleInput(data: string): void {
-    // Detect Alt modifier / keypress:
-    // Kitty protocol left/right alt keys: codepoints 57441 / 57442
-    if (data.includes('57441') || data.includes('57442')) {
-      if (isKeyRelease(data)) {
-        this.setAltActive(false)
-      } else {
-        this.setAltActive(true)
-      }
-      return
-    }
-
     if (isKeyRelease(data)) {
       return
     }
 
-    // Detect Alt + Enter:
-    const isAltEnter =
-      matchesKey(data, 'alt+enter') ||
-      data === '\x1b\r' ||
-      data === '\x1b\n' ||
-      ((data.includes(';3u') || data.includes(';3~') || data.includes(';9u')) &&
-        (data.includes('13') ||
-          data.includes('\r') ||
-          matchesKey(data, 'enter'))) ||
-      (this.isAltActive && (matchesKey(data, 'enter') || data === '\r'))
+    if (matchesKey(data, 'tab') || data === '\t') {
+      this.togglePermanentMode()
+      return
+    }
 
-    if (isAltEnter) {
+    const isShiftEnter =
+      matchesKey(data, 'shift+enter') ||
+      data === '\x1b[13;2u' ||
+      data === '\x1b[27;2;13~' ||
+      data === '\x1b\r' ||
+      ((data.includes(';2u') || data.includes(';2~')) &&
+        (data.includes('13') || data.includes('\r')))
+
+    const isPlainEnter =
+      matchesKey(data, 'enter') || data === '\r' || data === '\n'
+
+    if (isShiftEnter || (this.isPermanentActive && isPlainEnter)) {
       const selectedIndex =
         (this.inner as { selectedIndex?: number }).selectedIndex ?? 0
       const selected = this.items[selectedIndex]
-      let pattern = this.req?.value ?? ''
-      if (selected) {
+      if (
+        selected &&
+        (selected.id === 'allow' ||
+          selected.id.startsWith('allow_session') ||
+          selected.id.startsWith('allow_dir_'))
+      ) {
+        let pattern = this.req?.value ?? ''
         if (selected.id.startsWith('allow_session:')) {
           const idx = parseInt(selected.id.slice('allow_session:'.length), 10)
           pattern = this.req?.sessionPatterns?.[idx] ?? this.req?.value ?? ''
@@ -504,13 +518,9 @@ export class ModalView implements CustomComponent {
         } else if (selected.id === 'allow') {
           pattern = this.req?.sessionPatterns?.[0] ?? this.req?.value ?? ''
         }
+        this.onDecision?.({ decision: 'allow_permanent', pattern })
+        return
       }
-      this.onDecision?.({ decision: 'allow_permanent', pattern })
-      return
-    }
-
-    if (!hasAltModifier(data) && this.isAltActive) {
-      this.setAltActive(false)
     }
 
     this.inner.handleInput?.(data)
@@ -725,7 +735,7 @@ export function createModalAskResolver(
                     10
                   )
                   const pattern = req.sessionPatterns?.[idx] ?? req.value
-                  if (modalViewRef?.isAltActive) {
+                  if (modalViewRef?.isPermanentActive) {
                     finish({ decision: 'allow_permanent', pattern })
                     return
                   }
@@ -744,7 +754,7 @@ export function createModalAskResolver(
                     // The gate (gate.ts) records the session approval via
                     // SessionRules.approveForSession(). The modal only
                     // returns the decision; persistence is the gate's job.
-                    if (modalViewRef?.isAltActive) {
+                    if (modalViewRef?.isPermanentActive) {
                       const pattern = req.sessionPatterns?.[0] ?? req.value
                       finish({ decision: 'allow_permanent', pattern })
                       return
@@ -818,7 +828,7 @@ export function createModalAskResolver(
                   ? '[child session: no direct UI]'
                   : undefined
               ),
-              buildFooter(slTheme, req),
+              slTheme,
               list,
               items,
               req,

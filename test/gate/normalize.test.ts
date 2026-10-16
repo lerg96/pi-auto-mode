@@ -3,6 +3,7 @@ import {
   normalizeToolCall,
   splitShellSegments,
   segmentCommand,
+  stripQuotedLiterals,
 } from '../../src/gate/normalize.ts'
 
 describe('surfaceForTool', () => {
@@ -312,5 +313,84 @@ describe('redirections and compound command splitting', () => {
   it('does not treat <<< herestring as heredoc', () => {
     const segs = splitShellSegments('cat <<< "hello"; echo done')
     expect(segs).toEqual(['cat <<< hello', 'echo done'])
+  })
+
+  it('handles user command with escaped quotes inside regex without splitting on regex pipes', () => {
+    const cmd =
+      'cd "C:/Users/lerg_/opencode-bypass-src" && rg -n "serve_url|/session|/event|/config/providers|prompt_async|opencode\\", \\"run\\"|\\"run\\",|--format|cwd=" opencode_proxy.py | head -n 25'
+
+    const plainSegs = segmentCommand(cmd)
+    expect(plainSegs).toHaveLength(3)
+    expect(plainSegs[0].value).toBe('cd C:/Users/lerg_/opencode-bypass-src')
+    expect(plainSegs[1].value).toBe(
+      'rg -n serve_url|/session|/event|/config/providers|prompt_async|opencode", "run"|"run",|--format|cwd= opencode_proxy.py'
+    )
+    expect(plainSegs[2].value).toBe('head -n 25')
+
+    const rawSegs = segmentCommand(cmd, { keepQuotes: true })
+    expect(rawSegs).toHaveLength(3)
+    expect(rawSegs[0].value).toBe('cd "C:/Users/lerg_/opencode-bypass-src"')
+    expect(rawSegs[1].value).toBe(
+      'rg -n "serve_url|/session|/event|/config/providers|prompt_async|opencode\\", \\"run\\"|\\"run\\",|--format|cwd=" opencode_proxy.py'
+    )
+    expect(rawSegs[2].value).toBe('head -n 25')
+
+    // Ensure no segment is an isolated fragment like \"run\", or --format
+    const allValues = plainSegs.map((s) => s.value)
+    expect(allValues).not.toContain('\\"run\\",')
+    expect(allValues).not.toContain('"run",')
+    expect(allValues).not.toContain('--format')
+    expect(allValues.some((v) => v.startsWith('"run",'))).toBe(false)
+    expect(allValues.some((v) => v.startsWith('\\"run\\",'))).toBe(false)
+
+    // Verify normalizeToolCall zips correctly with rawValue
+    const intents = normalizeToolCall('bash', { command: cmd })
+    expect(intents).toHaveLength(3)
+    expect(intents[0].value).toBe('cd C:/Users/lerg_/opencode-bypass-src')
+    expect(intents[0].rawValue).toBe('cd "C:/Users/lerg_/opencode-bypass-src"')
+    expect(intents[1].value).toBe(
+      'rg -n serve_url|/session|/event|/config/providers|prompt_async|opencode", "run"|"run",|--format|cwd= opencode_proxy.py'
+    )
+    expect(intents[1].rawValue).toBe(
+      'rg -n "serve_url|/session|/event|/config/providers|prompt_async|opencode\\", \\"run\\"|\\"run\\",|--format|cwd=" opencode_proxy.py'
+    )
+    expect(intents[2].value).toBe('head -n 25')
+    expect(intents[2].rawValue).toBeUndefined()
+  })
+
+  it('handles simpler escaped quote cases inside double quotes', () => {
+    const simple = 'echo "hello \\"world\\" | foo"'
+    const plain = segmentCommand(simple)
+    expect(plain).toHaveLength(1)
+    expect(plain[0].value).toBe('echo hello "world" | foo')
+    expect(plain[0].quoted).toBe(true)
+
+    const raw = segmentCommand(simple, { keepQuotes: true })
+    expect(raw).toHaveLength(1)
+    expect(raw[0].value).toBe('echo "hello \\"world\\" | foo"')
+    expect(raw[0].quoted).toBe(true)
+  })
+
+  it('handles escaped characters outside quotes without opening quotes or splitting pipes', () => {
+    const escapedPipe = 'echo hello\\|world'
+    expect(splitShellSegments(escapedPipe)).toEqual(['echo hello\\|world'])
+
+    const escapedQuote = 'echo \\"hello\\"'
+    const segs = segmentCommand(escapedQuote)
+    expect(segs).toHaveLength(1)
+    expect(segs[0].value).toBe('echo \\"hello\\"')
+    expect(segs[0].quoted).toBe(false)
+  })
+
+  it('handles stripQuotedLiterals with escaped quotes inside and outside quotes', () => {
+    expect(stripQuotedLiterals('echo "hello \\"world\\""')).toBe(
+      'echo hello "world"'
+    )
+    expect(
+      stripQuotedLiterals(
+        'rg -n "serve_url|opencode\\", \\"run\\"|--format" file'
+      )
+    ).toBe('rg -n serve_url|opencode", "run"|--format file')
+    expect(stripQuotedLiterals('echo \\"hello\\"')).toBe('echo \\"hello\\"')
   })
 })

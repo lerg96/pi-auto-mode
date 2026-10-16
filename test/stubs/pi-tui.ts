@@ -28,14 +28,20 @@ export interface SettingItem {
 }
 
 export function matchesKey(data: string, keyId: string): boolean {
-  if (keyId === 'alt+enter') {
+  if (keyId === 'shift+enter') {
     return (
+      data === '\x1b[13;2u' ||
+      data === '\x1b[27;2;13~' ||
       data === '\x1b\r' ||
-      data === '\x1b\n' ||
-      data.includes(';3u') ||
-      data.includes(';3~') ||
-      data.includes(';9u')
+      data.includes(';2u') ||
+      data.includes(';2~')
     )
+  }
+  if (keyId === 'tab') {
+    return data === '\t' || data === '\x1b[I'
+  }
+  if (keyId === 'enter') {
+    return data === '\r' || data === '\n'
   }
   return false
 }

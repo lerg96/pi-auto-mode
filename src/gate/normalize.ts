@@ -253,6 +253,16 @@ export function segmentCommand(
     }
 
     if (quote) {
+      if (quote === '"' && c === '\\' && i + 1 < command.length) {
+        const next = command[i + 1]
+        if (next === '"' || next === '\\' || next === '$' || next === '`') {
+          buf += keep ? c + next : next
+        } else {
+          buf += c + next
+        }
+        i += 2
+        continue
+      }
       // Inside a quote: only command substitution is active in double quotes.
       // In single quotes `$(`/`...` are literal and must not be extracted.
       if (quote === '"' && c === '$' && command[i + 1] === '(') {
@@ -280,6 +290,11 @@ export function segmentCommand(
       continue
     }
     // Outside any quote.
+    if (c === '\\' && i + 1 < command.length) {
+      buf += c + command[i + 1]
+      i += 2
+      continue
+    }
     if (c === "'" || c === '"') {
       if (keep) buf += c
       quote = c
@@ -431,6 +446,12 @@ export function stripQuotedLiterals(command: string): string {
   while (i < command.length) {
     const c = command[i]
     if (quote) {
+      if (quote === '"' && c === '\\' && i + 1 < command.length) {
+        const next = command[i + 1]
+        out += next === '"' ? '"' : c + next
+        i += 2
+        continue
+      }
       // Inside a quote: keep $(...) command substitution in double quotes so the
       // real command remains scannable; keep all other text so patterns
       // (e.g. ~/.ssh/) still see quoted content.
@@ -456,6 +477,11 @@ export function stripQuotedLiterals(command: string): string {
       // keep text inside quotes (only strip the quote chars)
       out += c
       i++
+      continue
+    }
+    if (c === '\\' && i + 1 < command.length) {
+      out += c + command[i + 1]
+      i += 2
       continue
     }
     if (c === "'" || c === '"') {

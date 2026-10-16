@@ -7,6 +7,7 @@ import type {
 } from '../types/config.ts'
 import { wildcardMatch } from './wildcard-matcher.ts'
 import { collapseWhitespaceForMatching } from '../classifier/pattern-matcher.ts'
+import { stripEnvPrefix } from './command-prefix.ts'
 
 // ─── Legacy compat exports (tests only) ────────────────────────────────
 // These are the OLD API (tool:arg keys, wildcards). Kept so existing tests
@@ -61,6 +62,21 @@ function isPatternRuleArray(perm: ToolPermission): perm is PatternRule[] {
  */
 function ruleMatchesCall(rule: PatternRule, value: string): boolean {
   if (wildcardMatch(rule.pattern, value)) return true
+
+  const stripped = stripEnvPrefix(value)
+  if (stripped !== value) {
+    if (wildcardMatch(rule.pattern, stripped)) return true
+    if (rule.action !== 'allow') {
+      const collapsedStripped = collapseWhitespaceForMatching(stripped)
+      if (
+        collapsedStripped !== stripped &&
+        wildcardMatch(rule.pattern, collapsedStripped)
+      ) {
+        return true
+      }
+    }
+  }
+
   if (rule.action === 'allow') return false
   const collapsed = collapseWhitespaceForMatching(value)
   if (collapsed === value) return false

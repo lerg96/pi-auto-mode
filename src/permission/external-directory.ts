@@ -118,6 +118,15 @@ export function isEscapeDebris(raw: string): boolean {
   return ESCAPE_DEBRIS.has(raw.trim())
 }
 
+// Escaped shell operator/delimiter tokens like `\;`, `\(`, `\)`, `\{`, `\}`, etc.
+// In `find . -name "*.ts" -exec grep foo {} \;`, `\;` must not have `;` stripped
+// leaving `\` which is treated as a root directory candidate on Windows.
+const ESCAPED_SHELL_DELIMITER = /^\\[,;(){}[\]|&<>]$/
+
+export function isEscapedShellDelimiter(raw: string): boolean {
+  return ESCAPED_SHELL_DELIMITER.test(raw.trim())
+}
+
 // Lone `/X` (slash + single letter) on win32 is almost always a cmd-style
 // flag (`dir /b`, `cmd /c`) rather than a path. Skipped in shell extraction
 // only: structured fs values keep `/X` as a real absolute path, and posix
@@ -261,6 +270,11 @@ function tokenizeShell(segment: string): string[] {
       i++
       continue
     }
+    if (c === '\\' && i + 1 < segment.length) {
+      buf += c + segment[++i]
+      i++
+      continue
+    }
     if (c === ' ' || c === '\t' || c === '\n' || SHELL_SPLITTERS.has(c)) {
       flush()
       i++
@@ -274,6 +288,7 @@ function tokenizeShell(segment: string): string[] {
 }
 
 export function stripToken(t: string): string {
+  if (isEscapedShellDelimiter(t)) return ''
   return t.replace(/^['"`[{(]+|['"`\]},;]+$/g, '')
 }
 
@@ -332,6 +347,7 @@ export function selectPathCandidates(rawTokens: string[]): string[] {
   for (const token of rawTokens) {
     const eq = token.lastIndexOf('=')
     const raw = eq >= 0 ? token.slice(eq + 1) : token
+    if (isEscapedShellDelimiter(raw)) continue
     const cand = stripToken(raw)
     if (cand.length === 0) continue
     if (cand.startsWith('-')) continue

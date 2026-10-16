@@ -116,6 +116,31 @@ describe('gateToolCall', () => {
     await gateToolCall('bash', { command: 'safe' }, makeDeps())
   })
 
+  it('env prefix: allows command matching allow rule and denies command matching deny rule', async () => {
+    const customConfig: Config = {
+      ...config,
+      permissions: {
+        tools: {
+          bash: [
+            { pattern: 'python *', action: 'allow' },
+            { pattern: 'rm -rf *', action: 'deny' },
+          ],
+        },
+      },
+      activePermissionSets: [],
+    }
+    configState.set(customConfig)
+    const deps = makeDeps()
+
+    await expect(
+      gateToolCall('bash', { command: 'PYTHONPATH=. python -m pytest' }, deps)
+    ).resolves.not.toThrow()
+
+    await expect(
+      gateToolCall('bash', { command: 'FOO=1 rm -rf /' }, deps)
+    ).rejects.toThrow()
+  })
+
   it('C2: fail-closed — every blocked call is denied and escalation still advances', async () => {
     const deps = makeDeps()
     for (const cmd of ['echo spam a', 'echo spam b', 'echo spam c']) {

@@ -1,5 +1,6 @@
 import type { Rule, PermissionState } from './rule.ts'
 import { sessionPatternMatches } from './wildcard-matcher.ts'
+import { stripEnvPrefix } from './command-prefix.ts'
 
 type SessionRule = Rule
 
@@ -59,13 +60,33 @@ function patternCovers(
   if (exactEq || normEq) {
     return true
   }
-  return (
+  if (
     sessionPatternMatches(broad.pattern, narrow.pattern) ||
     sessionPatternMatches(
       normalizePattern(broad.pattern),
       normalizePattern(narrow.pattern)
     )
-  )
+  ) {
+    return true
+  }
+
+  const strippedNarrow = stripEnvPrefix(narrow.pattern)
+  if (strippedNarrow !== narrow.pattern) {
+    return (
+      sessionPatternMatches(broad.pattern, strippedNarrow) ||
+      sessionPatternMatches(
+        normalizePattern(broad.pattern),
+        normalizePattern(strippedNarrow)
+      ) ||
+      normalizePattern(broad.pattern) === normalizePattern(strippedNarrow)
+    )
+  }
+
+  return false
+}
+
+export function sessionPatternCovers(pattern: string, value: string): boolean {
+  return patternCovers({ pattern }, { pattern: value })
 }
 
 export class SessionRules {

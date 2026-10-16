@@ -1,6 +1,13 @@
-function tokenizeCommand(segment: string): string[] {
-  const tokens: string[] = []
+interface TokenSpan {
+  token: string
+  start: number
+  end: number
+}
+
+function tokenizeCommandWithSpans(segment: string): TokenSpan[] {
+  const tokens: TokenSpan[] = []
   let buf = ''
+  let tokenStart = -1
   let quote: "'" | '"' | null = null
   let i = 0
 
@@ -8,31 +15,44 @@ function tokenizeCommand(segment: string): string[] {
     const c = segment[i]
     if (quote) {
       if (quote === '"' && c === '\\' && i + 1 < segment.length) {
+        if (tokenStart === -1) tokenStart = i
         buf += c + segment[++i]
       } else if (c === quote) {
+        if (tokenStart === -1) tokenStart = i
         buf += c
         quote = null
       } else {
+        if (tokenStart === -1) tokenStart = i
         buf += c
       }
     } else if (c === '\\' && i + 1 < segment.length) {
+      if (tokenStart === -1) tokenStart = i
       buf += c + segment[++i]
     } else if (c === "'" || c === '"') {
+      if (tokenStart === -1) tokenStart = i
       buf += c
       quote = c
     } else if (c === ' ' || c === '\t' || c === '\n' || c === '\r') {
       if (buf.length > 0) {
-        tokens.push(buf)
+        tokens.push({ token: buf, start: tokenStart, end: i })
         buf = ''
+        tokenStart = -1
       }
     } else {
+      if (tokenStart === -1) tokenStart = i
       buf += c
     }
     i++
   }
 
-  if (buf.length > 0) tokens.push(buf)
+  if (buf.length > 0) {
+    tokens.push({ token: buf, start: tokenStart, end: segment.length })
+  }
   return tokens
+}
+
+function tokenizeCommand(segment: string): string[] {
+  return tokenizeCommandWithSpans(segment).map((t) => t.token)
 }
 
 const REDIR_TARGET_RE =
@@ -67,6 +87,28 @@ function filterRedirections(tokens: string[]): string[] {
 }
 
 const ENV_ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/
+
+export function stripEnvPrefix(command: string): string {
+  const trimmed = command.trim()
+  if (!trimmed) return trimmed
+  const tokens = tokenizeCommandWithSpans(command)
+  if (tokens.length === 0) return trimmed
+  if (!ENV_ASSIGN_RE.test(tokens[0].token)) return trimmed
+
+  let firstNonEnvIndex = -1
+  for (let i = 1; i < tokens.length; i++) {
+    if (!ENV_ASSIGN_RE.test(tokens[i].token)) {
+      firstNonEnvIndex = i
+      break
+    }
+  }
+
+  if (firstNonEnvIndex === -1) {
+    return trimmed
+  }
+
+  return command.slice(tokens[firstNonEnvIndex].start).trim()
+}
 
 export const HEREDOC_OP = /(^|[^<])<<[^<]/
 

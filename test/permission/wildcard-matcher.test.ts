@@ -51,6 +51,12 @@ describe('wildcardMatch / *', () => {
     expect(wildcardMatch('a**b', 'aXYZb')).toBe(true)
     expect(wildcardMatch('a**b', 'ab')).toBe(true)
   })
+
+  it('matches across newlines in multiline commands', () => {
+    expect(
+      wildcardMatch('python3 *', 'python3 -c "import sys\nprint(1)"')
+    ).toBe(true)
+  })
 })
 
 describe('wildcardMatch / ?', () => {

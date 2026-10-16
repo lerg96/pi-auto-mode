@@ -51,6 +51,7 @@ export {
   DATA_SINK_COMMANDS,
   isDataSinkCommand,
 } from '../permission/command-prefix.ts'
+import { extractArgv } from '../permission/command-prefix.ts'
 
 interface PendingHeredoc {
   target: number
@@ -124,6 +125,77 @@ function parseHeredocDelimiter(
 
   const rawSpec = command.slice(startSpec, i)
   return { delim, isQuoted, stripTabs, nextIndex: i, rawSpec }
+}
+
+export function normalizeLineContinuations(command: string): string {
+  let out = ''
+  let quote: "'" | '"' | null = null
+  let i = 0
+
+  while (i < command.length) {
+    const c = command[i]
+
+    if (quote === "'") {
+      out += c
+      if (c === "'") quote = null
+      i++
+      continue
+    }
+
+    if (quote === '"') {
+      if (c === '\\') {
+        const rest = command.slice(i + 1)
+        const m = rest.match(/^\r?\n/)
+        if (m) {
+          // Inside double quotes, bash removes \\\r?\n completely
+          i += 1 + m[0].length
+          continue
+        }
+        if (i + 1 < command.length) {
+          out += c + command[i + 1]
+          i += 2
+          continue
+        }
+      }
+      out += c
+      if (c === '"') quote = null
+      i++
+      continue
+    }
+
+    // Outside quotes
+    if (c === "'" || c === '"') {
+      quote = c
+      out += c
+      i++
+      continue
+    }
+
+    if (c === '\\') {
+      const rest = command.slice(i + 1)
+      const m = rest.match(/^\r?\n([ \t]*)/)
+      if (m) {
+        // Line continuation outside quotes
+        const hadLeadingWs = /[ \t]$/.test(out)
+        const trailingWs = m[1]
+        if (hadLeadingWs || trailingWs.length > 0) {
+          out = out.replace(/[ \t]+$/, '') + ' '
+        }
+        i += 1 + m[0].length
+        continue
+      }
+      if (i + 1 < command.length) {
+        out += c + command[i + 1]
+        i += 2
+        continue
+      }
+    }
+
+    out += c
+    i++
+  }
+
+  return out
 }
 
 export function readParenSub(command: string, from: number): [string, number] {
@@ -202,28 +274,355 @@ export function readBacktickSub(
   return [sub.trim(), j < command.length ? j + 1 : j]
 }
 
+export function readBraceExpansion(
+  command: string,
+  from: number
+): [string, number] {
+  let inner = ''
+  let j = from
+  let quote: "'" | '"' | null = null
+
+  while (j < command.length) {
+    const sc = command[j]
+
+    if (quote) {
+      if (quote === '"' && sc === '\\' && j + 1 < command.length) {
+        inner += sc + command[j + 1]
+        j += 2
+        continue
+      }
+      if (sc === quote) {
+        quote = null
+        inner += sc
+        j++
+        continue
+      }
+      if (quote === '"' && sc === '$' && command[j + 1] === '{') {
+        const [nested, nextJ] = readBraceExpansion(command, j + 2)
+        inner += '${' + nested + '}'
+        j = nextJ
+        continue
+      }
+      if (quote === '"' && sc === '$' && command[j + 1] === '(') {
+        const [nested, nextJ] = readParenSub(command, j + 2)
+        inner += '$(' + nested + ')'
+        j = nextJ
+        continue
+      }
+      if (quote === '"' && sc === '`') {
+        const [nested, nextJ] = readBacktickSub(command, j + 1)
+        inner += '`' + nested + '`'
+        j = nextJ
+        continue
+      }
+      inner += sc
+      j++
+      continue
+    }
+
+    if (sc === '\\' && j + 1 < command.length) {
+      inner += sc + command[j + 1]
+      j += 2
+      continue
+    }
+    if (sc === "'" || sc === '"') {
+      quote = sc
+      inner += sc
+      j++
+      continue
+    }
+    if (sc === '$' && command[j + 1] === '{') {
+      const [nested, nextJ] = readBraceExpansion(command, j + 2)
+      inner += '${' + nested + '}'
+      j = nextJ
+      continue
+    }
+    if (sc === '$' && command[j + 1] === '(') {
+      const [nested, nextJ] = readParenSub(command, j + 2)
+      inner += '$(' + nested + ')'
+      j = nextJ
+      continue
+    }
+    if (sc === '`') {
+      const [nested, nextJ] = readBacktickSub(command, j + 1)
+      inner += '`' + nested + '`'
+      j = nextJ
+      continue
+    }
+    if (sc === '}') {
+      j++ // skip '}'
+      break
+    }
+    inner += sc
+    j++
+  }
+
+  return [inner, j]
+}
+
+function hasOnlyNullRedirectionsOrTimeout(rest: string): boolean {
+  let cur = rest.trim()
+  const allowed =
+    /^(?:\s+|\(timeout\s+[^)]*\)|[0-9]*>&[0-9]+-?|[0-9]*<&[0-9]+-?|[0-9]*>&-|[0-9]*<&-|(?:[0-9]*>{1,2}|&>{1,2}|[0-9]*<)\s*(?:\/dev\/null|NUL\b))/i
+  while (cur.length > 0) {
+    const match = cur.match(allowed)
+    if (!match) return false
+    cur = cur.slice(match[0].length).trim()
+  }
+  return true
+}
+
 export function isBareShellKeyword(s: string): boolean {
-  return /^(?:do|done|then|else|fi|esac)(?:\s+\(timeout\s+[^)]*\))?$/.test(
-    s.trim()
-  )
+  const trimmed = s.trim()
+  if (
+    trimmed === ')' ||
+    trimmed === '}' ||
+    trimmed === '(' ||
+    trimmed === '{'
+  ) {
+    return true
+  }
+  const argv = extractArgv(trimmed)
+  if (argv.length === 1 && /^(?:do|done|then|else|fi|esac)$/.test(argv[0])) {
+    const rest = trimmed.replace(/^(?:do|done|then|else|fi|esac)\b/, '')
+    return hasOnlyNullRedirectionsOrTimeout(rest)
+  }
+  return false
+}
+
+function countUnquotedParens(s: string): { open: number; close: number } {
+  let open = 0
+  let close = 0
+  let quote: "'" | '"' | null = null
+  let i = 0
+  while (i < s.length) {
+    const c = s[i]
+    if (quote) {
+      if (quote === '"' && c === '\\' && i + 1 < s.length) {
+        i += 2
+        continue
+      }
+      if (c === quote) {
+        quote = null
+      }
+      i++
+      continue
+    }
+    if (c === '\\' && i + 1 < s.length) {
+      i += 2
+      continue
+    }
+    if (c === "'" || c === '"') {
+      quote = c
+      i++
+      continue
+    }
+    if (c === '(') open++
+    else if (c === ')') close++
+    i++
+  }
+  return { open, close }
+}
+
+function isTrailingBraceFromDollar(s: string): boolean {
+  let dollarBraces = 0
+  let quote: "'" | '"' | null = null
+  let i = 0
+  while (i < s.length - 1) {
+    const c = s[i]
+    if (quote) {
+      if (quote === '"' && c === '\\' && i + 1 < s.length) {
+        i += 2
+        continue
+      }
+      if (c === quote) quote = null
+      i++
+      continue
+    }
+    if (c === '\\' && i + 1 < s.length) {
+      i += 2
+      continue
+    }
+    if (c === "'" || c === '"') {
+      quote = c
+      i++
+      continue
+    }
+    if (c === '$' && s[i + 1] === '{') {
+      dollarBraces++
+      i += 2
+      continue
+    }
+    if (c === '}') {
+      if (dollarBraces > 0) dollarBraces--
+    }
+    i++
+  }
+  return dollarBraces > 0
 }
 
 export function stripLeadingShellKeywords(s: string): string {
   let cur = s.trim()
   if (isBareShellKeyword(cur)) return cur
-  const pattern = /^(?:do|then|else|if|elif|while|until)\s+/
-  while (pattern.test(cur)) {
-    cur = cur.replace(pattern, '').trim()
+
+  const kwPattern = /^(?:do|then|else|if|elif|while|until)\s+/
+  while (true) {
+    const prev = cur
+    if (kwPattern.test(cur)) {
+      cur = cur.replace(kwPattern, '').trim()
+    }
+    if (/^\{\s+/.test(cur)) {
+      cur = cur.replace(/^\{\s+/, '').trim()
+    }
+    if (
+      cur.startsWith('(') &&
+      !cur.startsWith('$(') &&
+      !cur.startsWith('<(') &&
+      !cur.startsWith('>(')
+    ) {
+      cur = cur.slice(1).trim()
+    }
+    if (cur === prev) break
   }
+
+  // Trailing unbalanced )
+  const parens = countUnquotedParens(cur)
+  while (cur.endsWith(')') && parens.close > parens.open) {
+    cur = cur.slice(0, -1).trimEnd()
+    parens.close--
+  }
+
+  // Trailing } preceded by whitespace (or s === '}') when not inside ${...}
+  while (
+    cur === '}' ||
+    (/\s+\}$/.test(cur) && !isTrailingBraceFromDollar(cur))
+  ) {
+    if (cur === '}') {
+      cur = ''
+      break
+    }
+    cur = cur.replace(/\s+\}$/, '').trimEnd()
+  }
+
   return cur
 }
 
 export function isShellStructureSegment(s: string): boolean {
   const trimmed = s.trim()
-  return (
-    isBareShellKeyword(trimmed) ||
-    /^(?:for|select)\s+[A-Za-z_][A-Za-z0-9_]*(?:\s+in\b[\s\S]*)?$/.test(trimmed)
+  if (isBareShellKeyword(trimmed)) return true
+  const argv = extractArgv(trimmed)
+  if (argv.length === 1 && /^(?:do|done|then|else|fi|esac)$/.test(argv[0])) {
+    return true
+  }
+  return /^(?:for|select)\s+[A-Za-z_][A-Za-z0-9_]*(?:\s+in\b[\s\S]*)?$/.test(
+    trimmed
   )
+}
+
+function tokenizeForFind(
+  s: string,
+  keepQuotes: boolean
+): { text: string; quoted: boolean }[] {
+  const tokens: { text: string; quoted: boolean }[] = []
+  let buf = ''
+  let quote: "'" | '"' | null = null
+  let tokenQuoted = false
+  let i = 0
+
+  while (i < s.length) {
+    const c = s[i]
+    if (quote) {
+      if (quote === '"' && c === '\\' && i + 1 < s.length) {
+        buf += keepQuotes ? c + s[i + 1] : s[i + 1]
+        i += 2
+        continue
+      }
+      if (c === quote) {
+        if (keepQuotes) buf += c
+        quote = null
+        i++
+        continue
+      }
+      buf += c
+      i++
+      continue
+    }
+
+    if (c === '\\' && i + 1 < s.length) {
+      buf += c + s[i + 1]
+      i += 2
+      continue
+    }
+    if (c === "'" || c === '"') {
+      if (keepQuotes) buf += c
+      quote = c
+      tokenQuoted = true
+      i++
+      continue
+    }
+    if (c === ' ' || c === '\t' || c === '\n' || c === '\r') {
+      if (buf.length > 0) {
+        tokens.push({ text: buf, quoted: tokenQuoted })
+        buf = ''
+        tokenQuoted = false
+      }
+      i++
+      continue
+    }
+    buf += c
+    i++
+  }
+  if (buf.length > 0) {
+    tokens.push({ text: buf, quoted: tokenQuoted })
+  }
+  return tokens
+}
+
+export function extractFindExecSegments(
+  segValue: string,
+  opts?: { keepQuotes?: boolean }
+): CommandSegment[] {
+  const argv = extractArgv(segValue)
+  if (argv.length === 0) return []
+  if (!/(?:^|[/\\])find(?:\.exe)?$/i.test(argv[0])) return []
+
+  const keep = opts?.keepQuotes === true
+  const tokens = tokenizeForFind(segValue, keep)
+  const results: CommandSegment[] = []
+
+  let i = 0
+  while (i < tokens.length) {
+    if (/^-(?:exec|execdir|ok|okdir)$/.test(tokens[i].text)) {
+      i++
+      const execTokens: { text: string; quoted: boolean }[] = []
+      while (i < tokens.length) {
+        const t = tokens[i].text
+        if (
+          t === '\\;' ||
+          t === ';' ||
+          t === "';'" ||
+          t === '";"' ||
+          t === '+'
+        ) {
+          i++
+          break
+        }
+        execTokens.push(tokens[i])
+        i++
+      }
+      if (execTokens.length > 0 && execTokens[0].text === '{}') {
+        execTokens.shift()
+      }
+      if (execTokens.length > 0) {
+        const execCmd = execTokens.map((t) => t.text).join(' ')
+        results.push({ value: execCmd, quoted: false })
+      }
+    } else {
+      i++
+    }
+  }
+
+  return results
 }
 
 function scanSubshells(
@@ -262,6 +661,7 @@ export function segmentCommand(
   command: string,
   opts?: { keepQuotes?: boolean }
 ): CommandSegment[] {
+  const cleanCommand = normalizeLineContinuations(command)
   const keep = opts?.keepQuotes === true
   const segments: CommandSegment[] = []
   let pendingSubSegments: CommandSegment[] = []
@@ -269,6 +669,7 @@ export function segmentCommand(
   let quoted = false
   let quote: "'" | '"' | null = null
   let pendingHeredocs: PendingHeredoc[] = []
+  let inDoubleBracket = false
 
   const flush = () => {
     const value = stripLeadingShellKeywords(buf.trim())
@@ -292,6 +693,10 @@ export function segmentCommand(
           h.target = segIndex
         }
       }
+      const findExecSegs = extractFindExecSegments(value, opts)
+      for (const fes of findExecSegs) {
+        segments.push(fes)
+      }
     }
     for (const sub of pendingSubSegments) {
       segments.push(sub)
@@ -302,8 +707,12 @@ export function segmentCommand(
   }
 
   const handleParenSub = (from: number): number => {
-    const [sub, next] = readParenSub(command, from)
-    if (command[from] === '(' && sub.startsWith('(') && sub.endsWith(')')) {
+    const [sub, next] = readParenSub(cleanCommand, from)
+    if (
+      cleanCommand[from] === '(' &&
+      sub.startsWith('(') &&
+      sub.endsWith(')')
+    ) {
       buf += '$(' + (keep ? sub : stripQuotedLiterals(sub)) + ')'
       const nested = scanSubshells(sub.slice(1, -1), opts)
       for (const s of nested) {
@@ -321,7 +730,7 @@ export function segmentCommand(
   }
 
   const handleBacktickSub = (from: number): number => {
-    const [sub, next] = readBacktickSub(command, from)
+    const [sub, next] = readBacktickSub(cleanCommand, from)
     buf += '`' + (keep ? sub : stripQuotedLiterals(sub)) + '`'
     if (sub.length > 0) {
       for (const seg of segmentCommand(sub, opts)) {
@@ -332,18 +741,19 @@ export function segmentCommand(
   }
 
   let i = 0
-  while (i < command.length) {
-    const c = command[i]
+  while (i < cleanCommand.length) {
+    const c = cleanCommand[i]
 
-    // heredoc operator — look for << delimiter (not <<< herestring, and outside quotes)
+    // heredoc operator — look for << delimiter (not <<< herestring, outside quotes, not in [[ ]])
     if (
       !quote &&
-      (i === 0 || command[i - 1] !== '<') &&
-      command[i] === '<' &&
-      command[i + 1] === '<' &&
-      command[i + 2] !== '<'
+      !inDoubleBracket &&
+      (i === 0 || cleanCommand[i - 1] !== '<') &&
+      cleanCommand[i] === '<' &&
+      cleanCommand[i + 1] === '<' &&
+      cleanCommand[i + 2] !== '<'
     ) {
-      const parsed = parseHeredocDelimiter(command, i)
+      const parsed = parseHeredocDelimiter(cleanCommand, i)
       buf += parsed.rawSpec
       pendingHeredocs.push({
         target: -1,
@@ -355,9 +765,56 @@ export function segmentCommand(
       continue
     }
 
+    // Process substitution <(...) or >(...) outside quotes and not in [[ ]]
+    if (
+      !quote &&
+      !inDoubleBracket &&
+      (c === '<' || c === '>') &&
+      cleanCommand[i + 1] === '(' &&
+      (c !== '<' || i === 0 || cleanCommand[i - 1] !== '<')
+    ) {
+      const [sub, next] = readParenSub(cleanCommand, i + 2)
+      buf += `${c}(${keep ? sub : stripQuotedLiterals(sub)})`
+      if (sub.length > 0) {
+        for (const seg of segmentCommand(sub, opts)) {
+          pendingSubSegments.push(seg)
+        }
+      }
+      i = next
+      continue
+    }
+
+    // [[ ... ]] conditional block entry
+    if (
+      !quote &&
+      !inDoubleBracket &&
+      cleanCommand[i] === '[' &&
+      cleanCommand[i + 1] === '[' &&
+      (i === 0 || /[\s;(&|]/.test(cleanCommand[i - 1])) &&
+      (i + 2 >= cleanCommand.length || /\s/.test(cleanCommand[i + 2]))
+    ) {
+      inDoubleBracket = true
+      buf += '[['
+      i += 2
+      continue
+    }
+
+    // [[ ... ]] conditional block exit
+    if (
+      !quote &&
+      inDoubleBracket &&
+      cleanCommand[i] === ']' &&
+      cleanCommand[i + 1] === ']'
+    ) {
+      inDoubleBracket = false
+      buf += ']]'
+      i += 2
+      continue
+    }
+
     if (quote) {
-      if (quote === '"' && c === '\\' && i + 1 < command.length) {
-        const next = command[i + 1]
+      if (quote === '"' && c === '\\' && i + 1 < cleanCommand.length) {
+        const next = cleanCommand[i + 1]
         if (next === '"' || next === '\\' || next === '$' || next === '`') {
           buf += keep ? c + next : next
         } else {
@@ -366,9 +823,17 @@ export function segmentCommand(
         i += 2
         continue
       }
-      // Inside a quote: only command substitution is active in double quotes.
-      // In single quotes `$(`/`...` are literal and must not be extracted.
-      if (quote === '"' && c === '$' && command[i + 1] === '(') {
+      if (quote === '"' && c === '$' && cleanCommand[i + 1] === '{') {
+        const [inner, next] = readBraceExpansion(cleanCommand, i + 2)
+        const subs = scanSubshells(inner, opts)
+        for (const s of subs) {
+          pendingSubSegments.push(s)
+        }
+        buf += '${' + (keep ? inner : stripQuotedLiterals(inner)) + '}'
+        i = next
+        continue
+      }
+      if (quote === '"' && c === '$' && cleanCommand[i + 1] === '(') {
         i = handleParenSub(i + 2)
         continue
       }
@@ -386,9 +851,10 @@ export function segmentCommand(
       i++
       continue
     }
-    // Outside any quote.
-    if (c === '\\' && i + 1 < command.length) {
-      buf += c + command[i + 1]
+
+    // Outside any quote
+    if (c === '\\' && i + 1 < cleanCommand.length) {
+      buf += c + cleanCommand[i + 1]
       i += 2
       continue
     }
@@ -399,7 +865,18 @@ export function segmentCommand(
       i++
       continue
     }
+    if (c === '$' && cleanCommand[i + 1] === '{') {
+      const [inner, next] = readBraceExpansion(cleanCommand, i + 2)
+      const subs = scanSubshells(inner, opts)
+      for (const s of subs) {
+        pendingSubSegments.push(s)
+      }
+      buf += '${' + (keep ? inner : stripQuotedLiterals(inner)) + '}'
+      i = next
+      continue
+    }
     if (c === ';' || c === '\n') {
+      inDoubleBracket = false
       if (c === '\n' && pendingHeredocs.length > 0) {
         flush()
         let curPos = i + 1
@@ -410,9 +887,9 @@ export function segmentCommand(
           let foundDelim = false
           let delimLineEnd = curPos
 
-          while (curPos < command.length && !foundDelim) {
-            if (command[curPos] === '\n') {
-              let line = command.slice(lineStart, curPos)
+          while (curPos < cleanCommand.length && !foundDelim) {
+            if (cleanCommand[curPos] === '\n') {
+              let line = cleanCommand.slice(lineStart, curPos)
               if (line.endsWith('\r')) line = line.slice(0, -1)
               const lineCheck = h.stripTabs ? line.replace(/^\t+/, '') : line
               if (lineCheck.trimEnd() === h.delim) {
@@ -428,7 +905,7 @@ export function segmentCommand(
           }
 
           if (!foundDelim) {
-            let line = command.slice(lineStart, curPos)
+            let line = cleanCommand.slice(lineStart, curPos)
             if (line.endsWith('\r')) line = line.slice(0, -1)
             const lineCheck = h.stripTabs ? line.replace(/^\t+/, '') : line
             if (lineCheck.trimEnd() === h.delim) {
@@ -440,16 +917,16 @@ export function segmentCommand(
           let heredocChunk = ''
           let bodyText = ''
           if (foundDelim) {
-            heredocChunk = command.slice(bodyStart - 1, delimLineEnd)
-            bodyText = command.slice(
+            heredocChunk = cleanCommand.slice(bodyStart - 1, delimLineEnd)
+            bodyText = cleanCommand.slice(
               bodyStart,
               lineStart > bodyStart ? lineStart - 1 : bodyStart
             )
             curPos = delimLineEnd
           } else {
-            heredocChunk = command.slice(bodyStart - 1)
-            bodyText = command.slice(bodyStart)
-            curPos = command.length
+            heredocChunk = cleanCommand.slice(bodyStart - 1)
+            bodyText = cleanCommand.slice(bodyStart)
+            curPos = cleanCommand.length
           }
 
           if (h.target >= 0 && h.target < segments.length) {
@@ -481,23 +958,28 @@ export function segmentCommand(
       continue
     }
     if (c === '|') {
-      // consume ALL consecutive | chars (handles ||, |||, |&) as one separator
-      while (i < command.length && command[i] === '|') i++
-      // |& — pipe stderr too — consume trailing &
-      if (i < command.length && command[i] === '&') i++
+      if (inDoubleBracket) {
+        buf += c
+        i++
+        continue
+      }
+      while (i < cleanCommand.length && cleanCommand[i] === '|') i++
+      if (i < cleanCommand.length && cleanCommand[i] === '&') i++
       flush()
       continue
     }
-    if (c === '&' && command[i + 1] === '&') {
+    if (c === '&' && cleanCommand[i + 1] === '&') {
+      if (inDoubleBracket) {
+        buf += '&&'
+        i += 2
+        continue
+      }
       flush()
       i += 2
       continue
     }
-    // Redirections using &:
-    // - &> or &>> (redirect stdout and stderr)
-    // - >& or <& (duplicate or close file descriptor, e.g. 2>&1, >&2, <&0, >&-, <&-)
     if (
-      (c === '&' && command[i + 1] === '>') ||
+      (c === '&' && cleanCommand[i + 1] === '>') ||
       (c === '&' && (buf.endsWith('>') || buf.endsWith('<')))
     ) {
       buf += c
@@ -505,12 +987,21 @@ export function segmentCommand(
       continue
     }
     if (c === '&') {
-      // bare & (not &&) — background separator
+      if (inDoubleBracket) {
+        buf += c
+        i++
+        continue
+      }
       flush()
       i++
       continue
     }
-    if (c === '$' && command[i + 1] === '(') {
+    if (inDoubleBracket && (c === '<' || c === '>')) {
+      buf += c
+      i++
+      continue
+    }
+    if (c === '$' && cleanCommand[i + 1] === '(') {
       i = handleParenSub(i + 2)
       continue
     }
@@ -531,23 +1022,30 @@ export function splitShellSegments(command: string): string[] {
  * intact, so trust-boundary / block rules still see the text inside quotes.
  */
 export function stripQuotedLiterals(command: string): string {
+  const cleanCommand = normalizeLineContinuations(command)
   let out = ''
   let quote: "'" | '"' | null = null
   let i = 0
-  while (i < command.length) {
-    const c = command[i]
+  while (i < cleanCommand.length) {
+    const c = cleanCommand[i]
     if (quote) {
-      if (quote === '"' && c === '\\' && i + 1 < command.length) {
-        const next = command[i + 1]
+      if (quote === '"' && c === '\\' && i + 1 < cleanCommand.length) {
+        const next = cleanCommand[i + 1]
         out += next === '"' ? '"' : c + next
         i += 2
+        continue
+      }
+      if (quote === '"' && c === '$' && cleanCommand[i + 1] === '{') {
+        const [inner, next] = readBraceExpansion(cleanCommand, i + 2)
+        out += '${' + stripQuotedLiterals(inner) + '}'
+        i = next
         continue
       }
       // Inside a quote: keep $(...) command substitution in double quotes so the
       // real command remains scannable; keep all other text so patterns
       // (e.g. ~/.ssh/) still see quoted content.
-      if (quote === '"' && c === '$' && command[i + 1] === '(') {
-        const [sub, next] = readParenSub(command, i + 2)
+      if (quote === '"' && c === '$' && cleanCommand[i + 1] === '(') {
+        const [sub, next] = readParenSub(cleanCommand, i + 2)
         out += '$(' + sub + ')'
         i = next
         continue
@@ -562,14 +1060,30 @@ export function stripQuotedLiterals(command: string): string {
       i++
       continue
     }
-    if (c === '\\' && i + 1 < command.length) {
-      out += c + command[i + 1]
+    if (c === '\\' && i + 1 < cleanCommand.length) {
+      out += c + cleanCommand[i + 1]
       i += 2
       continue
     }
     if (c === "'" || c === '"') {
       quote = c
       i++
+      continue
+    }
+    if (c === '$' && cleanCommand[i + 1] === '{') {
+      const [inner, next] = readBraceExpansion(cleanCommand, i + 2)
+      out += '${' + stripQuotedLiterals(inner) + '}'
+      i = next
+      continue
+    }
+    if (
+      (c === '<' || c === '>') &&
+      cleanCommand[i + 1] === '(' &&
+      (c !== '<' || i === 0 || cleanCommand[i - 1] !== '<')
+    ) {
+      const [sub, next] = readParenSub(cleanCommand, i + 2)
+      out += `${c}(${stripQuotedLiterals(sub)})`
+      i = next
       continue
     }
     out += c

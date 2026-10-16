@@ -112,4 +112,36 @@ describe('evaluate', () => {
     ]
     expect(evaluate('shell', 'rm -rf /tmp', rs).action).toBe('allow')
   })
+
+  it('matches allow rule python * when command has env prefix PYTHONPATH=.', () => {
+    const rs: Ruleset = [
+      { surface: 'shell', pattern: 'python *', action: 'allow' },
+    ]
+    expect(evaluate('shell', 'PYTHONPATH=. python -m pytest', rs).action).toBe(
+      'allow'
+    )
+  })
+
+  it('catches FOO=1 rm -rf / under deny rule rm -rf *', () => {
+    const rs: Ruleset = [
+      { surface: 'bash', pattern: 'rm -rf *', action: 'deny' },
+    ]
+    expect(evaluate('bash', 'FOO=1 rm -rf /', rs).action).toBe('deny')
+  })
+
+  it('catches LD_PRELOAD=/evil.so ls under deny rule LD_PRELOAD=*', () => {
+    const rs: Ruleset = [
+      { surface: 'shell', pattern: 'LD_PRELOAD=*', action: 'deny' },
+    ]
+    expect(evaluate('shell', 'LD_PRELOAD=/evil.so ls', rs).action).toBe('deny')
+  })
+
+  it('matches multiline commands under wildcard allow rule', () => {
+    const rs: Ruleset = [
+      { surface: 'shell', pattern: 'python3 *', action: 'allow' },
+    ]
+    expect(
+      evaluate('shell', 'python3 -c "import sys\nprint(1)"', rs).action
+    ).toBe('allow')
+  })
 })

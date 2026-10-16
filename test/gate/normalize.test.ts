@@ -4,6 +4,11 @@ import {
   splitShellSegments,
   segmentCommand,
   stripQuotedLiterals,
+  isBareShellKeyword,
+  isShellStructureSegment,
+  stripLeadingShellKeywords,
+  readBraceExpansion,
+  extractFindExecSegments,
 } from '../../src/gate/normalize.ts'
 
 describe('surfaceForTool', () => {
@@ -434,6 +439,316 @@ rm -f /tmp/agy1.txt /tmp/agy2.txt /tmp/agy3.txt`
       'echo 0',
       'tail -n 55 "$f" 2>/dev/null',
       'rm -f /tmp/agy1.txt /tmp/agy2.txt /tmp/agy3.txt',
+    ])
+  })
+})
+
+describe('subshells and brace groups (Item 2)', () => {
+  it('splits subshell into inner command segments', () => {
+    const segs = segmentCommand('(cd /tmp && npm test)')
+    expect(segs.map((s) => s.value)).toEqual(['cd /tmp', 'npm test'])
+  })
+
+  it('handles subshell with single command', () => {
+    const segs = segmentCommand('(npm test)')
+    expect(segs.map((s) => s.value)).toEqual(['npm test'])
+  })
+
+  it('handles nested subshells', () => {
+    const segs = segmentCommand('(cd /tmp && (cd /var && npm test))')
+    expect(segs.map((s) => s.value)).toEqual(['cd /tmp', 'cd /var', 'npm test'])
+  })
+
+  it('splits brace group into segments and drops bare closing brace', () => {
+    const segs = segmentCommand('{ echo a; echo b; }')
+    expect(segs.map((s) => s.value)).toEqual(['echo a', 'echo b'])
+  })
+
+  it('handles brace group without trailing semicolon before closing brace', () => {
+    const segs = segmentCommand('{ echo a; echo b }')
+    expect(segs.map((s) => s.value)).toEqual(['echo a', 'echo b'])
+  })
+
+  it('recognizes bare braces and parens as keywords', () => {
+    expect(isBareShellKeyword('(')).toBe(true)
+    expect(isBareShellKeyword(')')).toBe(true)
+    expect(isBareShellKeyword('{')).toBe(true)
+    expect(isBareShellKeyword('}')).toBe(true)
+  })
+
+  it('preserves balanced parens in normal commands', () => {
+    expect(stripLeadingShellKeywords('echo (foo)')).toBe('echo (foo)')
+    expect(stripLeadingShellKeywords('echo $(cat file)')).toBe(
+      'echo $(cat file)'
+    )
+  })
+
+  it('strips extra unbalanced closing parens', () => {
+    expect(stripLeadingShellKeywords('npm test)')).toBe('npm test')
+    expect(stripLeadingShellKeywords('echo (foo))')).toBe('echo (foo)')
+  })
+
+  it('preserves 1:1 parity between plain and raw for subshells and brace groups', () => {
+    const cmd1 = '(cd /tmp && npm test "suite a")'
+    const plain1 = segmentCommand(cmd1)
+    const raw1 = segmentCommand(cmd1, { keepQuotes: true })
+    expect(raw1).toHaveLength(plain1.length)
+    expect(raw1.map((s) => s.quoted)).toEqual(plain1.map((s) => s.quoted))
+    expect(plain1.map((s) => s.value)).toEqual(['cd /tmp', 'npm test suite a'])
+    expect(raw1.map((s) => s.value)).toEqual(['cd /tmp', 'npm test "suite a"'])
+
+    const cmd2 = '{ echo "a"; echo \'b\'; }'
+    const plain2 = segmentCommand(cmd2)
+    const raw2 = segmentCommand(cmd2, { keepQuotes: true })
+    expect(raw2).toHaveLength(plain2.length)
+    expect(raw2.map((s) => s.quoted)).toEqual(plain2.map((s) => s.quoted))
+    expect(plain2.map((s) => s.value)).toEqual(['echo a', 'echo b'])
+    expect(raw2.map((s) => s.value)).toEqual(['echo "a"', "echo 'b'"])
+  })
+})
+
+describe('line continuations (Item 3)', () => {
+  it('collapses line continuations with LF into a single segment', () => {
+    const segs = segmentCommand('echo hello \\\n  world')
+    expect(segs).toHaveLength(1)
+    expect(segs[0].value).toBe('echo hello world')
+  })
+
+  it('collapses line continuations with CRLF into a single segment', () => {
+    const segs = segmentCommand('echo hello \\\r\n  world')
+    expect(segs).toHaveLength(1)
+    expect(segs[0].value).toBe('echo hello world')
+  })
+
+  it('collapses multiple line continuations', () => {
+    const segs = segmentCommand('echo hello \\\n  beautiful \\\n  world')
+    expect(segs).toHaveLength(1)
+    expect(segs[0].value).toBe('echo hello beautiful world')
+  })
+
+  it('removes line continuations completely inside double quotes', () => {
+    const segs = segmentCommand('"echo hello \\\nworld"')
+    expect(segs).toHaveLength(1)
+    expect(segs[0].value).toBe('echo hello world')
+    const raw = segmentCommand('"echo hello \\\nworld"', { keepQuotes: true })
+    expect(raw[0].value).toBe('"echo hello world"')
+  })
+
+  it('preserves backslash as literal inside single quotes', () => {
+    const segs = segmentCommand("'echo hello \\\nworld'")
+    expect(segs).toHaveLength(1)
+    expect(segs[0].value).toBe('echo hello \\\nworld')
+  })
+
+  it('preserves 1:1 parity between plain and raw for line continuations', () => {
+    const cmd = 'echo "hello\\\nworld" && echo \\\n  next'
+    const plain = segmentCommand(cmd)
+    const raw = segmentCommand(cmd, { keepQuotes: true })
+    expect(raw).toHaveLength(plain.length)
+    expect(raw.map((s) => s.quoted)).toEqual(plain.map((s) => s.quoted))
+    expect(plain.map((s) => s.value)).toEqual(['echo helloworld', 'echo next'])
+    expect(raw.map((s) => s.value)).toEqual(['echo "helloworld"', 'echo next'])
+  })
+})
+
+describe('keywords with redirections (Item 4)', () => {
+  it('drops done 2>/dev/null as bare shell keyword', () => {
+    expect(isBareShellKeyword('done 2>/dev/null')).toBe(true)
+    expect(isShellStructureSegment('done 2>/dev/null')).toBe(true)
+    const segs = segmentCommand('for i in 1; do echo $i; done 2>/dev/null')
+    expect(segs.map((s) => s.value)).toEqual(['for i in 1', 'echo $i'])
+    expect(segs.map((s) => s.value)).not.toContain('done 2>/dev/null')
+  })
+
+  it('drops fi >/dev/null 2>&1 as bare shell keyword', () => {
+    expect(isBareShellKeyword('fi >/dev/null 2>&1')).toBe(true)
+    expect(isShellStructureSegment('fi >/dev/null 2>&1')).toBe(true)
+  })
+
+  it('keeps done > /tmp/out.txt for external directory inspection but marks as structure segment', () => {
+    expect(isBareShellKeyword('done > /tmp/out.txt')).toBe(false)
+    expect(isShellStructureSegment('done > /tmp/out.txt')).toBe(true)
+
+    const segs = segmentCommand('for i in 1; do echo $i; done > /tmp/out.txt')
+    const values = segs.map((s) => s.value)
+    expect(values).toContain('done > /tmp/out.txt')
+    expect(values).toEqual(['for i in 1', 'echo $i', 'done > /tmp/out.txt'])
+  })
+
+  it('preserves 1:1 parity between plain and raw for keywords with redirections', () => {
+    const cmd = 'for i in 1; do echo "$i"; done > /tmp/out.txt'
+    const plain = segmentCommand(cmd)
+    const raw = segmentCommand(cmd, { keepQuotes: true })
+    expect(raw).toHaveLength(plain.length)
+    expect(raw.map((s) => s.quoted)).toEqual(plain.map((s) => s.quoted))
+    expect(plain.map((s) => s.value)).toEqual([
+      'for i in 1',
+      'echo $i',
+      'done > /tmp/out.txt',
+    ])
+    expect(raw.map((s) => s.value)).toEqual([
+      'for i in 1',
+      'echo "$i"',
+      'done > /tmp/out.txt',
+    ])
+  })
+})
+
+describe('parameter expansion and [[ ... ]] conditional blocks (Item 5)', () => {
+  it('does not split [[ -f a.txt && -f b.txt ]] on internal operators', () => {
+    const segs = segmentCommand('[[ -f a.txt && -f b.txt ]] && echo ok')
+    expect(segs.map((s) => s.value)).toEqual([
+      '[[ -f a.txt && -f b.txt ]]',
+      'echo ok',
+    ])
+  })
+
+  it('does not split [[ ... ]] on internal pipe or ||', () => {
+    const segs = segmentCommand('[[ -f a || -f b ]] | cat')
+    expect(segs.map((s) => s.value)).toEqual(['[[ -f a || -f b ]]', 'cat'])
+  })
+
+  it('extracts command substitution from within [[ ... ]]', () => {
+    const segs = segmentCommand('[[ -f a.txt && $(echo ok) == ok ]]')
+    expect(segs.map((s) => s.value)).toEqual([
+      '[[ -f a.txt && $(echo ok) == ok ]]',
+      'echo ok',
+    ])
+  })
+
+  it('keeps parameter expansion with pipe intact as single segment', () => {
+    const segs = segmentCommand('echo "${FOO:-a|b}"')
+    expect(segs).toHaveLength(1)
+    expect(segs[0].value).toBe('echo ${FOO:-a|b}')
+  })
+
+  it('keeps parameter expansion with inner quotes intact without closing outer quote prematurely', () => {
+    const segs = segmentCommand('echo "${FOO:-"a|b"}"')
+    expect(segs).toHaveLength(1)
+    expect(segs[0].value).toBe('echo ${FOO:-a|b}')
+    const raw = segmentCommand('echo "${FOO:-"a|b"}"', { keepQuotes: true })
+    expect(raw).toHaveLength(1)
+    expect(raw[0].value).toBe('echo "${FOO:-"a|b"}"')
+  })
+
+  it('extracts command substitution from parameter expansion', () => {
+    const segs = segmentCommand('echo "${FOO:-$(cat /tmp/secret)}"')
+    expect(segs.map((s) => s.value)).toEqual([
+      'echo ${FOO:-$(cat /tmp/secret)}',
+      'cat /tmp/secret',
+    ])
+  })
+
+  it('preserves 1:1 parity between plain and raw for parameter expansions and [[ ... ]]', () => {
+    const cmd = '[[ -f a.txt && -f "b.txt" ]] && echo "${FOO:-x|y}"'
+    const plain = segmentCommand(cmd)
+    const raw = segmentCommand(cmd, { keepQuotes: true })
+    expect(raw).toHaveLength(plain.length)
+    expect(raw.map((s) => s.quoted)).toEqual(plain.map((s) => s.quoted))
+    expect(plain.map((s) => s.value)).toEqual([
+      '[[ -f a.txt && -f b.txt ]]',
+      'echo ${FOO:-x|y}',
+    ])
+    expect(raw.map((s) => s.value)).toEqual([
+      '[[ -f a.txt && -f "b.txt" ]]',
+      'echo "${FOO:-x|y}"',
+    ])
+  })
+})
+
+describe('process substitution (Item 6)', () => {
+  it('extracts command segments from <(...) and >(...)', () => {
+    const cmd = 'diff <(sort a.txt | uniq) <(sort b.txt)'
+    const segs = segmentCommand(cmd)
+    expect(segs.map((s) => s.value)).toEqual([
+      'diff <(sort a.txt | uniq) <(sort b.txt)',
+      'sort a.txt',
+      'uniq',
+      'sort b.txt',
+    ])
+  })
+
+  it('extracts command segments from output process substitution >(...)', () => {
+    const cmd = 'tee >(gzip > out.gz)'
+    const segs = segmentCommand(cmd)
+    expect(segs.map((s) => s.value)).toEqual([
+      'tee >(gzip > out.gz)',
+      'gzip > out.gz',
+    ])
+  })
+
+  it('preserves 1:1 parity between plain and raw for process substitutions', () => {
+    const cmd = 'diff <(sort "a.txt" | uniq) <(sort "b.txt")'
+    const plain = segmentCommand(cmd)
+    const raw = segmentCommand(cmd, { keepQuotes: true })
+    expect(raw).toHaveLength(plain.length)
+    expect(raw.map((s) => s.quoted)).toEqual(plain.map((s) => s.quoted))
+    expect(plain.map((s) => s.value)).toEqual([
+      'diff <(sort a.txt | uniq) <(sort b.txt)',
+      'sort a.txt',
+      'uniq',
+      'sort b.txt',
+    ])
+    expect(raw.map((s) => s.value)).toEqual([
+      'diff <(sort "a.txt" | uniq) <(sort "b.txt")',
+      'sort "a.txt"',
+      'uniq',
+      'sort "b.txt"',
+    ])
+  })
+})
+
+describe('find -exec / -execdir / -ok / -okdir (Item 7)', () => {
+  it('emits find command and extracted -exec command segment terminated by \\;', () => {
+    const cmd = 'find . -name "*.log" -exec rm -f {} \\;'
+    const segs = segmentCommand(cmd)
+    expect(segs.map((s) => s.value)).toEqual([
+      'find . -name *.log -exec rm -f {} \\;',
+      'rm -f {}',
+    ])
+  })
+
+  it('emits find command and extracted -exec command segment terminated by +', () => {
+    const cmd = 'find . -name "*.log" -exec rm -f {} +'
+    const segs = segmentCommand(cmd)
+    expect(segs.map((s) => s.value)).toEqual([
+      'find . -name *.log -exec rm -f {} +',
+      'rm -f {}',
+    ])
+  })
+
+  it('handles -execdir and -ok variants', () => {
+    const cmd = 'find /tmp -type f -execdir git status \\;'
+    const segs = segmentCommand(cmd)
+    expect(segs.map((s) => s.value)).toEqual([
+      'find /tmp -type f -execdir git status \\;',
+      'git status',
+    ])
+  })
+
+  it('handles multiple -exec clauses in one find command', () => {
+    const cmd = 'find . -exec echo {} \\; -exec rm {} \\;'
+    const segs = segmentCommand(cmd)
+    expect(segs.map((s) => s.value)).toEqual([
+      'find . -exec echo {} \\; -exec rm {} \\;',
+      'echo {}',
+      'rm {}',
+    ])
+  })
+
+  it('preserves 1:1 parity between plain and raw for find -exec', () => {
+    const cmd = 'find . -name "*.log" -exec rm -f "bad file" {} \\;'
+    const plain = segmentCommand(cmd)
+    const raw = segmentCommand(cmd, { keepQuotes: true })
+    expect(raw).toHaveLength(plain.length)
+    expect(raw.map((s) => s.quoted)).toEqual(plain.map((s) => s.quoted))
+    expect(plain.map((s) => s.value)).toEqual([
+      'find . -name *.log -exec rm -f bad file {} \\;',
+      'rm -f bad file {}',
+    ])
+    expect(raw.map((s) => s.value)).toEqual([
+      'find . -name "*.log" -exec rm -f "bad file" {} \\;',
+      'rm -f "bad file" {}',
     ])
   })
 })

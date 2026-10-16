@@ -1,6 +1,7 @@
 import {
   extractArgv,
   buildSessionPatterns,
+  stripEnvPrefix,
 } from '../../src/permission/command-prefix.ts'
 
 describe('extractArgv', () => {
@@ -228,5 +229,51 @@ describe('buildSessionPatterns', () => {
     expect(patterns.some((p) => p.includes('2>&1 *'))).toBe(false)
     expect(patterns).not.toContain('2>&1 *')
     expect(patterns).not.toContain('2>&1')
+  })
+})
+
+describe('stripEnvPrefix', () => {
+  it('strips a single leading env assignment', () => {
+    expect(stripEnvPrefix('PYTHONPATH=. python -m pytest')).toBe(
+      'python -m pytest'
+    )
+    expect(stripEnvPrefix('NODE_ENV=test npm test')).toBe('npm test')
+    expect(stripEnvPrefix('FOO=1 ./run.sh')).toBe('./run.sh')
+  })
+
+  it('strips multiple leading env assignments', () => {
+    expect(stripEnvPrefix('FOO="a b" BAR=1 npm test')).toBe('npm test')
+    expect(stripEnvPrefix('A=1 B=2 C=3 cmd arg1 arg2')).toBe('cmd arg1 arg2')
+  })
+
+  it('handles quoted env values with spaces and special characters', () => {
+    expect(stripEnvPrefix('FOO="hello world" cmd arg')).toBe('cmd arg')
+    expect(stripEnvPrefix('FOO=\'hello world\' BAR="1 2" cmd')).toBe('cmd')
+    expect(stripEnvPrefix('PATH="/custom/bin:$PATH" myapp')).toBe('myapp')
+  })
+
+  it('returns bare env assignment intact when there is no following command', () => {
+    expect(stripEnvPrefix('FOO=bar')).toBe('FOO=bar')
+    expect(stripEnvPrefix('FOO="bar baz"')).toBe('FOO="bar baz"')
+    expect(stripEnvPrefix('FOO=1 BAR=2')).toBe('FOO=1 BAR=2')
+  })
+
+  it('returns command intact when index 0 is not an env assignment', () => {
+    expect(stripEnvPrefix('python -m pytest')).toBe('python -m pytest')
+    expect(stripEnvPrefix('npm test')).toBe('npm test')
+    expect(stripEnvPrefix('git commit -m "FOO=bar"')).toBe(
+      'git commit -m "FOO=bar"'
+    )
+  })
+
+  it('preserves quotes and arguments intact after stripping env prefixes', () => {
+    expect(
+      stripEnvPrefix('FOO=1 python -c "import sys; print(sys.path)"')
+    ).toBe('python -c "import sys; print(sys.path)"')
+  })
+
+  it('handles empty and whitespace-only strings gracefully', () => {
+    expect(stripEnvPrefix('')).toBe('')
+    expect(stripEnvPrefix('   ')).toBe('')
   })
 })

@@ -4,6 +4,7 @@ import {
   wildcardMatch,
   sessionPatternMatches,
 } from '../permission/wildcard-matcher.ts'
+import { stripEnvPrefix } from '../permission/command-prefix.ts'
 import { externalDirSurfaceFor } from '../permission/external-directory.ts'
 import { addExternalDirAllow } from '../state/external-dir-allowlist.ts'
 import { getAskResolver, normalizeAskDecision, type AskOrigin } from './ask.ts'
@@ -110,6 +111,10 @@ export function trySessionAllow(
   startedAt: number | undefined,
   requestId: string
 ): boolean {
+  const isShell =
+    surface === 'shell' || surface === 'bash' || surface === 'powershell'
+  const strippedValue = isShell ? stripEnvPrefix(value) : value
+
   const sessionApproved = deps.sessionRules.snapshot().find((r) => {
     if (
       r.origin !== 'session' ||
@@ -141,7 +146,13 @@ export function trySessionAllow(
         normalizePatternOrValue(r.pattern),
         normalizePatternOrValue(value)
       ) ||
-      normalizePatternOrValue(r.pattern) === normalizePatternOrValue(value)
+      normalizePatternOrValue(r.pattern) === normalizePatternOrValue(value) ||
+      (strippedValue !== value &&
+        (sessionPatternMatches(r.pattern, strippedValue) ||
+          sessionPatternMatches(
+            normalizePatternOrValue(r.pattern),
+            normalizePatternOrValue(strippedValue)
+          )))
     )
   })
   if (!sessionApproved) return false

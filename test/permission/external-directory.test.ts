@@ -1127,4 +1127,22 @@ describe('Tool-scoped session rules (external_directory:<toolName>)', () => {
       expect(paths).toEqual([])
     }
   })
+
+  it('escaped shell delimiter \\; in find -exec does not produce \\ or trigger external-directory ask', () => {
+    const cmd = 'find . -name "*.ts" -exec grep foo {} \\;'
+    const paths = extractBashPaths(cmd)
+    expect(paths).toEqual(['.'])
+    expect(paths).not.toContain('\\')
+
+    const cfg = cfgWith({
+      confineToWorkingDirectory: true,
+      permissions: { tools: { bash: 'allow' } },
+    })
+    const intents = normalizeToolCall('bash', { command: cmd })
+    const verdict = evaluateExternalDirectory(cfg, intents, {
+      toolName: 'bash',
+      cwd,
+    })
+    expect(verdict).toBeUndefined()
+  })
 })

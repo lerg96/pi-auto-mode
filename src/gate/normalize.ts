@@ -126,6 +126,106 @@ function parseHeredocDelimiter(
   return { delim, isQuoted, stripTabs, nextIndex: i, rawSpec }
 }
 
+export function readParenSub(command: string, from: number): [string, number] {
+  let depth = 1
+  let sub = ''
+  let j = from
+  let subQuote: "'" | '"' | null = null
+  while (j < command.length && depth > 0) {
+    const sc = command[j]
+    if (subQuote) {
+      if (subQuote === '"' && sc === '\\' && j + 1 < command.length) {
+        sub += sc + command[j + 1]
+        j += 2
+        continue
+      }
+      if (sc === subQuote) {
+        subQuote = null
+        sub += sc
+        j++
+        continue
+      }
+      if (subQuote === '"' && sc === '$' && command[j + 1] === '(') {
+        const [nested, nextJ] = readParenSub(command, j + 2)
+        sub += command.slice(j, nextJ)
+        j = nextJ
+        continue
+      }
+      sub += sc
+      j++
+      continue
+    }
+    if (sc === '\\' && j + 1 < command.length) {
+      sub += sc + command[j + 1]
+      j += 2
+      continue
+    }
+    if (sc === "'" || sc === '"') {
+      subQuote = sc
+      sub += sc
+      j++
+      continue
+    }
+    if (sc === '(') {
+      depth++
+      sub += sc
+      j++
+      continue
+    }
+    if (sc === ')') {
+      depth--
+      if (depth > 0) sub += sc
+      j++
+      continue
+    }
+    sub += sc
+    j++
+  }
+  return [sub.trim(), j]
+}
+
+export function readBacktickSub(
+  command: string,
+  from: number
+): [string, number] {
+  let sub = ''
+  let j = from
+  while (j < command.length && command[j] !== '`') {
+    if (command[j] === '\\' && j + 1 < command.length) {
+      sub += command[j] + command[j + 1]
+      j += 2
+      continue
+    }
+    sub += command[j]
+    j++
+  }
+  return [sub.trim(), j < command.length ? j + 1 : j]
+}
+
+export function isBareShellKeyword(s: string): boolean {
+  return /^(?:do|done|then|else|fi|esac)(?:\s+\(timeout\s+[^)]*\))?$/.test(
+    s.trim()
+  )
+}
+
+export function stripLeadingShellKeywords(s: string): string {
+  let cur = s.trim()
+  if (isBareShellKeyword(cur)) return cur
+  const pattern = /^(?:do|then|else|if|elif|while|until)\s+/
+  while (pattern.test(cur)) {
+    cur = cur.replace(pattern, '').trim()
+  }
+  return cur
+}
+
+export function isShellStructureSegment(s: string): boolean {
+  const trimmed = s.trim()
+  return (
+    isBareShellKeyword(trimmed) ||
+    /^(?:for|select)\s+[A-Za-z_][A-Za-z0-9_]*(?:\s+in\b[\s\S]*)?$/.test(trimmed)
+  )
+}
+
 function scanSubshells(
   body: string,
   opts?: { keepQuotes?: boolean }
@@ -134,38 +234,23 @@ function scanSubshells(
   let j = 0
   while (j < body.length) {
     if (body[j] === '$' && body[j + 1] === '(') {
-      let depth = 1
-      let sub = ''
-      j += 2
-      while (j < body.length && depth > 0) {
-        const sc = body[j]
-        if (sc === '(') depth++
-        else if (sc === ')') depth--
-        if (depth > 0) sub += sc
-        j++
-      }
-      const trimmed = sub.trim()
-      if (trimmed.length > 0) {
-        for (const seg of segmentCommand(trimmed, opts)) {
+      const [sub, next] = readParenSub(body, j + 2)
+      if (sub.length > 0) {
+        for (const seg of segmentCommand(sub, opts)) {
           extraSegments.push(seg)
         }
       }
+      j = next
       continue
     }
     if (body[j] === '`') {
-      let sub = ''
-      j++
-      while (j < body.length && body[j] !== '`') {
-        sub += body[j]
-        j++
-      }
-      if (j < body.length && body[j] === '`') j++
-      const trimmed = sub.trim()
-      if (trimmed.length > 0) {
-        for (const seg of segmentCommand(trimmed, opts)) {
+      const [sub, next] = readBacktickSub(body, j + 1)
+      if (sub.length > 0) {
+        for (const seg of segmentCommand(sub, opts)) {
           extraSegments.push(seg)
         }
       }
+      j = next
       continue
     }
     j++
@@ -179,14 +264,27 @@ export function segmentCommand(
 ): CommandSegment[] {
   const keep = opts?.keepQuotes === true
   const segments: CommandSegment[] = []
+  let pendingSubSegments: CommandSegment[] = []
   let buf = ''
   let quoted = false
   let quote: "'" | '"' | null = null
   let pendingHeredocs: PendingHeredoc[] = []
 
   const flush = () => {
-    const value = buf.trim()
-    if (value.length > 0) {
+    const value = stripLeadingShellKeywords(buf.trim())
+    const isSingleSub =
+      !quoted &&
+      pendingSubSegments.length > 0 &&
+      ((value.startsWith('$(') &&
+        !value.startsWith('$((') &&
+        value.endsWith(')') &&
+        readParenSub(value, 2)[1] === value.length) ||
+        (value.startsWith('`') &&
+          value.endsWith('`') &&
+          value.length >= 2 &&
+          readBacktickSub(value, 1)[1] === value.length))
+
+    if (!isSingleSub && value.length > 0 && !isBareShellKeyword(value)) {
       segments.push({ value, quoted })
       const segIndex = segments.length - 1
       for (const h of pendingHeredocs) {
@@ -195,37 +293,42 @@ export function segmentCommand(
         }
       }
     }
+    for (const sub of pendingSubSegments) {
+      segments.push(sub)
+    }
+    pendingSubSegments = []
     buf = ''
     quoted = false
   }
 
-  // Read a $(...) command substitution, starting just after the opening "$(".
-  // Returns the inner command text (trimmed) and the index just past ")".
-  const readParenSub = (from: number): [string, number] => {
-    let depth = 1
-    let sub = ''
-    let j = from
-    while (j < command.length && depth > 0) {
-      const sc = command[j]
-      if (sc === '(') depth++
-      else if (sc === ')') depth--
-      if (depth > 0) sub += sc
-      j++
+  const handleParenSub = (from: number): number => {
+    const [sub, next] = readParenSub(command, from)
+    if (command[from] === '(' && sub.startsWith('(') && sub.endsWith(')')) {
+      buf += '$(' + (keep ? sub : stripQuotedLiterals(sub)) + ')'
+      const nested = scanSubshells(sub.slice(1, -1), opts)
+      for (const s of nested) {
+        pendingSubSegments.push(s)
+      }
+      return next
     }
-    return [sub.trim(), j]
+    buf += '$(' + (keep ? sub : stripQuotedLiterals(sub)) + ')'
+    if (sub.length > 0) {
+      for (const seg of segmentCommand(sub, opts)) {
+        pendingSubSegments.push(seg)
+      }
+    }
+    return next
   }
 
-  // Read a `...` command substitution, starting just after the opening backtick.
-  // Returns the inner command text (trimmed) and the index just past the
-  // closing backtick.
-  const readBacktickSub = (from: number): [string, number] => {
-    let sub = ''
-    let j = from
-    while (j < command.length && command[j] !== '`') {
-      sub += command[j]
-      j++
+  const handleBacktickSub = (from: number): number => {
+    const [sub, next] = readBacktickSub(command, from)
+    buf += '`' + (keep ? sub : stripQuotedLiterals(sub)) + '`'
+    if (sub.length > 0) {
+      for (const seg of segmentCommand(sub, opts)) {
+        pendingSubSegments.push(seg)
+      }
     }
-    return [sub.trim(), j + 1]
+    return next
   }
 
   let i = 0
@@ -266,17 +369,11 @@ export function segmentCommand(
       // Inside a quote: only command substitution is active in double quotes.
       // In single quotes `$(`/`...` are literal and must not be extracted.
       if (quote === '"' && c === '$' && command[i + 1] === '(') {
-        flush()
-        const [sub, next] = readParenSub(i + 2)
-        if (sub.length > 0) segments.push({ value: sub, quoted: false })
-        i = next
+        i = handleParenSub(i + 2)
         continue
       }
       if (quote === '"' && c === '`') {
-        flush()
-        const [sub, next] = readBacktickSub(i + 1)
-        if (sub.length > 0) segments.push({ value: sub, quoted: false })
-        i = next
+        i = handleBacktickSub(i + 1)
         continue
       }
       if (c === quote) {
@@ -380,10 +477,7 @@ export function segmentCommand(
     }
 
     if (c === '`') {
-      flush()
-      const [sub, next] = readBacktickSub(i + 1)
-      if (sub.length > 0) segments.push({ value: sub, quoted: false })
-      i = next
+      i = handleBacktickSub(i + 1)
       continue
     }
     if (c === '|') {
@@ -417,10 +511,7 @@ export function segmentCommand(
       continue
     }
     if (c === '$' && command[i + 1] === '(') {
-      flush()
-      const [sub, next] = readParenSub(i + 2)
-      if (sub.length > 0) segments.push({ value: sub, quoted: false })
-      i = next
+      i = handleParenSub(i + 2)
       continue
     }
     buf += c
@@ -456,17 +547,9 @@ export function stripQuotedLiterals(command: string): string {
       // real command remains scannable; keep all other text so patterns
       // (e.g. ~/.ssh/) still see quoted content.
       if (quote === '"' && c === '$' && command[i + 1] === '(') {
-        let depth = 1
-        let j = i + 2
-        out += '$('
-        while (j < command.length && depth > 0) {
-          const sc = command[j]
-          if (sc === '(') depth++
-          else if (sc === ')') depth--
-          if (depth > 0) out += sc
-          j++
-        }
-        i = j
+        const [sub, next] = readParenSub(command, i + 2)
+        out += '$(' + sub + ')'
+        i = next
         continue
       }
       if (c === quote) {

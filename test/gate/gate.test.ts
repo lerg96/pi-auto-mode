@@ -11,6 +11,7 @@ import {
   setAskResolver,
   getAskResolver,
   defaultAskResolver,
+  type AskRequest,
 } from '../../src/gate/ask.ts'
 import { resetExternalDirAllowlist } from '../../src/state/external-dir-allowlist.ts'
 import type { Config } from '../../src/types/config.ts'
@@ -1916,6 +1917,85 @@ describe('E2E: allow_dir_tool and allow_dir_all per-tool scoping', () => {
 
       await gateToolCall('bash', { command: 'cat test.txt' }, deps)
       expect(askSpy).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('compound loop and external directory gating', () => {
+    let prevResolver: ReturnType<typeof getAskResolver>
+
+    beforeEach(() => {
+      prevResolver = getAskResolver()
+      resetExternalDirAllowlist()
+    })
+    afterEach(() => {
+      setAskResolver(prevResolver)
+    })
+
+    const compoundCmd = `for f in /tmp/agy1.txt /tmp/agy2.txt /tmp/agy3.txt; do
+  echo "=== $f ($(wc -l < $f 2>/dev/null || echo 0) lines) ==="
+  tail -n 55 "$f" 2>/dev/null
+done
+rm -f /tmp/agy1.txt /tmp/agy2.txt /tmp/agy3.txt`
+
+    it('auto-allows with 0 modals when all real commands match allowed patterns and confineToWorkingDirectory is false', async () => {
+      configState.set({
+        ...config,
+        confineToWorkingDirectory: false,
+        permissions: {
+          tools: {
+            bash: [
+              { pattern: 'echo *', action: 'allow' },
+              { pattern: 'wc *', action: 'allow' },
+              { pattern: 'tail *', action: 'allow' },
+              { pattern: 'rm *', action: 'allow' },
+              { pattern: '*', action: 'ask' },
+            ],
+          },
+        },
+      })
+      const askSpy = jest.fn()
+      setAskResolver(async () => {
+        askSpy()
+        return 'allow'
+      })
+
+      await gateToolCall('bash', { command: compoundCmd }, makeDeps())
+      expect(askSpy).not.toHaveBeenCalled()
+    })
+
+    it('prompts only 1 external-directory modal when allow_dir_tool is granted on first external segment', async () => {
+      configState.set({
+        ...config,
+        confineToWorkingDirectory: true,
+        permissions: {
+          tools: {
+            bash: [
+              { pattern: 'echo *', action: 'allow' },
+              { pattern: 'wc *', action: 'allow' },
+              { pattern: 'tail *', action: 'allow' },
+              { pattern: 'rm *', action: 'allow' },
+              { pattern: '*', action: 'allow' },
+            ],
+          },
+        },
+      })
+      const askedRequests: AskRequest[] = []
+      setAskResolver(async (req) => {
+        askedRequests.push(req)
+        return 'allow_dir_tool'
+      })
+
+      const deps = makeDeps()
+      await gateToolCall(
+        'bash',
+        { command: compoundCmd, cwd: process.cwd() },
+        deps
+      )
+
+      expect(askedRequests).toHaveLength(1)
+      expect(askedRequests[0].askOrigin).toBe('external-directory')
+      expect(askedRequests[0].type).toBe('external-directory')
+      expect(askedRequests[0].externalDir).toBeDefined()
     })
   })
 })

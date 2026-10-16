@@ -9,7 +9,11 @@ import type { DenyAndContinueService } from '../deny/deny-service.ts'
 import { evaluatePermission } from '../permission/visibility.ts'
 import { evaluateExternalDirectory } from '../permission/external-directory.ts'
 import { grantDirFor } from '../permission/path-scope.ts'
-import { normalizeToolCall, type AccessIntent } from './normalize.ts'
+import {
+  normalizeToolCall,
+  isShellStructureSegment,
+  type AccessIntent,
+} from './normalize.ts'
 import { emit, askActor, type GateHooks } from './ask-audit.ts'
 import { buildDecisionDetail } from './decision-detail.ts'
 import type { AskOrigin } from './ask.ts'
@@ -137,6 +141,9 @@ function evaluateCascade(ctx: GateCtx): CascadeState {
     rulePattern: '*',
   }
   for (const intent of intents) {
+    if (intent.surface === 'shell' && isShellStructureSegment(intent.value)) {
+      continue
+    }
     // Evaluate permission cascade (config) - use toolName as key, not surface
     const evalResult = evaluatePermission(
       cfg,
@@ -467,15 +474,18 @@ function evaluateSegmentAction(
   action: 'allow' | 'ask' | 'deny'
   extVerdict?: ReturnType<typeof evaluateExternalDirectory>
 } {
-  const evalResult = evaluatePermission(
-    ctx.cfg,
-    'tools',
-    ctx.toolName,
-    intent.value
-  )
-  const cascadeAction = evalResult.action
-  let action: 'allow' | 'ask' | 'deny' =
-    cascadeAction && cascadeAction !== 'unknown' ? cascadeAction : 'allow'
+  let action: 'allow' | 'ask' | 'deny' = 'allow'
+  if (!(intent.surface === 'shell' && isShellStructureSegment(intent.value))) {
+    const evalResult = evaluatePermission(
+      ctx.cfg,
+      'tools',
+      ctx.toolName,
+      intent.value
+    )
+    const cascadeAction = evalResult.action
+    action =
+      cascadeAction && cascadeAction !== 'unknown' ? cascadeAction : 'allow'
+  }
   const extVerdict = evaluateExternalDirectory(ctx.cfg, [intent], {
     toolName: ctx.toolName,
     sessionRules: ctx.deps.sessionRules,
@@ -509,15 +519,17 @@ function findUnapprovedShellSegments(
     }
     const reqId =
       globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)
-    const approved = trySessionAllow(
-      deps,
-      intent.surface,
-      intent.value,
-      agg.risk,
-      toolName,
-      startedAt,
-      reqId
-    )
+    const approved =
+      extVerdict?.action !== 'ask' &&
+      trySessionAllow(
+        deps,
+        intent.surface,
+        intent.value,
+        agg.risk,
+        toolName,
+        startedAt,
+        reqId
+      )
     if (!approved) {
       unapproved.push({ intent, extVerdict })
     }
@@ -537,10 +549,30 @@ async function promptAskMultiSegmentShell(
 
   const { deps, toolName, fullCommand, startedAt } = ctx
   const { resolution } = planAsk(ctx, state, agg)
-  const defaultExternalDirAsk = toExternalDirAsk(external)
 
   for (let k = 1; k <= totalAsks; k++) {
-    const { intent: seg, extVerdict } = unapproved[k - 1]
+    const { intent: seg } = unapproved[k - 1]
+    const current = evaluateSegmentAction(ctx, seg)
+    if (current.action === 'allow') {
+      continue
+    }
+    const reqId =
+      globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)
+    if (
+      current.extVerdict?.action !== 'ask' &&
+      trySessionAllow(
+        deps,
+        seg.surface,
+        seg.value,
+        agg.risk,
+        toolName,
+        startedAt,
+        reqId
+      )
+    ) {
+      continue
+    }
+
     const sessionPatterns = buildSessionPatterns(seg.value)
     const matchedRule = {
       surface: toolName,
@@ -556,13 +588,13 @@ async function promptAskMultiSegmentShell(
       startedAt,
     }
     const segExternalDirAsk =
-      extVerdict && extVerdict.action === 'ask'
+      current.extVerdict && current.extVerdict.action === 'ask'
         ? {
             isExternalDir: true,
-            externalDirPath: extVerdict.absPath,
-            externalGrantDir: grantDirFor(extVerdict.absPath),
+            externalDirPath: current.extVerdict.absPath,
+            externalGrantDir: grantDirFor(current.extVerdict.absPath),
           }
-        : defaultExternalDirAsk
+        : undefined
 
     const segAskOrigin: AskOrigin = segExternalDirAsk?.isExternalDir
       ? 'external-directory'

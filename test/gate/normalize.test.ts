@@ -394,3 +394,46 @@ describe('redirections and compound command splitting', () => {
     expect(stripQuotedLiterals('echo \\"hello\\"')).toBe('echo \\"hello\\"')
   })
 })
+
+describe('compound loop/subshell command segmentation', () => {
+  const loopCmd = `for f in /tmp/agy1.txt /tmp/agy2.txt /tmp/agy3.txt; do
+  echo "=== $f ($(wc -l < $f 2>/dev/null || echo 0) lines) ==="
+  tail -n 55 "$f" 2>/dev/null
+done
+rm -f /tmp/agy1.txt /tmp/agy2.txt /tmp/agy3.txt`
+
+  it('correctly segments compound loop with nested command substitutions and cleanup', () => {
+    const plain = segmentCommand(loopCmd)
+    const values = plain.map((s) => s.value)
+
+    expect(values).toEqual([
+      'for f in /tmp/agy1.txt /tmp/agy2.txt /tmp/agy3.txt',
+      'echo === $f ($(wc -l < $f 2>/dev/null || echo 0) lines) ===',
+      'wc -l < $f 2>/dev/null',
+      'echo 0',
+      'tail -n 55 $f 2>/dev/null',
+      'rm -f /tmp/agy1.txt /tmp/agy2.txt /tmp/agy3.txt',
+    ])
+
+    expect(values).not.toContain('do')
+    expect(values).not.toContain('done')
+    expect(values).not.toContain('lines) ===')
+    expect(values).not.toContain('echo === $f (')
+  })
+
+  it('verifies raw and plain 1:1 parity on compound loop command', () => {
+    const plain = segmentCommand(loopCmd)
+    const raw = segmentCommand(loopCmd, { keepQuotes: true })
+
+    expect(raw).toHaveLength(plain.length)
+    expect(raw.map((s) => s.quoted)).toEqual(plain.map((s) => s.quoted))
+    expect(raw.map((s) => s.value)).toEqual([
+      'for f in /tmp/agy1.txt /tmp/agy2.txt /tmp/agy3.txt',
+      'echo "=== $f ($(wc -l < $f 2>/dev/null || echo 0) lines) ==="',
+      'wc -l < $f 2>/dev/null',
+      'echo 0',
+      'tail -n 55 "$f" 2>/dev/null',
+      'rm -f /tmp/agy1.txt /tmp/agy2.txt /tmp/agy3.txt',
+    ])
+  })
+})

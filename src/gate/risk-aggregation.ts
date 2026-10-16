@@ -1,5 +1,5 @@
 import type { ClassifierResult, RiskLevel } from '../classifier/llm-layer.ts'
-import type { AccessIntent } from './normalize.ts'
+import { isShellStructureSegment, type AccessIntent } from './normalize.ts'
 import type { GateDeps } from './gate.ts'
 
 const RISK_RANK: Record<RiskLevel, number> = { low: 0, medium: 1, high: 2 }
@@ -42,8 +42,22 @@ export async function aggregateClassify(
   let action: 'allow' | 'ask' | 'deny' = 'allow'
   const onBlock = deps.configState.get().classifier.onBlock
   let risk: ClassifierResult['risk'] | undefined
-  let repSurface = intents[0]?.surface ?? toolName
-  let repValue = intents[0]?.value ?? '*'
+
+  const candidateIntents = intents.filter(
+    (i) => !(i.surface === 'shell' && isShellStructureSegment(i.value))
+  )
+  if (candidateIntents.length === 0 && intents.length > 0) {
+    return {
+      action: 'allow',
+      surface: intents[0]?.surface ?? toolName,
+      value: intents[0]?.value ?? '*',
+    }
+  }
+  const intentsToClassify =
+    candidateIntents.length > 0 ? candidateIntents : intents
+
+  let repSurface = intentsToClassify[0]?.surface ?? toolName
+  let repValue = intentsToClassify[0]?.value ?? '*'
   let askRepSet = false
 
   for (const intent of intents) {

@@ -1108,7 +1108,7 @@ export function normalizeToolCall(
   const surface = surfaceForTool(toolName)
   const cmd = input.command
 
-  if (toolName === 'bash') {
+  if (toolName === 'bash' || toolName === 'powershell') {
     if (typeof cmd === 'string' && cmd.length > 0) {
       const segments = segmentCommand(cmd)
       const rawSegments = segmentCommand(cmd, { keepQuotes: true })
@@ -1122,7 +1122,7 @@ export function normalizeToolCall(
         return intent
       })
     }
-    // 'bash' tool with no command — sentinel (never "undefined")
+    // 'bash' or 'powershell' tool with no command — sentinel (never "undefined")
     return [{ surface, value: '*' }]
   }
 

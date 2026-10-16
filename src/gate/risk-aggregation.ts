@@ -60,7 +60,7 @@ export async function aggregateClassify(
   let repValue = intentsToClassify[0]?.value ?? '*'
   let askRepSet = false
 
-  for (const intent of intents) {
+  for (const intent of intentsToClassify) {
     if (!deps.classify)
       return { action: 'deny', surface: repSurface, value: repValue }
     const r = await deps.classify({
@@ -69,15 +69,21 @@ export async function aggregateClassify(
       surface: intent.surface,
       value: intent.value,
     })
-    const a = classifyDecision(r, onBlock)
-    if (a === 'ask' && !askRepSet) {
+    const intentAction = classifyDecision(r, onBlock)
+    if (intentAction === 'ask' && !askRepSet) {
       repSurface = intent.surface
       repValue = intent.value
       askRepSet = true
     }
-    if (mostRestrictive(action, a) === a) action = a
+    if (mostRestrictive(action, intentAction) === intentAction)
+      action = intentAction
     if (r.risk && (!risk || RISK_RANK[r.risk.level] > RISK_RANK[risk.level])) {
       risk = r.risk
+    }
+    if (intentAction === 'deny') {
+      repSurface = intent.surface
+      repValue = intent.value
+      break
     }
   }
   return { action, risk, surface: repSurface, value: repValue }

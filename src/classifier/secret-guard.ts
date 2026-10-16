@@ -8,9 +8,9 @@ export interface SecretCheck {
 }
 
 // 1. Secret file paths — anchored to path boundary to avoid false positives.
-//    Matches `.env`, `.ssh`, `id_rsa` etc. only at start of string, after `/`, `\`, `.`, or `~`.
+//    Matches `.env`, `.ssh`, `id_rsa` etc. only at start of string, after `/`, `\`, `.`, `~`, whitespace or quotes.
 const PATH_RE =
-  /(?:^|[/\\.~])\.(env(?:\.\w+)?|ssh|credentials|netrc|npmrc|aws|kube|pypirc|gitconfig)\b|(?:^|[/\\.~])\bid_(?:rsa|ed25519|dsa|ecdsa)\b/i
+  /(?:^|[/\\.~\s"'])\.(env(?:\.\w+)?|ssh|credentials|netrc|npmrc|aws|kube|pypirc|gitconfig)\b|(?:^|[/\\.~\s"'])\bid_(?:rsa|ed25519|dsa|ecdsa)\b/i
 
 // 1b. Environment-style secret assignments: KEYNAME=value / KEYNAME: value.
 //     The sensitive keyword must be a delimited key token: preceded by start-of
@@ -116,6 +116,10 @@ const FLAG_VALUE_RE =
 const ENV_VALUE_RE =
   /(^|[^A-Za-z_])((?:[A-Za-z_]*?(?:SECRET_ACCESS_KEY|ACCESS_KEY|SECRET_KEY|API[_-]?KEY|PRIVATE[_-]?KEY|CLIENT[_-]?SECRET|SECRET|TOKEN|PASSWORD|PASSWD|PWD|CREDENTIAL))\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s"'`,;]+)/gi
 
+// JSON-style key-value credentials: "apiKey": "xyz" / 'password': 'secret' → "apiKey": "[REDACTED]".
+const JSON_CREDS_RE =
+  /((?:["'])(?:apiKey|api_key|password|secret|token|client_secret|clientSecret|access_key|accessKey|private_key|privateKey)(?:["'])\s*:\s*)("[^"]*"|'[^']*'|[^\s"',;`}\]]+)/gi
+
 /** Masks one credential value, preserving quotes and trailing closers. */
 function maskSecretValue(value: string): string {
   // Already-redacted output (marker plus optional trailing closers) passes
@@ -158,6 +162,10 @@ export function redactSecretsForModel(text: string): string {
   out = out.replace(BEARER_BASIC_RE, `$1$2${REDACTED}`)
   out = out.replace(
     FLAG_VALUE_RE,
+    (_m: string, head: string, value: string) => head + maskSecretValue(value)
+  )
+  out = out.replace(
+    JSON_CREDS_RE,
     (_m: string, head: string, value: string) => head + maskSecretValue(value)
   )
   out = out.replace(

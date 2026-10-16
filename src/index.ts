@@ -153,7 +153,12 @@ export async function endSession(
   ctx: ExtensionContext,
   loggers?: { telemetry?: Flushable; debug?: Flushable }
 ): Promise<void> {
-  sessionRules.clear()
+  const isChildSession =
+    (ctx as { hasUI?: boolean } | undefined)?.hasUI === false
+  if (!isChildSession) {
+    sessionRules.clear()
+    configState.setYoloSession(false)
+  }
   denyService.reset()
   void base(event, ctx)
   await boundedFlush(loggers?.telemetry)

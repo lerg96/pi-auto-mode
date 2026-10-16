@@ -120,7 +120,12 @@ function evaluatePermissionsBlock(
   // Exact name first; `"*"` is the catch-all for names with NO entry
   // (unknown tools included). An existing entry whose patterns miss the
   // call stays silent (no star fallthrough): allow-final is preserved.
-  const perm = map[name] ?? map['*']
+  const perm =
+    map[name] ??
+    (namespace === 'tools' && (name === 'bash' || name === 'powershell')
+      ? (map['shell'] ?? map['bash'])
+      : undefined) ??
+    map['*']
   if (perm === undefined) return undefined
 
   if (isSimpleAction(perm)) return perm
@@ -156,7 +161,12 @@ function evaluatePermissionsBlockWithRule(
   if (!map) return undefined
 
   // Same `"*"` catch-all as evaluatePermissionsBlock (see above).
-  const perm = map[name] ?? map['*']
+  const perm =
+    map[name] ??
+    (namespace === 'tools' && (name === 'bash' || name === 'powershell')
+      ? (map['shell'] ?? map['bash'])
+      : undefined) ??
+    map['*']
   if (perm === undefined) return undefined
 
   if (isSimpleAction(perm)) return { action: perm, matchedRule: undefined }

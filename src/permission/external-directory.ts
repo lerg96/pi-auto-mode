@@ -287,6 +287,76 @@ function tokenizeShell(segment: string): string[] {
   return tokens
 }
 
+/**
+ * If `command` is a shell `cd <dir>` command with a concrete directory argument
+ * (not '-', and not containing unexpanded variables/backticks), returns the unquoted
+ * directory path; otherwise returns null.
+ */
+export function extractCdTarget(command: string): string | null {
+  const tokens = tokenizeShell(command)
+  if (tokens.length === 0) return null
+  let idx = 0
+  if (tokens[idx] === 'builtin') idx++
+  if (tokens[idx] !== 'cd') return null
+  idx++
+  while (
+    idx < tokens.length &&
+    tokens[idx]!.startsWith('-') &&
+    tokens[idx] !== '-' &&
+    tokens[idx] !== '--'
+  ) {
+    idx++
+  }
+  if (idx < tokens.length && tokens[idx] === '--') {
+    idx++
+  }
+  if (idx >= tokens.length) return null
+  const rawArg = tokens[idx]!
+  if (rawArg === '-' || rawArg.includes('$') || rawArg.includes('`'))
+    return null
+  const unquoted = rawArg.replace(/^(['"])(.*)\1$/, '$2').trim()
+  if (
+    unquoted === '' ||
+    unquoted === '-' ||
+    unquoted.includes('$') ||
+    unquoted.includes('`')
+  ) {
+    return null
+  }
+  return unquoted
+}
+
+/**
+ * When effectiveCwd is outside the workspace base, extracts candidate argument
+ * tokens from a command so bare filenames (e.g. `cat secret.txt`) resolve against
+ * effectiveCwd and are subject to external-directory rules.
+ */
+function extractArgTokens(command: string): string[] {
+  const tokens = tokenizeShell(command)
+  if (tokens.length <= 1) return []
+  const args: string[] = []
+  let i = 0
+  while (
+    i < tokens.length &&
+    tokens[i]!.includes('=') &&
+    !tokens[i]!.startsWith('-')
+  ) {
+    i++
+  }
+  i++
+  for (; i < tokens.length; i++) {
+    const raw = tokens[i]!
+    if (raw.startsWith('-')) continue
+    if (SHELL_SPLITTERS.has(raw)) continue
+    if (raw === '>' || raw === '<' || raw === '>>' || raw === '2>&1') continue
+    const unquoted = raw.replace(/^(['"])(.*)\1$/, '$2').trim()
+    if (unquoted.length > 0 && !isDevicePath(unquoted)) {
+      args.push(unquoted)
+    }
+  }
+  return args
+}
+
 export function stripToken(t: string): string {
   if (isEscapedShellDelimiter(t)) return ''
   return t.replace(/^['"`[{(]+|['"`\]},;]+$/g, '')
@@ -396,7 +466,11 @@ export function externalScopeAppliesTo(
 ): boolean {
   if (toolName === undefined) return true
   const patterns = cfg.externalDirectoryTools ?? ['*']
-  return patterns.some((pattern) => wildcardMatch(pattern, toolName))
+  return (
+    patterns.some((pattern) => wildcardMatch(pattern, toolName)) ||
+    (toolName === 'powershell' &&
+      patterns.some((pattern) => wildcardMatch(pattern, 'bash')))
+  )
 }
 
 /** Surface of a session rule that grants an external directory. */
@@ -427,6 +501,28 @@ function isApprovedBySessionRule(
       expandHomePrefix(expandMsysDrive(rule.pattern))
     )
     if (wildcardMatch(expandedKey, absPath)) return true
+    const trimmedKey = expandedKey.replace(/[/\\]\*\*?$/, '')
+    if (trimmedKey !== expandedKey && wildcardMatch(trimmedKey, absPath))
+      return true
+    if (
+      process.platform === 'win32' &&
+      isAbsolute(expandedKey) &&
+      isAbsolute(absPath)
+    ) {
+      const keyWithDrive = /^[a-zA-Z]:/.test(expandedKey)
+        ? expandedKey
+        : resolve(process.cwd(), expandedKey)
+      const absWithDrive = /^[a-zA-Z]:/.test(absPath)
+        ? absPath
+        : resolve(process.cwd(), absPath)
+      if (wildcardMatch(keyWithDrive, absWithDrive)) return true
+      const trimmedWithDrive = keyWithDrive.replace(/[/\\]\*\*?$/, '')
+      if (
+        trimmedWithDrive !== keyWithDrive &&
+        wildcardMatch(trimmedWithDrive, absWithDrive)
+      )
+        return true
+    }
   }
   return false
 }
@@ -470,6 +566,7 @@ export function evaluateExternalDirectory(
     // The session-rules block that used to short-circuit the entire evaluation
     // has been moved into `isApprovedExternalPath` as a per-path check (BUG 1).
     const base = opts?.cwd ?? process.cwd()
+    let effectiveCwd = base
     const outside: Array<{
       abs: string
       value: string
@@ -482,7 +579,7 @@ export function evaluateExternalDirectory(
         if (isDevicePath(intent.value)) continue
         if (isEscapeDebris(intent.value)) continue
         if (isQuotedPureGlob(intent.value)) continue
-        const abs = resolveFsPath(intent.value, base)
+        const abs = resolveFsPath(intent.value, effectiveCwd)
         if (isOutsideCwd(abs, base) && !isApprovedExternalPath(abs, opts))
           outside.push({
             abs,
@@ -501,11 +598,18 @@ export function evaluateExternalDirectory(
           : null
         const fromTree = treeCandidates !== null
         const engine: ExternalEngine = fromTree ? 'tree-sitter' : 'heuristic'
-        const candidates = fromTree
-          ? treeCandidates
-          : extractBashPaths(intent.value)
+        const candidates = (
+          fromTree ? treeCandidates : extractBashPaths(intent.value)
+        ).slice()
+        if (isOutsideCwd(effectiveCwd, base)) {
+          for (const arg of extractArgTokens(source)) {
+            if (!candidates.includes(arg)) {
+              candidates.push(arg)
+            }
+          }
+        }
         for (const cand of candidates) {
-          const abs = resolveFsPath(cand, base)
+          const abs = resolveFsPath(cand, effectiveCwd)
           if (isOutsideCwd(abs, base) && !isApprovedExternalPath(abs, opts))
             outside.push({
               abs,
@@ -513,6 +617,10 @@ export function evaluateExternalDirectory(
               surface: intent.surface,
               engine,
             })
+        }
+        const cdTarget = extractCdTarget(source)
+        if (cdTarget) {
+          effectiveCwd = resolveFsPath(cdTarget, effectiveCwd)
         }
       }
       // Custom surfaces: no opinion.
@@ -546,8 +654,38 @@ export function evaluateExternalDirectory(
           // so globs like `~/projects/**` or `/c/work/**` match resolved
           // paths.
           const expandedKey = normalize(expandHomePrefix(expandMsysDrive(key)))
-          if (wildcardMatch(expandedKey, abs))
+          if (wildcardMatch(expandedKey, abs)) {
             found = { action: candidate, pattern: key }
+            continue
+          }
+          const trimmedKey = expandedKey.replace(/[/\\]\*\*?$/, '')
+          if (trimmedKey !== expandedKey && wildcardMatch(trimmedKey, abs)) {
+            found = { action: candidate, pattern: key }
+            continue
+          }
+          if (
+            process.platform === 'win32' &&
+            isAbsolute(expandedKey) &&
+            isAbsolute(abs)
+          ) {
+            const keyWithDrive = /^[a-zA-Z]:/.test(expandedKey)
+              ? expandedKey
+              : resolve(base, expandedKey)
+            const absWithDrive = /^[a-zA-Z]:/.test(abs)
+              ? abs
+              : resolve(base, abs)
+            if (wildcardMatch(keyWithDrive, absWithDrive)) {
+              found = { action: candidate, pattern: key }
+              continue
+            }
+            const trimmedWithDrive = keyWithDrive.replace(/[/\\]\*\*?$/, '')
+            if (
+              trimmedWithDrive !== keyWithDrive &&
+              wildcardMatch(trimmedWithDrive, absWithDrive)
+            ) {
+              found = { action: candidate, pattern: key }
+            }
+          }
         }
       }
       return found

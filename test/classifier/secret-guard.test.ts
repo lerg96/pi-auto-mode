@@ -7,10 +7,14 @@ describe('isSecretSensitive', () => {
   // ── Positive: sensitive detections ─────────────────────────
   describe('sensitive === true', () => {
     it('detects .env file path', () => {
-      // PATH_RE requires a path boundary (start, /, \, or .) before the dot;
-      // "cat .env" intentionally does NOT match (space is not a boundary).
       const result = isSecretSensitive('.env')
       expect(result.sensitive).toBe(true)
+    })
+
+    it('detects cat .env and cat id_rsa with leading whitespace', () => {
+      expect(isSecretSensitive('cat .env').sensitive).toBe(true)
+      expect(isSecretSensitive('cat id_rsa').sensitive).toBe(true)
+      expect(isSecretSensitive('ssh -i id_rsa user@host').sensitive).toBe(true)
     })
 
     it('detects cat ~/.npmrc', () => {
@@ -414,6 +418,28 @@ describe('redactSecretsForModel', () => {
       'psql "postgres://user:hunter2@db/prod" mysql://c:d@h2/db'
     )
     expect(redactSecretsForModel(once)).toBe(once)
+  })
+
+  it('redacts JSON key-value credentials in payloads', () => {
+    const json = JSON.stringify({
+      apiKey: 'secret_api_123',
+      password: 'mypassword',
+      secret: 'mysecret',
+      token: 'tok_abc',
+      client_secret: 'cs_xyz',
+      access_key: 'AKIA12345',
+      private_key: 'KEY_VALUE_HERE',
+      normal_field: 'safe_value',
+    })
+    const redacted = redactSecretsForModel(json)
+    expect(redacted).toContain('"apiKey":"[REDACTED]"')
+    expect(redacted).toContain('"password":"[REDACTED]"')
+    expect(redacted).toContain('"secret":"[REDACTED]"')
+    expect(redacted).toContain('"token":"[REDACTED]"')
+    expect(redacted).toContain('"client_secret":"[REDACTED]"')
+    expect(redacted).toContain('"access_key":"[REDACTED]"')
+    expect(redacted).toContain('"private_key":"[REDACTED]"')
+    expect(redacted).toContain('"normal_field":"safe_value"')
   })
 
   it('is idempotent', () => {

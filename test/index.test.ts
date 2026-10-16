@@ -153,6 +153,42 @@ describe('session lifecycle (M3)', () => {
     expect(denyService.getStats()).toEqual({ consecutive: 0, total: 0 })
     expect(sessionRules.size()).toBe(0)
   })
+
+  it('endSession with { hasUI: false } (sub-agent) does NOT clear sessionRules, whereas { hasUI: true } DOES', async () => {
+    const sessionRules = new SessionRules()
+    sessionRules.approveForSession('shell', 'cat file.txt', 'allow')
+    expect(sessionRules.size()).toBe(1)
+    configState.setYoloSession(true)
+
+    const denyService = new DenyAndContinueService({
+      mode: 'both',
+      escalation: { consecutive: 3, total: 20 },
+    })
+
+    // Child session (hasUI: false) -> preserves sessionRules and yoloSession
+    const childCtx = { hasUI: false } as unknown as ExtensionContext
+    await endSession(
+      sessionRules,
+      denyService,
+      (async () => {}) as unknown as PiEventHandler,
+      event,
+      childCtx
+    )
+    expect(sessionRules.size()).toBe(1)
+    expect(configState.isYoloSession()).toBe(true)
+
+    // Root session (hasUI: true) -> clears sessionRules and resets yoloSession
+    const rootCtx = { hasUI: true } as unknown as ExtensionContext
+    await endSession(
+      sessionRules,
+      denyService,
+      (async () => {}) as unknown as PiEventHandler,
+      event,
+      rootCtx
+    )
+    expect(sessionRules.size()).toBe(0)
+    expect(configState.isYoloSession()).toBe(false)
+  })
 })
 
 /*

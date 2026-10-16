@@ -200,4 +200,38 @@ export function registerSetCommands(
               : 'ask -> allow (explicit deny still wins)',
       })),
   })
+
+  pi.registerCommand('yolo', {
+    description:
+      'Toggle session-wide YOLO bypass (disables command/tool gate; hidden tools remain hidden). Usage: /yolo [on|off]',
+    handler: async (args, ctx) => {
+      const arg = (args ?? '').trim().toLowerCase()
+      let next: boolean
+      if (arg === '' || arg === 'toggle') {
+        next = !(state.isYoloSession?.() ?? false)
+      } else if (arg === 'on' || arg === 'true' || arg === '1') {
+        next = true
+      } else if (arg === 'off' || arg === 'false' || arg === '0') {
+        next = false
+      } else {
+        ctx.ui?.notify('Usage: /yolo [on|off]', 'warning')
+        return
+      }
+      state.setYoloSession?.(next)
+      ctx.ui?.notify(
+        next
+          ? 'YOLO mode enabled for this session (tool_call validation bypassed; hidden tools remain hidden).'
+          : 'YOLO mode disabled (normal permission gate restored).',
+        'info'
+      )
+    },
+    getArgumentCompletions: (prefix: string) =>
+      ['on', 'off']
+        .filter((opt) => opt.startsWith(prefix))
+        .map((opt) => ({
+          value: opt,
+          label: opt,
+          description: opt === 'on' ? 'enable YOLO mode' : 'disable YOLO mode',
+        })),
+  })
 }

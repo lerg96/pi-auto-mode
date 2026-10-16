@@ -16,12 +16,9 @@ import { expandHomePrefix, expandMsysDrive } from '../permission/path-scope.ts'
 /** Normalize a path string: expand home/drive prefixes and normalize separators. */
 function normalizeAllowPath(p: string): string {
   const expanded = expandHomePrefix(expandMsysDrive(p))
-  // Use `isAbsolute` (Node.js semantics) so Windows only treats
-  // `C:\...` as absolute, not `/c/...` or `/mnt/...` (MSYS drives must
-  // be rewritten via expandMsysDrive first).
-  if (isAbsolute(expanded)) return normalize(expanded)
-  // If it looks relative (no drive letter on win32, no leading / on posix),
-  // resolve against cwd to get an absolute normalized form.
+  // Always resolve against cwd to ensure root-relative paths like `/tmp`
+  // on Windows acquire the drive letter of cwd (e.g. `C:\tmp`), so they
+  // match paths passed as either `C:/tmp/...` or `/tmp/...`.
   return normalize(resolve(process.cwd(), expanded))
 }
 

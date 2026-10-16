@@ -10,6 +10,7 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
 } from '@earendil-works/pi-coding-agent'
+import { configState } from '../../src/state/config-state.ts'
 
 const baseConfig: Config = {
   ...DEFAULT_CONFIG,
@@ -22,6 +23,7 @@ const baseConfig: Config = {
 
 function makeState(initial: Config) {
   let current = initial
+  let yoloSession = false
   return {
     get: () => ({ ...current }),
     set: (c: Config) => {
@@ -34,6 +36,10 @@ function makeState(initial: Config) {
     getMode: () => current.mode,
     setMode: (mode: Config['mode']) => {
       current = { ...current, mode }
+    },
+    isYoloSession: () => yoloSession,
+    setYoloSession: (enabled: boolean) => {
+      yoloSession = Boolean(enabled)
     },
   }
 }
@@ -314,5 +320,118 @@ describe('auto-mode:mode command', () => {
       value: string
     }>
     expect(yMatches.map((m) => m.value)).toEqual(['yolo'])
+  })
+})
+
+describe('yolo command', () => {
+  let state: ReturnType<typeof makeState>
+  let commands: Record<
+    string,
+    { handler: Function; getArgumentCompletions?: Function }
+  >
+  let registerCommand: ReturnType<typeof jest.fn>
+
+  beforeEach(() => {
+    state = makeState(baseConfig)
+    const m = makePi()
+    registerCommand = m.registerCommand
+    commands = m.commands
+    registerSetCommands(m.pi, state as never)
+  })
+
+  it('registers the yolo command', () => {
+    expect(registerCommand).toHaveBeenCalledWith(
+      'yolo',
+      expect.objectContaining({ handler: expect.any(Function) })
+    )
+    expect(commands['yolo']).toBeDefined()
+  })
+
+  it('/yolo with no args toggles configState.isYoloSession() from false -> true and back true -> false', async () => {
+    const notify = jest.fn()
+    const ctx: ExtensionCommandContext = {
+      ui: { notify },
+      hasUI: true,
+    } as unknown as ExtensionCommandContext
+
+    expect(state.isYoloSession()).toBe(false)
+    await commands['yolo'].handler('', ctx)
+    expect(state.isYoloSession()).toBe(true)
+    expect(notify).toHaveBeenCalledWith(
+      expect.stringContaining('YOLO mode enabled'),
+      'info'
+    )
+
+    await commands['yolo'].handler('', ctx)
+    expect(state.isYoloSession()).toBe(false)
+    expect(notify).toHaveBeenCalledWith(
+      expect.stringContaining('YOLO mode disabled'),
+      'info'
+    )
+
+    // Also test toggle keyword explicitly
+    await commands['yolo'].handler('toggle', ctx)
+    expect(state.isYoloSession()).toBe(true)
+  })
+
+  it('/yolo on enables it, /yolo off disables it, /yolo invalid warns and does not change state', async () => {
+    const notify = jest.fn()
+    const ctx: ExtensionCommandContext = {
+      ui: { notify },
+      hasUI: true,
+    } as unknown as ExtensionCommandContext
+
+    await commands['yolo'].handler('on', ctx)
+    expect(state.isYoloSession()).toBe(true)
+    expect(notify).toHaveBeenCalledWith(
+      expect.stringContaining('YOLO mode enabled'),
+      'info'
+    )
+
+    await commands['yolo'].handler('invalid', ctx)
+    expect(state.isYoloSession()).toBe(true)
+    expect(notify).toHaveBeenCalledWith('Usage: /yolo [on|off]', 'warning')
+
+    await commands['yolo'].handler('off', ctx)
+    expect(state.isYoloSession()).toBe(false)
+    expect(notify).toHaveBeenCalledWith(
+      expect.stringContaining('YOLO mode disabled'),
+      'info'
+    )
+
+    // Test alternate boolean-like strings
+    await commands['yolo'].handler('1', ctx)
+    expect(state.isYoloSession()).toBe(true)
+    await commands['yolo'].handler('0', ctx)
+    expect(state.isYoloSession()).toBe(false)
+    await commands['yolo'].handler('true', ctx)
+    expect(state.isYoloSession()).toBe(true)
+    await commands['yolo'].handler('false', ctx)
+    expect(state.isYoloSession()).toBe(false)
+  })
+
+  it('provides argument completions for on and off', () => {
+    const def = commands['yolo']
+    expect(typeof def.getArgumentCompletions).toBe('function')
+    const all = def.getArgumentCompletions!('') as Array<{ value: string }>
+    expect(all.map((m) => m.value)).toEqual(['on', 'off'])
+    const oMatches = def.getArgumentCompletions!('of') as Array<{
+      value: string
+    }>
+    expect(oMatches.map((m) => m.value)).toEqual(['off'])
+  })
+
+  it('works with real configState', async () => {
+    const m = makePi()
+    configState.setYoloSession(false)
+    registerSetCommands(m.pi, configState)
+    const ctx = {
+      ui: { notify: jest.fn() },
+      hasUI: true,
+    } as unknown as ExtensionCommandContext
+    await m.commands['yolo'].handler('', ctx)
+    expect(configState.isYoloSession()).toBe(true)
+    await m.commands['yolo'].handler('off', ctx)
+    expect(configState.isYoloSession()).toBe(false)
   })
 })

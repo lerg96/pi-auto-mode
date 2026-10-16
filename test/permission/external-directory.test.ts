@@ -1145,4 +1145,155 @@ describe('Tool-scoped session rules (external_directory:<toolName>)', () => {
     })
     expect(verdict).toBeUndefined()
   })
+
+  describe('cd tracking across compound command segments', () => {
+    it('tracks cd <dir> so subsequent relative paths resolve to the new dir', () => {
+      const outsideDir = outside('target-dir')
+      const cfg = cfgWith({
+        confineToWorkingDirectory: true,
+        permissions: {
+          tools: { bash: 'allow' },
+          external_directory: {
+            [`${outsideDir}/**`]: 'allow',
+            [`${outsideDir}/secret.txt`]: 'deny',
+          },
+        },
+      })
+
+      // Segment 1 cd is allowed; segment 2 touches file.txt under outsideDir -> allowed (no verdict)
+      const allowedIntents = [
+        { surface: 'shell', value: `cd "${outsideDir}"` },
+        { surface: 'shell', value: 'cat file.txt' },
+      ]
+      const allowedVerdict = evaluateExternalDirectory(cfg, allowedIntents, {
+        toolName: 'bash',
+        cwd,
+      })
+      expect(allowedVerdict?.action).toBe('allow')
+
+      // Segment 1 cd is allowed; segment 2 touches secret.txt under outsideDir -> caught by deny rule!
+      const deniedIntents = [
+        { surface: 'shell', value: `cd "${outsideDir}"` },
+        { surface: 'shell', value: 'cat secret.txt' },
+      ]
+      const verdict = evaluateExternalDirectory(cfg, deniedIntents, {
+        toolName: 'bash',
+        cwd,
+      })
+      expect(verdict).toBeDefined()
+      expect(verdict?.action).toBe('deny')
+      expect(verdict?.absPath).toBe(normalize(`${outsideDir}/secret.txt`))
+    })
+
+    it('cd to unapproved outside dir triggers ask on the cd itself', () => {
+      const outsideDir = outside('unapproved-dir')
+      const cfg = cfgWith({
+        confineToWorkingDirectory: true,
+        permissions: { tools: { bash: 'allow' } },
+      })
+      const intents = [{ surface: 'shell', value: `cd "${outsideDir}"` }]
+      const verdict = evaluateExternalDirectory(cfg, intents, {
+        toolName: 'bash',
+        cwd,
+      })
+      expect(verdict).toBeDefined()
+      expect(verdict?.action).toBe('ask')
+      expect(verdict?.absPath).toBe(normalize(outsideDir))
+    })
+
+    it('cd to unapproved outside dir with subsequent segment resolves both to outside', () => {
+      const outsideDir = outside('unapproved-dir')
+      const cfg = cfgWith({
+        confineToWorkingDirectory: true,
+        permissions: { tools: { bash: 'allow' } },
+      })
+      const intents = [
+        { surface: 'shell', value: `cd "${outsideDir}"` },
+        { surface: 'shell', value: 'cat file.txt' },
+      ]
+      const verdict = evaluateExternalDirectory(cfg, intents, {
+        toolName: 'bash',
+        cwd,
+      })
+      expect(verdict).toBeDefined()
+      expect(verdict?.action).toBe('ask')
+      expect(verdict?.absPath).toBe(normalize(`${outsideDir}/file.txt`))
+    })
+
+    it('cd inside cwd keeps subsequent files internal', () => {
+      const cfg = cfgWith({
+        confineToWorkingDirectory: true,
+        permissions: { tools: { bash: 'allow' } },
+      })
+      const intents = [
+        { surface: 'shell', value: 'cd src' },
+        { surface: 'shell', value: 'cat index.ts' },
+      ]
+      expect(
+        evaluateExternalDirectory(cfg, intents, { toolName: 'bash', cwd })
+      ).toBeUndefined()
+    })
+  })
+
+  describe('Windows drive-letter and /tmp matching in external_directory', () => {
+    it('matches /tmp/** config rule when command uses drive letter path', () => {
+      if (process.platform !== 'win32') return
+      const drive = cwd.slice(0, 2) // e.g. "C:"
+      const cfg = cfgWith({
+        confineToWorkingDirectory: true,
+        permissions: {
+          tools: { bash: 'allow' },
+          external_directory: {
+            '/tmp/**': 'allow',
+          },
+        },
+      })
+      const intents = [
+        { surface: 'shell', value: `cat ${drive}/tmp/nested/test.txt` },
+      ]
+      const verdict = evaluateExternalDirectory(cfg, intents, {
+        toolName: 'bash',
+        cwd,
+      })
+      expect(verdict?.action).toBe('allow')
+    })
+
+    it('matches C:/tmp/** config rule when command uses root-relative /tmp path', () => {
+      if (process.platform !== 'win32') return
+      const drive = cwd.slice(0, 2) // e.g. "C:"
+      const cfg = cfgWith({
+        confineToWorkingDirectory: true,
+        permissions: {
+          tools: { bash: 'allow' },
+          external_directory: {
+            [`${drive}/tmp/**`]: 'allow',
+          },
+        },
+      })
+      const intents = [{ surface: 'shell', value: 'cat /tmp/nested/test.txt' }]
+      const verdict = evaluateExternalDirectory(cfg, intents, {
+        toolName: 'bash',
+        cwd,
+      })
+      expect(verdict?.action).toBe('allow')
+    })
+
+    it('allowlist matches root-relative and drive-letter variants symmetrically on win32', () => {
+      if (process.platform !== 'win32') return
+      const drive = cwd.slice(0, 2)
+      resetExternalDirAllowlist()
+      try {
+        addExternalDirAllow('/tmp')
+        expect(isExternalDirAllowed(`${drive}/tmp/file.txt`)).toBe(true)
+        expect(isExternalDirAllowed('/tmp/file.txt')).toBe(true)
+
+        resetExternalDirAllowlist()
+        addExternalDirAllow(`${drive}/tmp`)
+        expect(isExternalDirAllowed('/tmp/file.txt')).toBe(true)
+        expect(isExternalDirAllowed(`${drive}/tmp/file.txt`)).toBe(true)
+      } finally {
+        resetExternalDirAllowlist()
+      }
+    })
+  })
 })

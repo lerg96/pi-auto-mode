@@ -6,7 +6,10 @@ import type {
   ClassifierResult,
 } from '../classifier/llm-layer.ts'
 import type { DenyAndContinueService } from '../deny/deny-service.ts'
-import { evaluatePermission } from '../permission/visibility.ts'
+import {
+  evaluatePermission,
+  resolveToolVisibility,
+} from '../permission/visibility.ts'
 import { evaluateExternalDirectory } from '../permission/external-directory.ts'
 import { grantDirFor } from '../permission/path-scope.ts'
 import {
@@ -727,13 +730,37 @@ export async function gateToolCall(
           ? input.workingDirectory.trim()
           : undefined
 
+  const startedAt = Date.now()
+  const cfg = deps.configState.get()
+  const intents = normalizeToolCall(toolName, input)
+
+  if (
+    (
+      deps.configState as { isYoloSession?: () => boolean }
+    ).isYoloSession?.() === true
+  ) {
+    const toolVis = resolveToolVisibility(cfg, toolName, '*')
+    if (toolVis !== 'deny') {
+      const first = intents[0] ?? { surface: toolName, value: '*' }
+      emit(deps.hooks, first.surface, first.value, 'allow', 'yolo_bypass', {
+        ...buildDecisionDetail({
+          toolName,
+          matchedSurface: first.surface,
+          matchedValue: first.value,
+          startedAt,
+        }),
+      })
+      return
+    }
+  }
+
   const ctx: GateCtx = {
     toolName,
     input,
     deps,
-    startedAt: Date.now(),
-    cfg: deps.configState.get(),
-    intents: normalizeToolCall(toolName, input),
+    startedAt,
+    cfg,
+    intents,
     fullCommand:
       typeof input.command === 'string' && input.command.length > 0
         ? input.command

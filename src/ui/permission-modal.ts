@@ -514,7 +514,12 @@ export class ModalView implements CustomComponent {
         } else if (selected.id === 'allow_session') {
           pattern = this.req?.sessionPatterns?.[0] ?? this.req?.value ?? ''
         } else if (selected.id.startsWith('allow_dir_')) {
-          pattern = this.req?.externalDir ?? this.req?.value ?? ''
+          const baseDir = (
+            this.req?.externalDir ??
+            this.req?.value ??
+            ''
+          ).replace(/[/\\]+$/, '')
+          pattern = baseDir ? `${baseDir}/**` : ''
         } else if (selected.id === 'allow') {
           pattern = this.req?.sessionPatterns?.[0] ?? this.req?.value ?? ''
         }
@@ -791,6 +796,14 @@ export function createModalAskResolver(
                     // H5: capture an optional reason and return it as a
                     // structured denial. Sanitize to prevent directive
                     // injection into the message the model will see.
+                    if (timer !== undefined) {
+                      clearTimeout(timer)
+                      timer = undefined
+                    }
+                    if (remindTimer !== undefined) {
+                      clearInterval(remindTimer)
+                      remindTimer = undefined
+                    }
                     let reason: string | undefined
                     try {
                       reason = await ui.input(

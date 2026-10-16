@@ -2023,4 +2023,148 @@ rm -f /tmp/agy1.txt /tmp/agy2.txt /tmp/agy3.txt`
       expect(askedRequests[0].externalDir).toBeDefined()
     })
   })
+
+  describe('/yolo session mode bypass', () => {
+    it('allows bash command matching a deny pattern rule when isYoloSession is true', async () => {
+      configState.set(config)
+      const emitSpy = jest.fn()
+      const yoloConfigState = Object.assign(Object.create(configState), {
+        isYoloSession: () => true,
+      })
+      const deps = {
+        ...makeDeps(),
+        configState: yoloConfigState,
+        hooks: { emit: emitSpy },
+      }
+
+      await expect(
+        gateToolCall('bash', { command: 'echo spam a' }, deps)
+      ).resolves.toBeUndefined()
+      await expect(
+        gateToolCall('bash', { command: 'rm -rf /tmp/foo' }, deps)
+      ).resolves.toBeUndefined()
+
+      expect(emitSpy).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          result: 'allow',
+          resolution: 'yolo_bypass',
+        })
+      )
+    })
+
+    it('still denies a tool with a tool-level SimpleAction deny even when isYoloSession is true', async () => {
+      configState.set({
+        ...config,
+        permissions: {
+          ...config.permissions,
+          tools: {
+            ...config.permissions.tools,
+            write: 'deny',
+          },
+        },
+      })
+      const yoloConfigState = Object.assign(Object.create(configState), {
+        isYoloSession: () => true,
+      })
+      const deps = { ...makeDeps(), configState: yoloConfigState }
+
+      await expect(
+        gateToolCall('write', { path: '/tmp/test.txt' }, deps)
+      ).rejects.toThrow()
+    })
+  })
+
+  describe('allow_permanent on external-directory modal', () => {
+    let prevResolver: ReturnType<typeof getAskResolver>
+
+    beforeEach(() => {
+      prevResolver = getAskResolver()
+      resetExternalDirAllowlist()
+    })
+    afterEach(() => {
+      setAskResolver(prevResolver)
+    })
+
+    it('appends /** when pattern is passed without /** and allows subsequent accesses without prompting', async () => {
+      configState.set({
+        ...config,
+        confineToWorkingDirectory: true,
+      })
+      const extDir = resolve(process.cwd(), '..', 'external-test-dir')
+      const extFile1 = resolve(extDir, 'sub', 'file1.txt')
+      const extFile2 = resolve(extDir, 'sub', 'file2.txt')
+
+      let askCount = 0
+      setAskResolver(async (req) => {
+        askCount++
+        return {
+          decision: 'allow_permanent',
+          pattern: req.externalDir?.externalGrantDir,
+        }
+      })
+
+      const deps = makeDeps()
+      await gateToolCall('read', { path: extFile1, cwd: process.cwd() }, deps)
+      expect(askCount).toBe(1)
+
+      // Subsequent access to another file in the same external dir is allowed without asking
+      await gateToolCall('read', { path: extFile2, cwd: process.cwd() }, deps)
+      expect(askCount).toBe(1)
+    })
+  })
+
+  describe('powershell parity with bash', () => {
+    it('matches permissions.tools.bash rules when powershell rule is not defined', async () => {
+      configState.set(config)
+      const deps = makeDeps()
+      await expect(
+        gateToolCall('powershell', { command: 'echo spam a' }, deps)
+      ).rejects.toThrow()
+      await expect(
+        gateToolCall('powershell', { command: 'rm -rf /tmp/foo' }, deps)
+      ).rejects.toThrow()
+    })
+  })
+
+  describe('classifier aggregateClassify in gateToolCall', () => {
+    it('breaks early on deny without classifying subsequent segments, and skips shell structural segments', async () => {
+      configState.set({
+        ...config,
+        permissions: {
+          tools: {
+            bash: [{ pattern: '*', action: 'ask' }],
+          },
+        },
+      })
+      const classifiedValues: string[] = []
+      const classify = async (
+        i: ClassifierInput
+      ): Promise<ClassifierResult> => {
+        classifiedValues.push(i.value)
+        if (i.value === 'bad-cmd') {
+          return {
+            decision: 'block',
+            risk: {
+              score: 9,
+              level: 'high',
+              reason: 'dangerous',
+              category: 'destructive',
+            },
+          }
+        }
+        return { decision: 'allow' }
+      }
+
+      const deps = { ...makeDeps(), classify }
+      const cmd = 'for f in a b; do bad-cmd; later-cmd; done'
+      await expect(
+        gateToolCall('bash', { command: cmd }, deps)
+      ).rejects.toThrow()
+
+      expect(classifiedValues).not.toContain('for f in a b')
+      expect(classifiedValues).toContain('bad-cmd')
+      expect(classifiedValues).not.toContain('later-cmd')
+    })
+  })
 })

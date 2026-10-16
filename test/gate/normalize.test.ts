@@ -133,6 +133,14 @@ describe('segmentCommand keepQuotes (raw twin for the scope extractor)', () => {
     expect(bare).toHaveLength(1)
     expect(bare[0].rawValue).toBeUndefined()
   })
+
+  it('normalizeToolCall for powershell sets rawValue when quotes are present', () => {
+    const withQuotes = normalizeToolCall('powershell', {
+      command: 'echo "a b"',
+    })
+    expect(withQuotes).toHaveLength(1)
+    expect(withQuotes[0].rawValue).toBe('echo "a b"')
+  })
 })
 
 describe('normalizeToolCall edge cases', () => {

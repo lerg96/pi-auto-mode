@@ -110,12 +110,32 @@ export const defaultAskResolver: AskResolver = async () => ({
   via: 'no-ui',
 })
 
-let current: AskResolver = defaultAskResolver
+const ASK_RESOLVER_KEY = Symbol.for('pi-auto-mode:ask-resolver')
+
+const slot = globalThis as unknown as Record<symbol, unknown>
+if (!slot[ASK_RESOLVER_KEY]) {
+  slot[ASK_RESOLVER_KEY] = defaultAskResolver
+}
 
 export function getAskResolver(): AskResolver {
-  return current
+  const raw = (globalThis as unknown as Record<symbol, unknown>)[
+    ASK_RESOLVER_KEY
+  ]
+  if (typeof raw === 'function') {
+    return raw as AskResolver
+  }
+  if (
+    raw &&
+    typeof raw === 'object' &&
+    'current' in raw &&
+    typeof (raw as { current: unknown }).current === 'function'
+  ) {
+    return (raw as { current: AskResolver }).current
+  }
+  return defaultAskResolver
 }
 
 export function setAskResolver(r: AskResolver): void {
-  current = r
+  const g = globalThis as unknown as Record<symbol, unknown>
+  g[ASK_RESOLVER_KEY] = r
 }

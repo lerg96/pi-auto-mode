@@ -194,15 +194,31 @@ function applyAllowDecision(
     return 'allow_session'
   }
   if (decision === 'allow_permanent') {
-    const safePattern =
-      chosenPattern ??
-      (externalDir?.isExternalDir && externalDir.externalGrantDir
-        ? `${externalDir.externalGrantDir}/**`
-        : value)
+    if (externalDir?.isExternalDir) {
+      const dirBase = externalDir.externalGrantDir ?? chosenPattern ?? value
+      const safePattern =
+        dirBase.endsWith('/**') || dirBase.endsWith('\\**')
+          ? dirBase
+          : `${dirBase.replace(/[/\\]+$/, '')}/**`
+      deps.sessionRules.approveForSession(
+        externalDirSurfaceFor(toolName ?? surface),
+        safePattern,
+        'allow'
+      )
+      addExternalDirAllow(dirBase)
+      persistPermanentAllow({
+        surface: 'external_directory',
+        pattern: safePattern,
+        toolName,
+        isExternalDir: true,
+      })
+      return 'allow_permanent'
+    }
+    const safePattern = chosenPattern ?? value
     const isExact = chosenPattern ? chosenPattern === value : true
     deps.sessionRules.approveForSession(surface, safePattern, 'allow', isExact)
     persistPermanentAllow({
-      surface: externalDir?.isExternalDir ? 'external_directory' : surface,
+      surface: surface,
       pattern: safePattern,
       toolName,
       isExternalDir: externalDir?.isExternalDir,

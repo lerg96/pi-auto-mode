@@ -1669,6 +1669,84 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
 
       expect(await promise).toBe('deny')
     })
+
+    it('resolves allow_permanent with <dir>/** on Shift+Enter or permanent mode for external-directory', async () => {
+      const resolver = makeResolver()
+      const promise = resolver({
+        type: 'external-directory',
+        externalDir: '/mnt/shared',
+        surface: 'shell',
+        value: 'ls /mnt/shared',
+      })
+      const view = renderCapture!(
+        undefined,
+        fakeGlobalTheme,
+        undefined,
+        () => {}
+      ) as unknown as { handleInput(data: string): void }
+
+      view.handleInput('down') // index 1: allow_dir_tool
+      view.handleInput('\x1b[13;2u') // Shift + Enter
+
+      expect(await promise).toEqual({
+        decision: 'allow_permanent',
+        pattern: '/mnt/shared/**',
+      })
+
+      // Also test allow_dir_all in permanent mode
+      const resolver2 = makeResolver()
+      const promise2 = resolver2({
+        type: 'external-directory',
+        externalDir: 'C:/Users/test/external',
+        surface: 'shell',
+        value: 'cat C:/Users/test/external/f.txt',
+      })
+      const view2 = renderCapture!(
+        undefined,
+        fakeGlobalTheme,
+        undefined,
+        () => {}
+      ) as unknown as { handleInput(data: string): void }
+
+      view2.handleInput('\t') // Switch to permanent mode
+      view2.handleInput('down') // index 1: allow_dir_tool
+      view2.handleInput('down') // index 2: allow_dir_all
+      view2.handleInput('\r') // Enter
+
+      expect(await promise2).toEqual({
+        decision: 'allow_permanent',
+        pattern: 'C:/Users/test/external/**',
+      })
+    })
+
+    it('clears modal timer when user selects deny_reason so main modal timeout does not race', async () => {
+      jest.useFakeTimers()
+      try {
+        let inputResolve: (val: string) => void
+        inputImpl.mockImplementationOnce(
+          () =>
+            new Promise<string>((resolve) => {
+              inputResolve = resolve
+            })
+        )
+        const resolver = makeResolver(new SessionRules(), 1000)
+        const promise = resolver({ surface: 'fs', value: '/tmp/test' })
+        choose('deny_reason')
+
+        // Fast-forward past modal timeout (1000ms)
+        await jest.advanceTimersByTimeAsync(1500)
+
+        // Then resolve user input
+        inputResolve!('my detailed reason')
+        const result = await promise
+        expect(result).toEqual({
+          decision: 'deny',
+          reason: 'my detailed reason',
+        })
+      } finally {
+        jest.useRealTimers()
+      }
+    })
   })
 })
 

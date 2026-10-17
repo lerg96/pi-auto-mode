@@ -1,3 +1,6 @@
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   classifyToolCall,
   redactSecrets,
@@ -651,5 +654,190 @@ describe('llm-layer home-path masking (external payload boundary)', () => {
     } finally {
       ;(globalThis as { fetch?: unknown }).fetch = undefined
     }
+  })
+})
+
+describe('llm-layer extensions: cwd, requestId, and file-extraction', () => {
+  describe('cwd prompt forwarding', () => {
+    beforeEach(() => {
+      ;(globalThis as { fetch?: unknown }).fetch = mockFetch(
+        '{"decision":"allow","riskScore":1}'
+      )
+    })
+    afterEach(() => {
+      ;(globalThis as { fetch?: unknown }).fetch = undefined
+    })
+
+    it('when cwd is provided, the LLM prompt includes WorkingDirectory: <masked cwd>', async () => {
+      const fetchSpy = globalThis.fetch as unknown as ReturnType<typeof jest.fn>
+      await classifyToolCall(
+        {
+          toolName: 'bash',
+          arguments: { command: 'npm test' },
+          surface: 'bash',
+          value: 'npm test',
+          cwd: '/workspace/project',
+        },
+        { config: baseConfig, llm: llmCfg }
+      )
+      const prompt = promptFromFetch(fetchSpy)
+      expect(prompt).toContain('WorkingDirectory: /workspace/project')
+    })
+  })
+
+  describe('requestId forwarding and debug observability', () => {
+    beforeEach(() => {
+      ;(globalThis as { fetch?: unknown }).fetch = mockFetch(
+        '{"decision":"allow","riskScore":1}'
+      )
+    })
+    afterEach(() => {
+      ;(globalThis as { fetch?: unknown }).fetch = undefined
+    })
+
+    it('forwards requestId to metadata.pi_auto_mode_request_id in fetch body and attempt', async () => {
+      const fetchSpy = globalThis.fetch as unknown as ReturnType<typeof jest.fn>
+      const debugSpy = jest.fn()
+      const res = await classifyToolCall(
+        {
+          toolName: 'bash',
+          arguments: { command: 'echo hello' },
+          surface: 'bash',
+          value: 'echo hello',
+          requestId: 'req-abc-123',
+        },
+        {
+          config: baseConfig,
+          llm: {
+            ...llmCfg,
+            extraBody: {
+              customProp: 'existing',
+              metadata: { priorMeta: 'yes' },
+            },
+          },
+        },
+        { debug: { record: debugSpy } }
+      )
+      expect(res.decision).toBe('allow')
+      expect(res.risk?.decision).toBe('allow')
+      expect(fetchSpy).toHaveBeenCalled()
+      const init = fetchSpy.mock.calls[0]?.[1] as { body?: string } | undefined
+      expect(init?.body).toBeDefined()
+      const parsedBody = JSON.parse(init!.body!) as {
+        customProp?: string
+        metadata?: { priorMeta?: string; pi_auto_mode_request_id?: string }
+      }
+      expect(parsedBody.customProp).toBe('existing')
+      expect(parsedBody.metadata?.priorMeta).toBe('yes')
+      expect(parsedBody.metadata?.pi_auto_mode_request_id).toBe('req-abc-123')
+      expect(debugSpy).toHaveBeenCalledWith(
+        'llm:attempt',
+        expect.objectContaining({
+          requestId: 'req-abc-123',
+        })
+      )
+    })
+
+    it('includes requestId in debug.record llm:error on generic fetch error', async () => {
+      ;(globalThis as { fetch?: unknown }).fetch = jest.fn(async () => {
+        throw new TypeError('connection reset')
+      })
+      const debugSpy = jest.fn()
+      const res = await classifyToolCall(
+        {
+          toolName: 'bash',
+          arguments: { command: 'echo hello' },
+          surface: 'bash',
+          value: 'echo hello',
+          requestId: 'req-err-456',
+        },
+        { config: baseConfig, llm: llmCfg },
+        { debug: { record: debugSpy } }
+      )
+      expect(res.decision).toBe('ask')
+      expect(debugSpy).toHaveBeenCalledWith(
+        'llm:error',
+        expect.objectContaining({
+          requestId: 'req-err-456',
+          kind: 'onError',
+        })
+      )
+    })
+
+    it('includes requestId in debug.record llm:error on LlmHttpError', async () => {
+      ;(globalThis as { fetch?: unknown }).fetch = jest.fn(async () => ({
+        ok: false,
+        status: 502,
+        statusText: 'Bad Gateway',
+        text: async () => 'upstream bad gateway',
+      }))
+      const debugSpy = jest.fn()
+      const res = await classifyToolCall(
+        {
+          toolName: 'bash',
+          arguments: { command: 'echo hello' },
+          surface: 'bash',
+          value: 'echo hello',
+          requestId: 'req-http-789',
+        },
+        { config: baseConfig, llm: { ...llmCfg, retries: 0 } },
+        { debug: { record: debugSpy } }
+      )
+      expect(res.decision).toBe('ask')
+      expect(debugSpy).toHaveBeenCalledWith(
+        'llm:error',
+        expect.objectContaining({
+          requestId: 'req-http-789',
+          status: 502,
+        })
+      )
+    })
+  })
+
+  describe('referenced file extraction into LLM prompt', () => {
+    let tempDir: string
+
+    beforeEach(() => {
+      tempDir = mkdtempSync(join(tmpdir(), 'pi-am-llm-layer-'))
+      ;(globalThis as { fetch?: unknown }).fetch = mockFetch(
+        '{"decision":"allow","riskScore":1}'
+      )
+    })
+
+    afterEach(() => {
+      ;(globalThis as { fetch?: unknown }).fetch = undefined
+      rmSync(tempDir, { recursive: true, force: true })
+    })
+
+    it('includes referenced file contents in prompt and emits classifier:file_extraction telemetry', async () => {
+      const scriptPath = join(tempDir, 'script.py')
+      writeFileSync(scriptPath, 'print("safe script execution")\n', 'utf8')
+      const fetchSpy = globalThis.fetch as unknown as ReturnType<typeof jest.fn>
+      const telemetrySpy = jest.fn()
+
+      const res = await classifyToolCall(
+        {
+          toolName: 'bash',
+          arguments: { command: `python "${scriptPath}"` },
+          surface: 'bash',
+          value: `python "${scriptPath}"`,
+        },
+        { config: baseConfig, llm: llmCfg },
+        { telemetry: { record: telemetrySpy } }
+      )
+
+      expect(res.decision).toBe('allow')
+      expect(res.risk?.decision).toBe('allow')
+      const prompt = promptFromFetch(fetchSpy)
+      expect(prompt).toContain('File referenced:')
+      expect(prompt).toContain('print("safe script execution")')
+      expect(telemetrySpy).toHaveBeenCalledWith(
+        'classifier:file_extraction',
+        expect.objectContaining({
+          kind: 'ok',
+          path: expect.stringContaining('script.py'),
+        })
+      )
+    })
   })
 })

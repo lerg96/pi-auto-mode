@@ -120,6 +120,10 @@ async function resolveLlmCredentials(
 import { isSecretSensitive } from './secret-guard.ts'
 import { maskHomePrefix } from './home-path.ts'
 import {
+  extractReferencedFile,
+  formatFileExtraction,
+} from './file-extraction.ts'
+import {
   callLlmWithFallback,
   isTimeoutError,
   LlmHttpError,
@@ -137,6 +141,8 @@ export interface ClassifierInput {
   arguments: Record<string, unknown>
   surface: string
   value: string
+  cwd?: string
+  requestId?: string
 }
 
 export type RiskLevel = 'low' | 'medium' | 'high'
@@ -156,6 +162,7 @@ export interface ClassifierResult {
     // part of a deny message. Optional for back-compat with legacy
     // callers; absence is treated as `'rule'`.
     riskOrigin?: 'rule' | 'llm'
+    decision?: 'allow' | 'block' | 'ask'
   }
   matchedRuleId?: string
 }
@@ -254,7 +261,8 @@ export function redactSecrets(text: string): string {
 
 function buildLlmPrompt(
   input: ClassifierInput,
-  _config: import('../types/config.ts').ClassifierConfig
+  _config: import('../types/config.ts').ClassifierConfig,
+  fileFragment?: string
 ): string {
   // M2: redact sensitive values in BOTH the JSON arguments and the free-form
   // value field before including them in the LLM prompt. Arguments are redacted
@@ -269,13 +277,18 @@ function buildLlmPrompt(
   )
   const args = redactSecrets(JSON.stringify(redactedArgs))
   const value = redactSecrets(input.value ?? '')
-  const parts = [
-    `Tool: ${input.toolName}`,
-    `Surface: ${input.surface}`,
+  const parts = [`Tool: ${input.toolName}`, `Surface: ${input.surface}`]
+  if (input.cwd && input.cwd.trim().length > 0) {
+    parts.push(`WorkingDirectory: ${redactSecrets(input.cwd.trim())}`)
+  }
+  parts.push(
     `Arguments: ${args}`,
     `Value: ${value}`,
-    `Policy: LLM-only classification (rule-based phase removed in Phase 1).`,
-  ]
+    `Policy: LLM-only classification (rule-based phase removed in Phase 1).`
+  )
+  if (fileFragment && fileFragment.trim().length > 0) {
+    parts.push(fileFragment)
+  }
   parts.push(DEFAULT_SYSTEM)
   return parts.join('\n')
 }
@@ -379,6 +392,7 @@ function mapLlmResult(
           : '(LLM classifier gave no reason)',
       category: parsed?.category,
       riskOrigin: 'llm',
+      decision,
     },
   }
 }
@@ -462,7 +476,30 @@ async function runLlmBranch(
   // below runs outside `creds` scope, so it travels in this binding.
   let debugHost = ''
   try {
-    const prompt = buildLlmPrompt(input, config)
+    let fileFragment: string | undefined
+    if (
+      input.surface === 'shell' ||
+      input.surface === 'bash' ||
+      input.surface === 'powershell' ||
+      input.toolName === 'bash' ||
+      input.toolName === 'powershell'
+    ) {
+      const extracted = await extractReferencedFile(input.value)
+      if (extracted !== null) {
+        deps.telemetry?.record(
+          'classifier:file_extraction',
+          extracted.kind === 'ok'
+            ? {
+                kind: extracted.kind,
+                path: extracted.path,
+                size: extracted.size,
+              }
+            : extracted
+        )
+        fileFragment = redactSecrets(formatFileExtraction(extracted))
+      }
+    }
+    const prompt = buildLlmPrompt(input, config, fileFragment)
     // Resolve credentials lazily: per call (the user can switch Pi models
     // mid-session). Empty config values fall through to the Pi model
     // registry. A resolution failure routes to `fallbackDecision` so the
@@ -470,6 +507,16 @@ async function runLlmBranch(
     // out of `classifyToolCall` for a credential lookup miss.
     const creds = await resolveLlmCredentials(params.llm, deps.models)
     debugHost = safeHostname(creds.baseUrl)
+    const extraBody = input.requestId
+      ? {
+          ...(params.llm.extraBody ?? {}),
+          metadata: {
+            ...((params.llm.extraBody?.metadata as
+              Record<string, unknown> | undefined) ?? {}),
+            pi_auto_mode_request_id: input.requestId,
+          },
+        }
+      : params.llm.extraBody
     const res = await callLlmWithFallback({
       baseUrl: creds.baseUrl,
       apiKey: creds.apiKey,
@@ -479,12 +526,15 @@ async function runLlmBranch(
       systemPrompt: params.llm.systemPrompt ?? DEFAULT_SYSTEM,
       timeoutMs: params.llm.timeoutMs,
       maxTokens: params.llm.maxTokens,
-      extraBody: params.llm.extraBody,
+      extraBody,
       extraHeaders: params.llm.extraHeaders,
       // Per-attempt diagnostics → debug jsonl (`llm:attempt` events).
       // No-op when the debug recorder is absent or disabled.
       onAttempt: (a) => {
-        deps.debug?.record('llm:attempt', a)
+        deps.debug?.record(
+          'llm:attempt',
+          input.requestId ? { ...a, requestId: input.requestId } : a
+        )
       },
       retries: params.llm.retries,
     })
@@ -503,6 +553,7 @@ async function runLlmBranch(
         kind,
         timeoutMs: params.llm.timeoutMs,
         host: debugHost,
+        ...(input.requestId ? { requestId: input.requestId } : {}),
       })
     } else {
       deps.debug?.record('llm:error', {
@@ -511,6 +562,7 @@ async function runLlmBranch(
         message: e instanceof Error ? e.message : String(e),
         timeoutMs: params.llm.timeoutMs,
         host: debugHost,
+        ...(input.requestId ? { requestId: input.requestId } : {}),
       })
     }
     return fallbackDecision(config, kind, e)

@@ -1,4 +1,8 @@
-import type { ClassifierResult, RiskLevel } from '../classifier/llm-layer.ts'
+import type {
+  ClassifierInput,
+  ClassifierResult,
+  RiskLevel,
+} from '../classifier/llm-layer.ts'
 import { isShellStructureSegment, type AccessIntent } from './normalize.ts'
 import type { GateDeps } from './gate.ts'
 
@@ -25,10 +29,11 @@ export async function aggregateClassify(
   intents: AccessIntent[],
   toolName: string,
   input: Record<string, unknown>,
-  deps: GateDeps
+  deps: GateDeps,
+  extra?: { cwd?: string; requestId?: string }
 ): Promise<{
   action: 'allow' | 'ask' | 'deny'
-  risk?: ClassifierResult['risk']
+  risk?: ClassifierResult['risk'] & { decision?: 'allow' | 'block' | 'ask' }
   surface: string
   value: string
 }> {
@@ -41,7 +46,9 @@ export async function aggregateClassify(
   }
   let action: 'allow' | 'ask' | 'deny' = 'allow'
   const onBlock = deps.configState.get().classifier.onBlock
-  let risk: ClassifierResult['risk'] | undefined
+  let risk:
+    | (ClassifierResult['risk'] & { decision?: 'allow' | 'block' | 'ask' })
+    | undefined
 
   const candidateIntents = intents.filter(
     (i) => !(i.surface === 'shell' && isShellStructureSegment(i.value))
@@ -68,7 +75,9 @@ export async function aggregateClassify(
       arguments: input,
       surface: intent.surface,
       value: intent.value,
-    })
+      ...(extra?.cwd !== undefined ? { cwd: extra.cwd } : {}),
+      ...(extra?.requestId !== undefined ? { requestId: extra.requestId } : {}),
+    } as ClassifierInput)
     const intentAction = classifyDecision(r, onBlock)
     if (intentAction === 'ask' && !askRepSet) {
       repSurface = intent.surface
@@ -78,7 +87,10 @@ export async function aggregateClassify(
     if (mostRestrictive(action, intentAction) === intentAction)
       action = intentAction
     if (r.risk && (!risk || RISK_RANK[r.risk.level] > RISK_RANK[risk.level])) {
-      risk = r.risk
+      risk = {
+        ...r.risk,
+        ...(r.decision !== undefined ? { decision: r.decision } : {}),
+      }
     }
     if (intentAction === 'deny') {
       repSurface = intent.surface

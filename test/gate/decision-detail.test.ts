@@ -100,6 +100,75 @@ describe('buildDecisionDetail', () => {
       matchedValue: 'password=hunter2secret',
       startedAt,
     })
-    expect(detail.matchedValue).toBe('[REDACTED]')
+    expect(detail.matchedValue).toContain('[REDACTED]')
+    expect(detail.matchedValue).not.toContain('hunter2secret')
+  })
+
+  it('attaches risk.decision when present', () => {
+    const { detail } = buildDecisionDetail({
+      toolName: 'bash',
+      matchedSurface: 'shell',
+      matchedValue: 'ls',
+      risk: {
+        score: 5,
+        level: 'medium',
+        decision: 'ask',
+      },
+      startedAt,
+    })
+    expect(detail.risk?.decision).toBe('ask')
+  })
+
+  it('populates cwd, fullCommand, and segments with redaction', () => {
+    const { detail } = buildDecisionDetail({
+      toolName: 'bash',
+      matchedSurface: 'shell',
+      matchedValue: 'echo 1',
+      cwd: '/home/user/project',
+      fullCommand: 'echo 1 && echo password=hunter2secret',
+      segments: ['echo 1', 'echo password=hunter2secret'],
+      startedAt,
+    })
+    expect(detail.cwd).toBeDefined()
+    expect(detail.fullCommand).toContain('[REDACTED]')
+    expect(detail.fullCommand).not.toContain('hunter2secret')
+    expect(detail.segments).toHaveLength(2)
+    expect(detail.segments?.[0]).toBe('echo 1')
+    expect(detail.segments?.[1]).toContain('[REDACTED]')
+    expect(detail.segments?.[1]).not.toContain('hunter2secret')
+  })
+
+  it('populates externalScope when provided', () => {
+    const { detail } = buildDecisionDetail({
+      toolName: 'read',
+      matchedSurface: 'fs',
+      matchedValue: '/etc/passwd',
+      externalScope: {
+        outsideCwd: true,
+        externalDir: '/etc',
+        action: 'ask',
+      },
+      startedAt,
+    })
+    expect(detail.externalScope).toEqual({
+      outsideCwd: true,
+      externalDir: '/etc',
+      action: 'ask',
+    })
+  })
+
+  it('handles externalScope without optional externalDir or action', () => {
+    const { detail } = buildDecisionDetail({
+      toolName: 'read',
+      matchedSurface: 'fs',
+      matchedValue: 'foo.txt',
+      externalScope: {
+        outsideCwd: false,
+      },
+      startedAt,
+    })
+    expect(detail.externalScope).toEqual({
+      outsideCwd: false,
+    })
   })
 })

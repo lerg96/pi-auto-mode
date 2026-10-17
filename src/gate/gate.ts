@@ -18,7 +18,10 @@ import {
   type AccessIntent,
 } from './normalize.ts'
 import { emit, askActor, type GateHooks } from './ask-audit.ts'
-import { buildDecisionDetail } from './decision-detail.ts'
+import {
+  buildDecisionDetail,
+  type DecisionExternalScope,
+} from './decision-detail.ts'
 import type { AskOrigin } from './ask.ts'
 import {
   resolveAsk,
@@ -59,6 +62,23 @@ interface GateCtx {
   intents: AccessIntent[]
   fullCommand?: string
   cwd?: string
+  requestId: string
+  segments?: string[]
+  externalScope?: DecisionExternalScope
+}
+
+function ctxDetailFields(ctx: GateCtx): {
+  cwd?: string
+  fullCommand?: string
+  segments?: string[]
+  externalScope?: DecisionExternalScope
+} {
+  return {
+    cwd: ctx.cwd,
+    fullCommand: ctx.fullCommand,
+    segments: ctx.segments,
+    externalScope: ctx.externalScope,
+  }
 }
 
 interface CascadeState {
@@ -92,6 +112,7 @@ async function handleUnknownToolIntent(
     matchedSurface: toolName,
     matchedValue: value,
     startedAt,
+    ...ctxDetailFields(ctx),
   }
   try {
     const { requestId, verdict, via } = await resolveAsk(
@@ -104,7 +125,13 @@ async function handleUnknownToolIntent(
       fullCommand,
       startedAt,
       undefined,
-      { askOrigin: 'unknown-tool', cwd: ctx.cwd }
+      {
+        askOrigin: 'unknown-tool',
+        cwd: ctx.cwd,
+        requestId: ctx.requestId,
+        segments: ctx.segments,
+        externalScope: ctx.externalScope,
+      }
     )
     emit(deps.hooks, toolName, value, 'allow', 'unknown_tool_ask', {
       requestId,
@@ -204,6 +231,15 @@ function applyExternalScope(
     externalVerdict === undefined
       ? undefined
       : grantDirFor(externalVerdict.absPath)
+  ctx.externalScope = {
+    outsideCwd: externalVerdict !== undefined,
+    ...(externalVerdict
+      ? {
+          externalDir: externalGrantDir ?? externalVerdict.absPath,
+          action: externalVerdict.action,
+        }
+      : {}),
+  }
   let isExternalDirAsk = false
   if (externalVerdict !== undefined) {
     const rank = { allow: 0, ask: 1, deny: 2 } as const
@@ -242,6 +278,8 @@ function hardDeny(args: {
     'deny',
     resolution,
     {
+      requestId: ctx.requestId,
+      decidedBy: 'rule',
       ...buildDecisionDetail({
         toolName,
         matchedSurface: state.matchedSurface,
@@ -253,6 +291,7 @@ function hardDeny(args: {
         },
         startedAt,
         strategy,
+        ...ctxDetailFields(ctx),
       }),
     }
   )
@@ -331,6 +370,7 @@ async function handleDenyAskUser(
       },
       startedAt,
       strategy,
+      ...ctxDetailFields(ctx),
     })
   try {
     const { requestId, verdict, via } = await resolveAsk(
@@ -347,6 +387,9 @@ async function handleDenyAskUser(
         askOrigin: 'deny-override',
         sessionPatterns,
         cwd: ctx.cwd,
+        requestId: ctx.requestId,
+        segments: ctx.segments,
+        externalScope: ctx.externalScope,
       }
     )
     emit(deps.hooks, matchedSurface, matchedValue, 'allow', 'permission_ask', {
@@ -377,11 +420,19 @@ function emitAllowDecision(ctx: GateCtx, state: CascadeState): void {
     'allow',
     'allow',
     {
+      requestId: ctx.requestId,
+      decidedBy: 'rule',
       ...buildDecisionDetail({
         toolName: ctx.toolName,
         matchedSurface: state.matchedSurface,
         matchedValue: state.matchedValue,
+        rule: {
+          surface: state.ruleSurface,
+          pattern: state.rulePattern,
+          reason: state.ruleReason,
+        },
         startedAt: ctx.startedAt,
+        ...ctxDetailFields(ctx),
       }),
     }
   )
@@ -397,7 +448,8 @@ async function handleAskPath(
     ctx.intents,
     ctx.toolName,
     ctx.input,
-    ctx.deps
+    ctx.deps,
+    { cwd: ctx.cwd, requestId: ctx.requestId }
   )
   if (agg.action === 'deny') {
     const proceeded = await handleClassifierBlock(ctx.deps, ctx.cfg, {
@@ -412,6 +464,10 @@ async function handleAskPath(
         reason: state.ruleReason,
       },
       cwd: ctx.cwd,
+      requestId: ctx.requestId,
+      fullCommand: ctx.fullCommand,
+      segments: ctx.segments,
+      externalScope: ctx.externalScope,
     })
     if (proceeded) return
     throw new Error(
@@ -531,7 +587,8 @@ function findUnapprovedShellSegments(
         agg.risk,
         toolName,
         startedAt,
-        reqId
+        reqId,
+        ctxDetailFields(ctx)
       )
     if (!approved) {
       unapproved.push({ intent, extVerdict })
@@ -570,7 +627,8 @@ async function promptAskMultiSegmentShell(
         agg.risk,
         toolName,
         startedAt,
-        reqId
+        reqId,
+        ctxDetailFields(ctx)
       )
     ) {
       continue
@@ -589,6 +647,7 @@ async function promptAskMultiSegmentShell(
       rule: matchedRule,
       risk: agg.risk,
       startedAt,
+      ...ctxDetailFields(ctx),
     }
     const segExternalDirAsk =
       current.extVerdict && current.extVerdict.action === 'ask'
@@ -622,6 +681,9 @@ async function promptAskMultiSegmentShell(
           segmentTotal: totalAsks,
           askOrigin: segAskOrigin,
           cwd: ctx.cwd,
+          requestId: reqId,
+          segments: ctx.segments,
+          externalScope: ctx.externalScope,
         }
       )
       emit(deps.hooks, seg.surface, seg.value, 'allow', resolution, {
@@ -667,6 +729,7 @@ async function promptAskAfterClassifier(
     rule: matchedRuleForAsk,
     risk: agg.risk,
     startedAt,
+    ...ctxDetailFields(ctx),
   }
   const externalDirAsk = toExternalDirAsk(external)
   const isShell =
@@ -697,6 +760,9 @@ async function promptAskAfterClassifier(
         sessionPatterns,
         askOrigin,
         cwd: ctx.cwd,
+        requestId: ctx.requestId,
+        segments: ctx.segments,
+        externalScope: ctx.externalScope,
       }
     )
     emit(deps.hooks, askSurface, askValue, 'allow', resolution, {
@@ -720,6 +786,9 @@ export async function gateToolCall(
   input: Record<string, unknown>,
   deps: GateDeps
 ): Promise<void> {
+  const requestId =
+    globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)
+
   const rawCwd =
     typeof input.cwd === 'string' && input.cwd.trim().length > 0
       ? input.cwd.trim()
@@ -730,9 +799,17 @@ export async function gateToolCall(
           ? input.workingDirectory.trim()
           : undefined
 
+  const effectiveCwd = rawCwd ?? process.cwd()
   const startedAt = Date.now()
   const cfg = deps.configState.get()
   const intents = normalizeToolCall(toolName, input)
+  const fullCommand =
+    typeof input.command === 'string' && input.command.length > 0
+      ? input.command
+      : undefined
+  const shellSegments = intents.some((i) => i.surface === 'shell')
+    ? intents.filter((i) => i.surface === 'shell').map((i) => i.value)
+    : undefined
 
   if (
     (
@@ -743,11 +820,16 @@ export async function gateToolCall(
     if (toolVis !== 'deny') {
       const first = intents[0] ?? { surface: toolName, value: '*' }
       emit(deps.hooks, first.surface, first.value, 'allow', 'yolo_bypass', {
+        requestId,
+        decidedBy: 'yolo',
         ...buildDecisionDetail({
           toolName,
           matchedSurface: first.surface,
           matchedValue: first.value,
           startedAt,
+          cwd: effectiveCwd,
+          fullCommand,
+          segments: shellSegments,
         }),
       })
       return
@@ -761,11 +843,10 @@ export async function gateToolCall(
     startedAt,
     cfg,
     intents,
-    fullCommand:
-      typeof input.command === 'string' && input.command.length > 0
-        ? input.command
-        : undefined,
-    cwd: rawCwd,
+    fullCommand,
+    cwd: effectiveCwd,
+    requestId,
+    segments: shellSegments,
   }
 
   // Unknown tools (surface === 'denied') are visible and ask the user

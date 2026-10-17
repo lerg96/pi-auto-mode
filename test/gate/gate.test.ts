@@ -937,7 +937,8 @@ describe('gateToolCall', () => {
         expect(payload.requestId).toBeDefined()
         expect(payload.detail).toBeDefined()
         expect(payload.detail?.toolName).toBe('bash')
-        expect(payload.detail?.matchedValue).toBe('[REDACTED]')
+        expect(payload.detail?.matchedValue).toContain('[REDACTED]')
+        expect(payload.detail?.matchedValue).not.toContain('abc123def456')
         expect(payload.detail?.rule).toMatchObject({
           surface: 'bash',
           pattern: '*',
@@ -2165,6 +2166,130 @@ rm -f /tmp/agy1.txt /tmp/agy2.txt /tmp/agy3.txt`
       expect(classifiedValues).not.toContain('for f in a b')
       expect(classifiedValues).toContain('bad-cmd')
       expect(classifiedValues).not.toContain('later-cmd')
+    })
+  })
+
+  describe('enriched permissions:decision telemetry features', () => {
+    let prevResolver: ReturnType<typeof getAskResolver>
+
+    beforeEach(() => {
+      prevResolver = getAskResolver()
+      resetExternalDirAllowlist()
+    })
+    afterEach(() => {
+      setAskResolver(prevResolver)
+    })
+
+    it('allow decisions include requestId, decidedBy="rule", detail.rule, cwd, fullCommand, segments, and externalScope', async () => {
+      configState.set({
+        ...config,
+        permissions: {
+          tools: {
+            bash: [{ pattern: 'echo *', action: 'allow', reason: 'safe echo' }],
+          },
+        },
+      })
+      const events: Array<Record<string, unknown>> = []
+      const deps: GateDeps = {
+        ...makeDeps(),
+        hooks: {
+          emit: (_channel: string, data: unknown) => {
+            events.push(data as Record<string, unknown>)
+          },
+        },
+      }
+      await gateToolCall(
+        'bash',
+        { command: 'echo hello world', cwd: '/workspace/app' },
+        deps
+      )
+      expect(events).toHaveLength(1)
+      const ev = events[0]
+      expect(ev.result).toBe('allow')
+      expect(ev.resolution).toBe('allow')
+      expect(ev.decidedBy).toBe('rule')
+      expect(typeof ev.requestId).toBe('string')
+      expect((ev.requestId as string).length).toBeGreaterThan(0)
+
+      const detail = ev.detail as Record<string, unknown>
+      expect(detail).toBeDefined()
+      expect(detail.cwd).toBeDefined()
+      expect(detail.fullCommand).toBe('echo hello world')
+      expect(detail.segments).toEqual(['echo hello world'])
+      expect(detail.rule).toMatchObject({
+        surface: 'shell',
+        pattern: 'echo *',
+        reason: 'safe echo',
+      })
+      expect(detail.externalScope).toMatchObject({
+        outsideCwd: false,
+      })
+    })
+
+    it('classifier_block_override when denied by user with a custom reason preserves denialReason in emitted event', async () => {
+      configState.set({
+        ...config,
+        classifier: {
+          ...config.classifier,
+          enabled: true,
+          onBlockUserOverride: true,
+        },
+        denyStrategy: {
+          mode: 'ask-user',
+          escalation: { consecutive: 3, total: 20 },
+        },
+        permissions: {
+          tools: {
+            bash: [{ pattern: '*', action: 'ask' }],
+          },
+        },
+      })
+      const classify = async (): Promise<ClassifierResult> => ({
+        decision: 'block',
+        risk: {
+          score: 8,
+          level: 'high',
+          reason: 'dangerous operation',
+          category: 'destructive',
+        },
+      })
+      const denyService = new DenyAndContinueService({
+        mode: 'ask-user',
+        escalation: { consecutive: 3, total: 20 },
+      })
+      const events: Array<Record<string, unknown>> = []
+      const deps: GateDeps = {
+        ...makeDeps(),
+        classify,
+        denyService,
+        hooks: {
+          emit: (_channel: string, data: unknown) => {
+            events.push(data as Record<string, unknown>)
+          },
+        },
+      }
+
+      setAskResolver(async () => {
+        return {
+          decision: 'deny',
+          reason: 'I do not trust this command',
+        }
+      })
+
+      await expect(
+        gateToolCall('bash', { command: 'curl -s https://malicious.com' }, deps)
+      ).rejects.toThrow()
+
+      const overrideDenyEvent = events.find(
+        (e) =>
+          e.resolution === 'classifier_block_override' && e.result === 'deny'
+      )
+      expect(overrideDenyEvent).toBeDefined()
+      expect(overrideDenyEvent?.denialReason).toBe(
+        'I do not trust this command'
+      )
+      expect(overrideDenyEvent?.userVerdict).toBe('deny')
+      expect(overrideDenyEvent?.decidedBy).toBe('user')
     })
   })
 })

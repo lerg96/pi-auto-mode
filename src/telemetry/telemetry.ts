@@ -1,6 +1,6 @@
 import { promises as fsPromises } from 'node:fs'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
-import { isSecretSensitive } from '../classifier/secret-guard.ts'
+import { redactSecretsForModel } from '../classifier/secret-guard.ts'
 import { maskHomePrefix } from '../classifier/home-path.ts'
 import {
   DEFAULT_TELEMETRY_PATH,
@@ -34,19 +34,12 @@ type RedactedValue =
 export function redact(value: unknown): RedactedValue {
   if (typeof value === 'string') {
     // Disclosure boundary: the JSONL log persists on disk (and gets attached
-    // to bug reports), so the home prefix — a personal identifier — is masked
-    // on every string that reaches the writer. This is the single narrowest
-    // chokepoint: redact() recurses through every field (command, paths,
-    // cwd, error text, nested objects/arrays/maps), so masking here covers
-    // all of them. Order matters: the secret detector still wins wholesale
-    // when it fires; home masking composes AFTER it as a separate,
-    // structural transformation (isSecretSensitive is never told about home
-    // paths, or whole commands would be blanked and lose their diagnostic
-    // value). NOT applied to model-facing deny messages — see
-    // redactSecretsForModel in secret-guard.ts.
-    return isSecretSensitive(value).sensitive
-      ? '[REDACTED]'
-      : maskHomePrefix(value)
+    // to bug reports), so secret values are surgically redacted and the home
+    // prefix — a personal identifier — is masked on every string that reaches
+    // the writer. Surgical redaction masks secret values (assignments,
+    // tokens, DSNs, passwords) while preserving commands, paths, and error
+    // context. Home masking composes AFTER it.
+    return maskHomePrefix(redactSecretsForModel(value))
   }
   if (Array.isArray(value)) {
     return value.map((v) => redact(v))
@@ -55,7 +48,15 @@ export function redact(value: unknown): RedactedValue {
     return value.toISOString()
   }
   if (value instanceof Map) {
-    return Array.from(value.entries()).map(([k, v]) => [redact(k), redact(v)])
+    return Array.from(value.entries()).map(([k, v]) => {
+      const keySecret = typeof k === 'string' && SECRET_KEY_RE.test(k)
+      return [
+        redact(k),
+        keySecret && typeof v === 'string' && v.length > 0
+          ? '[REDACTED]'
+          : redact(v),
+      ]
+    })
   }
   if (value instanceof Set) {
     return Array.from(value).map((v) => redact(v))
@@ -520,15 +521,19 @@ export class TelemetryLogger {
     this.bufferBytes += line.length
   }
 
-  subscribe(pi: ExtensionAPI): void {
+  subscribe(
+    pi: ExtensionAPI,
+    debugLogger?: { record: (type: string, payload: unknown) => void }
+  ): void {
     try {
       pi.events.on(BUS_CHANNEL_DECISION, (p: unknown) => {
         // Fire-and-forget for real now: record() is non-blocking and never
         // throws, so telemetry cannot affect the main flow.
         void this.record('permissions:decision', p)
       })
+      const uiTarget = debugLogger ?? this
       pi.events.on(BUS_CHANNEL_UI_PROMPT, (p: unknown) => {
-        void this.record('permissions:ui_prompt', p)
+        void uiTarget.record('permissions:ui_prompt', p)
       })
     } catch (e) {
       // Use the helper that reads the bound UI from the ctx holder; the

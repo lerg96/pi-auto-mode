@@ -9,9 +9,19 @@ import { externalDirSurfaceFor } from '../permission/external-directory.ts'
 import { addExternalDirAllow } from '../state/external-dir-allowlist.ts'
 import { getAskResolver, normalizeAskDecision, type AskOrigin } from './ask.ts'
 import { emit, type AskAudit } from './ask-audit.ts'
-import { buildDecisionDetail } from './decision-detail.ts'
+import {
+  buildDecisionDetail,
+  type DecisionExternalScope,
+} from './decision-detail.ts'
 import type { GateDeps } from './gate.ts'
 import { persistPermanentAllow } from '../config/permanent-allow.ts'
+
+export interface DecisionContextExtra {
+  cwd?: string
+  fullCommand?: string
+  segments?: string[]
+  externalScope?: DecisionExternalScope
+}
 
 export class AskDeniedError extends Error {
   readonly audit: AskAudit
@@ -109,7 +119,8 @@ export function trySessionAllow(
   risk: ClassifierResult['risk'] | undefined,
   toolName: string | undefined,
   startedAt: number | undefined,
-  requestId: string
+  requestId: string,
+  detailCtx?: DecisionContextExtra
 ): boolean {
   const isShell =
     surface === 'shell' || surface === 'bash' || surface === 'powershell'
@@ -168,6 +179,7 @@ export function trySessionAllow(
       rule: { surface, pattern: sessionApproved.pattern },
       risk,
       startedAt: startedAt ?? Date.now(),
+      ...(detailCtx ?? {}),
     }),
   })
   deps.denyService?.onContinueSucceeded()
@@ -247,6 +259,9 @@ export interface ResolveAskExtra {
   segmentTotal?: number
   askOrigin?: AskOrigin
   cwd?: string
+  requestId?: string
+  segments?: string[]
+  externalScope?: DecisionExternalScope
 }
 
 export async function resolveAsk(
@@ -262,10 +277,26 @@ export async function resolveAsk(
   extra?: ResolveAskExtra
 ): Promise<{ requestId: string; verdict: AskVerdict; via: AskAudit['via'] }> {
   const requestId =
-    globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)
+    extra?.requestId ??
+    globalThis.crypto?.randomUUID?.() ??
+    Math.random().toString(36).slice(2)
 
   if (
-    trySessionAllow(deps, surface, value, risk, toolName, startedAt, requestId)
+    trySessionAllow(
+      deps,
+      surface,
+      value,
+      risk,
+      toolName,
+      startedAt,
+      requestId,
+      {
+        cwd: extra?.cwd,
+        fullCommand,
+        segments: extra?.segments,
+        externalScope: extra?.externalScope,
+      }
+    )
   ) {
     return { requestId, verdict: 'session', via: 'session-rules' }
   }

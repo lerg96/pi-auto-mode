@@ -2,7 +2,11 @@ import type { ClassifierResult } from '../classifier/llm-layer.ts'
 import type { Config } from '../types/config.ts'
 import type { DenialAction } from '../deny/deny-service.ts'
 import { emit, askActor, type AskAudit } from './ask-audit.ts'
-import { buildDecisionDetail, type DecisionDetail } from './decision-detail.ts'
+import {
+  buildDecisionDetail,
+  type DecisionDetail,
+  type DecisionExternalScope,
+} from './decision-detail.ts'
 import { formatDenyMessage } from './deny-message.ts'
 import { applyDenyStrategy } from './deny-strategy.ts'
 import {
@@ -21,6 +25,10 @@ export interface ClassifierBlockCtx {
   startedAt: number
   rule?: { surface: string; pattern: string; reason?: string }
   cwd?: string
+  requestId?: string
+  fullCommand?: string
+  segments?: string[]
+  externalScope?: DecisionExternalScope
 }
 
 function blockMessage(ctx: ClassifierBlockCtx): string {
@@ -48,6 +56,10 @@ function detailFor(
     risk: ctx.risk,
     startedAt: ctx.startedAt,
     strategy,
+    cwd: ctx.cwd,
+    fullCommand: ctx.fullCommand,
+    segments: ctx.segments,
+    externalScope: ctx.externalScope,
   })
 }
 
@@ -58,6 +70,8 @@ function throwBlockDeny(
   strategy: string = 'deny'
 ): never {
   emit(deps.hooks, ctx.surface, ctx.value, 'deny', 'classifier_block', {
+    ...(ctx.requestId ? { requestId: ctx.requestId } : {}),
+    decidedBy: 'classifier',
     ...detailFor(ctx, strategy),
   })
   throw new Error(blockMessage(ctx))
@@ -105,6 +119,12 @@ function overrideDenied(
       decidedBy: err.audit.decidedBy,
       via: err.audit.via,
       userVerdict: 'deny',
+      ...(err.audit.denialReason
+        ? { denialReason: err.audit.denialReason }
+        : {}),
+      ...(err.audit.matchedPattern
+        ? { matchedPattern: err.audit.matchedPattern }
+        : {}),
       ...detailFor(ctx, 'ask-user'),
     }
   )
@@ -126,10 +146,16 @@ async function classifierOverrideAsk(
       deps,
       undefined,
       ctx.toolName,
-      undefined,
+      ctx.fullCommand,
       ctx.startedAt,
       undefined,
-      { askOrigin: 'classifier-override', cwd: ctx.cwd }
+      {
+        askOrigin: 'classifier-override',
+        cwd: ctx.cwd,
+        requestId: ctx.requestId,
+        segments: ctx.segments,
+        externalScope: ctx.externalScope,
+      }
     ))
   } catch (err) {
     if (err instanceof AskDeniedError) overrideDenied(deps, ctx, err)

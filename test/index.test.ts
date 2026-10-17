@@ -504,6 +504,31 @@ describe('piAutoMode integration: gate→decision flow', () => {
     ).rejects.toThrow()
   })
 
+  it('records tool_call_blocked with toolName and input context when blocked', async () => {
+    const recordSpy = jest.spyOn(TelemetryLogger.prototype, 'record')
+    await expect(
+      handlers.tool_call!(
+        {
+          type: 'tool_call',
+          toolName: 'bash',
+          toolCallId: 'test-blocked-context',
+          input: { command: 'rm -rf /tmp/foo' },
+        } as unknown as PiEventData,
+        {} as ExtensionContext
+      )
+    ).rejects.toThrow()
+
+    const blockedCalls = recordSpy.mock.calls.filter(
+      (c) => c[0] === 'tool_call_blocked'
+    )
+    expect(blockedCalls.length).toBeGreaterThan(0)
+    const payload = blockedCalls[0][1] as Record<string, unknown>
+    expect(payload.toolName).toBe('bash')
+    expect(payload.input).toEqual({ command: 'rm -rf /tmp/foo' })
+    expect(typeof payload.error).toBe('string')
+    recordSpy.mockRestore()
+  })
+
   it('allows a tool call whose command matches no deny rule (gate→allow)', async () => {
     await expect(
       handlers.tool_call!(

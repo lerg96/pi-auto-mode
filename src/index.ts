@@ -316,7 +316,6 @@ export default function piAutoMode(pi: ExtensionAPI): void {
       maxFiles: initialConfig.telemetry.maxFiles,
     }
   )
-  telemetry.subscribe(pi)
   // Debug jsonl (opt-in, separado de telemetry): diagnósticos LLM con
   // body upstream. Sin subscribe al bus — solo escribe vía record().
   const debugLog = new TelemetryLogger(
@@ -328,6 +327,7 @@ export default function piAutoMode(pi: ExtensionAPI): void {
       maxFiles: initialConfig.debug.maxFiles,
     }
   )
+  telemetry.subscribe(pi, debugLog)
 
   const denyService = new DenyAndContinueService(initialConfig.denyStrategy)
 
@@ -389,6 +389,7 @@ export default function piAutoMode(pi: ExtensionAPI): void {
   // read `getUiContext()` and render the dialog. Without this bind the modal
   // returned 'deny' instantly because `pi.ui` was undefined (the invisible-
   // modal bug).
+  let lastToolCall: { toolName?: string; input?: Record<string, unknown> } = {}
   pi.on(
     'tool_call',
     createFailClosedToolCall(
@@ -419,11 +420,12 @@ export default function piAutoMode(pi: ExtensionAPI): void {
             // `'ask-user'`, fail-closed). NEVER logged. The apiKey never
             // appears in telemetry, deny messages, or thrown errors — only
             // in the `Authorization` header on the outbound HTTPS request.
-            { telemetry, debug: debugLog, models: ctx.modelRegistry }
+            { telemetry: debugLog, debug: debugLog, models: ctx.modelRegistry }
           )
         const raw = event as Record<string, unknown>
         const toolName = String(raw.toolName ?? 'unknown')
         const input = (raw.input ?? {}) as Record<string, unknown>
+        lastToolCall = { toolName, input }
         await gateToolCall(toolName, input, {
           configState,
           sessionRules,
@@ -434,7 +436,11 @@ export default function piAutoMode(pi: ExtensionAPI): void {
       },
       (err) => {
         const message = err instanceof Error ? err.message : String(err)
-        telemetry.record('tool_call_blocked', { error: message })
+        debugLog.record('tool_call_blocked', {
+          ...(lastToolCall.toolName ? { toolName: lastToolCall.toolName } : {}),
+          ...(lastToolCall.input ? { input: lastToolCall.input } : {}),
+          error: message,
+        })
         notifyUi(`Blocked tool call: ${message}`, 'error')
       }
     )

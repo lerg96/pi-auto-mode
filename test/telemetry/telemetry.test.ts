@@ -255,6 +255,33 @@ describe('TelemetryLogger', () => {
     if (existsSync(p)) unlinkSync(p)
   })
 
+  it('subscribe routes BUS_CHANNEL_DECISION to telemetry and BUS_CHANNEL_UI_PROMPT to debugLogger', async () => {
+    const { pi, handlers } = makePi()
+    const p = tempPath()
+    const telemetry = new TelemetryLogger(true, p)
+    const debugRecord = jest.fn()
+    const debugLogger = { record: debugRecord }
+
+    telemetry.subscribe(pi, debugLogger)
+
+    handlers[BUS_CHANNEL_DECISION]({ action: 'allow' })
+    handlers[BUS_CHANNEL_UI_PROMPT]({ modal: 'shown' })
+
+    await telemetry.flush()
+
+    expect(existsSync(p)).toBe(true)
+    const ev = JSON.parse(readFileSync(p, 'utf8').trim())
+    expect(ev.type).toBe('permissions:decision')
+    expect(ev.payload).toEqual({ action: 'allow' })
+
+    expect(debugRecord).toHaveBeenCalledTimes(1)
+    expect(debugRecord).toHaveBeenCalledWith('permissions:ui_prompt', {
+      modal: 'shown',
+    })
+
+    if (existsSync(p)) unlinkSync(p)
+  })
+
   it('update changes enabled/path state so a later record writes', async () => {
     const p = tempPath()
     const logger = new TelemetryLogger(false, '')
@@ -318,6 +345,12 @@ describe('TelemetryLogger', () => {
     if (existsSync(p)) unlinkSync(p)
   })
 
+  it('preserves error messages mentioning apiKey without wiping them, but masks assignments', () => {
+    const errorMsg = 'LLM credential resolution failed (apiKey): missing'
+    expect(redact(errorMsg)).toBe(errorMsg)
+    expect(redact('apiKey=sk-12345')).toBe('apiKey=[REDACTED]')
+  })
+
   // Finding MEDIUM: redact must preserve Map/Set/Date instead of serializing
   // them as empty objects. Recursive redaction still applies to their values.
   describe('redact preserves Map/Set/Date', () => {
@@ -338,7 +371,7 @@ describe('TelemetryLogger', () => {
       const s = new Set<unknown>(['ok', 'password=abc'])
       const out = redact(s) as unknown[]
       expect(Array.isArray(out)).toBe(true)
-      expect(out).toEqual(['ok', '[REDACTED]'])
+      expect(out).toEqual(['ok', 'password=[REDACTED]'])
     })
 
     it('redacts a Date into its ISO string', () => {
@@ -355,7 +388,7 @@ describe('TelemetryLogger', () => {
       const out = redact(m) as [unknown, unknown][]
       expect(out).toEqual([
         ['nested', { token: '[REDACTED]' }],
-        ['list', ['[REDACTED]', 'ok']],
+        ['list', ['password=[REDACTED]', 'ok']],
       ])
     })
 
@@ -1005,20 +1038,23 @@ describe('telemetry home-path masking', () => {
     if (existsSync(p)) unlinkSync(p)
   })
 
-  it('composes AFTER whole-value secret redaction (secret still wins)', async () => {
-    // A value flagged by isSecretSensitive is replaced wholesale with
-    // [REDACTED]; home masking must not reorder or weaken that.
+  it('masks home prefix and surgically redacts secret values without wiping entire commands', async () => {
     const mod = isolatedLoggerModule('/home/mockuser')
     const p = tempPath()
     const logger = new mod.TelemetryLogger(true, p)
     logger.record('permissions:decision', {
       command: 'cat /home/mockuser/.ssh/id_rsa',
+      curl: 'curl -H "Authorization: Bearer secret123" /home/mockuser/a',
     })
     await logger.flush()
     const raw = readFileSync(p, 'utf8')
     expect(raw).not.toContain('mockuser')
+    expect(raw).not.toContain('secret123')
     const ev = JSON.parse(raw.trim()) as { payload: Record<string, unknown> }
-    expect(ev.payload.command).toBe('[REDACTED]')
+    expect(ev.payload.command).toBe('cat /home/[REDACTED]/.ssh/id_rsa')
+    expect(ev.payload.curl).toBe(
+      'curl -H "Authorization: Bearer [REDACTED]" /home/[REDACTED]/a'
+    )
     if (existsSync(p)) unlinkSync(p)
   })
 })

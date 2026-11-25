@@ -1,10 +1,10 @@
-interface TokenSpan {
+export interface TokenSpan {
   token: string
   start: number
   end: number
 }
 
-function tokenizeCommandWithSpans(segment: string): TokenSpan[] {
+export function tokenizeCommandWithSpans(segment: string): TokenSpan[] {
   const tokens: TokenSpan[] = []
   let buf = ''
   let tokenStart = -1
@@ -86,7 +86,7 @@ function filterRedirections(tokens: string[]): string[] {
   return filtered
 }
 
-const ENV_ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/
+export const ENV_ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/
 
 export function stripEnvPrefix(command: string): string {
   const trimmed = command.trim()
@@ -151,6 +151,22 @@ export function extractArgv(segment: string): string[] {
 }
 
 const WORD_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._:@+-]*$/
+const SCRIPT_TOKEN_EXT_RE = /\.(?:sh|bash|zsh|ps1|py|js|mjs|cjs|ts|tsx)$/i
+const DANGEROUS_SHELL_META_RE = /[*?[\]$`();&|<>]/
+
+function isScriptPathToken(token: string): boolean {
+  let unquoted = token.trim()
+  if (
+    (unquoted.startsWith('"') && unquoted.endsWith('"')) ||
+    (unquoted.startsWith("'") && unquoted.endsWith("'"))
+  ) {
+    unquoted = unquoted.slice(1, -1).trim()
+  }
+  if (!unquoted || DANGEROUS_SHELL_META_RE.test(unquoted)) {
+    return false
+  }
+  return SCRIPT_TOKEN_EXT_RE.test(unquoted)
+}
 
 function isPrivileged(cmd: string): boolean {
   const base = cmd
@@ -176,7 +192,7 @@ export function buildSessionPatterns(segment: string): string[] {
 
   let prefixLen = 1
   for (let i = 1; i < argv.length; i++) {
-    if (WORD_TOKEN_RE.test(argv[i])) {
+    if (WORD_TOKEN_RE.test(argv[i]) || isScriptPathToken(argv[i])) {
       prefixLen++
     } else {
       break

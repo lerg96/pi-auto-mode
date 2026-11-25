@@ -52,6 +52,7 @@ export {
   isDataSinkCommand,
 } from '../permission/command-prefix.ts'
 import { extractArgv } from '../permission/command-prefix.ts'
+import { splitWrapperSegments } from './wrapper-split.ts'
 
 interface PendingHeredoc {
   target: number
@@ -686,14 +687,18 @@ export function segmentCommand(
           readBacktickSub(value, 1)[1] === value.length))
 
     if (!isSingleSub && value.length > 0 && !isBareShellKeyword(value)) {
-      segments.push({ value, quoted })
+      const wrappedParts = splitWrapperSegments(value)
+      for (const part of wrappedParts) {
+        segments.push({ value: part, quoted })
+      }
       const segIndex = segments.length - 1
       for (const h of pendingHeredocs) {
         if (h.target === -1) {
           h.target = segIndex
         }
       }
-      const findExecSegs = extractFindExecSegments(value, opts)
+      const finalPart = wrappedParts[wrappedParts.length - 1]
+      const findExecSegs = extractFindExecSegments(finalPart, opts)
       for (const fes of findExecSegs) {
         segments.push(fes)
       }
@@ -1137,6 +1142,9 @@ export function normalizeToolCall(
   }
   if (FILE_TOOLS.has(toolName) && input.path != null) {
     return [{ surface, value: String(input.path) }]
+  }
+  if (typeof input.path === 'string' && input.path.length > 0) {
+    return [{ surface, value: input.path }]
   }
   return [{ surface, value: '*' }]
 }

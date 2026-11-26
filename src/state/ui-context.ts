@@ -1,5 +1,5 @@
 import type { ExtensionUI } from '../pi-sdk.ts'
-import { publishUi } from './ui-registry.ts'
+import { publishUi, type EventEmitFn } from './ui-registry.ts'
 
 /**
  * Snapshot of the UI surface exposed on `ctx.ui` at the time the most recent
@@ -25,7 +25,8 @@ let current: UiContext | null = null
  */
 export function setUiContext(
   ui: ExtensionUI | undefined,
-  hasUI: boolean
+  hasUI: boolean,
+  emit?: EventEmitFn
 ): void {
   if (!ui || !hasUI) {
     // A session without UI (print mode, or a child session whose harness never
@@ -35,7 +36,7 @@ export function setUiContext(
     return
   }
   current = { ui, hasUI }
-  publishUi(ui)
+  publishUi(ui, emit)
 }
 
 /**

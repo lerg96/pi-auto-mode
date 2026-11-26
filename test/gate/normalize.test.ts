@@ -216,6 +216,15 @@ describe('normalizeToolCall surface mapping', () => {
     const intents = normalizeToolCall('unknown_thing', { x: 1 })
     expect(intents).toEqual([{ surface: 'unknown_thing', value: '*' }])
   })
+
+  it('preserves input.path as intent value for custom tools', () => {
+    const intents = normalizeToolCall('custom_reader', {
+      path: '/tmp/data.json',
+    })
+    expect(intents).toEqual([
+      { surface: 'custom_reader', value: '/tmp/data.json' },
+    ])
+  })
 })
 
 describe('redirections and compound command splitting', () => {
@@ -758,5 +767,93 @@ describe('find -exec / -execdir / -ok / -okdir (Item 7)', () => {
       'find . -name "*.log" -exec rm -f "bad file" {} \\;',
       'rm -f "bad file" {}',
     ])
+  })
+})
+
+describe('bash function headers, var assignments, and C-style for loops', () => {
+  it('strips bash function headers so inner commands are evaluated directly', () => {
+    expect(stripLeadingShellKeywords('run() { echo == $1')).toBe('echo == $1')
+    expect(stripLeadingShellKeywords('function run() { echo hi')).toBe(
+      'echo hi'
+    )
+    expect(stripLeadingShellKeywords('function run { curl https://x')).toBe(
+      'curl https://x'
+    )
+    expect(isBareShellKeyword('run() {')).toBe(true)
+    expect(isBareShellKeyword('function run {')).toBe(true)
+
+    const segs = splitShellSegments('run() { echo "== $1 =="; curl $2; }')
+    expect(segs).toEqual(['echo == $1 ==', 'curl $2'])
+  })
+
+  it('treats pure safe variable assignments as shell structure while keeping inner subshells', () => {
+    expect(
+      isShellStructureSegment(
+        'H=https://qvb56g3s6j.execute-api.us-east-1.amazonaws.com'
+      )
+    ).toBe(true)
+    expect(
+      isShellStructureSegment('B=\'{"date":"2026-11-25","msg":"a b"}\'')
+    ).toBe(true)
+    expect(isShellStructureSegment('FIN=$(date -Is)')).toBe(true)
+    expect(
+      isShellStructureSegment('START=$(( $(date +%s) * 1000 - 3600*1000 ))')
+    ).toBe(true)
+
+    const segs = splitShellSegments('L=$(grep -n foo bar | head -1)')
+    expect(segs).toContain('grep -n foo bar')
+    expect(segs).toContain('head -1')
+  })
+
+  it('keeps sensitive env vars, prefixed commands, and redirections out of structure skip', () => {
+    expect(isShellStructureSegment('PATH=/tmp:$PATH')).toBe(false)
+    expect(isShellStructureSegment('LD_PRELOAD=/tmp/evil.so')).toBe(false)
+    expect(isShellStructureSegment('NODE_OPTIONS=--require=/tmp/x.js')).toBe(
+      false
+    )
+    expect(
+      isShellStructureSegment('AWS_PROFILE=ledger-test aws s3api get-object')
+    ).toBe(false)
+    expect(isShellStructureSegment('H=foo > /tmp/out')).toBe(false)
+  })
+
+  it('recognizes C-style for loops as shell structure', () => {
+    expect(isShellStructureSegment('for (( i=0; i<3; i++ ))')).toBe(true)
+  })
+
+  it('recognizes pure shell test expressions ([ ], [[ ]], test) without redirections', () => {
+    expect(isShellStructureSegment('[ -n "${!v}" ]')).toBe(true)
+    expect(isShellStructureSegment('[[ $a < $b ]]')).toBe(true)
+    expect(isShellStructureSegment('test -f foo.txt')).toBe(true)
+    expect(isShellStructureSegment('[ 1 = 1 ] > /tmp/out')).toBe(false)
+    expect(isShellStructureSegment('test -f foo > /tmp/out')).toBe(false)
+
+    const cmd =
+      'source ~/.pi/agent/alegra-validacion-tokens.env 2>/dev/null && for v in TOKEN_A TOKEN_B; do if [ -n "${!v}" ]; then echo "$v: set"; else echo "$v: MISSING"; fi; done'
+    const intents = normalizeToolCall('bash', { command: cmd })
+    const nonStructure = intents
+      .filter((i) => !isShellStructureSegment(i.rawValue ?? i.value))
+      .map((i) => i.value)
+    expect(nonStructure).toEqual([
+      'source ~/.pi/agent/alegra-validacion-tokens.env 2>/dev/null',
+      'echo $v: set',
+      'echo $v: MISSING',
+    ])
+  })
+
+  it('strips case headers and arm patterns so the inner command is evaluated directly', () => {
+    expect(
+      stripLeadingShellKeywords(
+        'case $url in https*) curl -s -o layer-$n-$v.zip $url'
+      )
+    ).toBe('curl -s -o layer-$n-$v.zip $url')
+    expect(stripLeadingShellKeywords('*) echo skip')).toBe('echo skip')
+    expect(isBareShellKeyword('case $url in')).toBe(true)
+    expect(isBareShellKeyword('https*)')).toBe(true)
+
+    const segs = splitShellSegments(
+      'case "$url" in https*) curl -s -o out.zip "$url" ;; *) echo skip ;; esac'
+    )
+    expect(segs).toEqual(['curl -s -o out.zip $url', 'echo skip'])
   })
 })

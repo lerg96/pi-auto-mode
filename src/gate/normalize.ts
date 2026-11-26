@@ -51,7 +51,7 @@ export {
   DATA_SINK_COMMANDS,
   isDataSinkCommand,
 } from '../permission/command-prefix.ts'
-import { extractArgv } from '../permission/command-prefix.ts'
+import { ENV_ASSIGN_RE, extractArgv } from '../permission/command-prefix.ts'
 import { splitWrapperSegments } from './wrapper-split.ts'
 
 interface PendingHeredoc {
@@ -373,13 +373,130 @@ function hasOnlyNullRedirectionsOrTimeout(rest: string): boolean {
   return true
 }
 
+const BARE_FN_HEADER_RE =
+  /^(?:function\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:\(\s*\))?|[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\))\s*\{$/
+
+const LEADING_FN_HEADER_RE =
+  /^(?:function\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:\(\s*\))?|[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\))\s*\{\s*/
+
+const BARE_CASE_HEADER_RE = /^case\s+\S+\s+in$/
+const LEADING_CASE_HEADER_RE = /^case\s+\S+\s+in\s+/
+const LEADING_CASE_ARM_RE = /^(?:[^\s()&|;]+(?:\s*\|\s*[^\s()&|;]+)*)\)\s+/
+const BARE_CASE_ARM_RE = /^(?:[^\s()&|;]+(?:\s*\|\s*[^\s()&|;]+)*)\)$/
+
+const SENSITIVE_ENV_VARS: ReadonlySet<string> = new Set([
+  'PATH',
+  'LD_PRELOAD',
+  'LD_LIBRARY_PATH',
+  'DYLD_INSERT_LIBRARIES',
+  'DYLD_LIBRARY_PATH',
+  'BASH_ENV',
+  'ENV',
+  'IFS',
+  'PROMPT_COMMAND',
+  'NODE_OPTIONS',
+  'PYTHONPATH',
+  'PYTHONSTARTUP',
+  'RUBYOPT',
+  'PERL5OPT',
+  'GIT_SSH_COMMAND',
+  'GIT_EDITOR',
+  'EDITOR',
+  'VISUAL',
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'ALL_PROXY',
+  'NO_PROXY',
+])
+
+function splitAssignmentTokens(s: string): string[] | null {
+  const tokens: string[] = []
+  let buf = ''
+  let quote: "'" | '"' | null = null
+  let parenDepth = 0
+  let inBacktick = false
+
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]
+    if (quote) {
+      if (quote === '"' && c === '\\' && i + 1 < s.length) {
+        buf += c + s[++i]
+        continue
+      }
+      if (c === quote) quote = null
+      buf += c
+      continue
+    }
+    if (c === '\\' && i + 1 < s.length) {
+      buf += c + s[++i]
+      continue
+    }
+    if (c === "'" || c === '"') {
+      quote = c
+      buf += c
+      continue
+    }
+    if (c === '`') {
+      inBacktick = !inBacktick
+      buf += c
+      continue
+    }
+    if (!inBacktick && c === '$' && s[i + 1] === '(') {
+      parenDepth++
+      buf += '$('
+      i++
+      continue
+    }
+    if (parenDepth > 0) {
+      if (c === '(') parenDepth++
+      else if (c === ')') parenDepth--
+      buf += c
+      continue
+    }
+    if (!inBacktick && (c === '>' || c === '<')) {
+      return null
+    }
+    if (!inBacktick && (c === ' ' || c === '\t' || c === '\n' || c === '\r')) {
+      if (buf.length > 0) {
+        tokens.push(buf)
+        buf = ''
+      }
+      continue
+    }
+    buf += c
+  }
+  if (quote !== null || parenDepth > 0 || inBacktick) return null
+  if (buf.length > 0) tokens.push(buf)
+  return tokens
+}
+
+function isPureSafeVarAssignment(s: string): boolean {
+  const tokens = splitAssignmentTokens(s)
+  if (!tokens || tokens.length === 0) return false
+  for (const token of tokens) {
+    if (!ENV_ASSIGN_RE.test(token)) return false
+    const eqIdx = token.indexOf('=')
+    const name = token.slice(0, eqIdx)
+    if (
+      SENSITIVE_ENV_VARS.has(name) ||
+      SENSITIVE_ENV_VARS.has(name.toUpperCase())
+    ) {
+      return false
+    }
+  }
+  return true
+}
+
 export function isBareShellKeyword(s: string): boolean {
   const trimmed = s.trim()
   if (
     trimmed === ')' ||
     trimmed === '}' ||
     trimmed === '(' ||
-    trimmed === '{'
+    trimmed === '{' ||
+    BARE_FN_HEADER_RE.test(trimmed) ||
+    BARE_CASE_HEADER_RE.test(trimmed) ||
+    BARE_CASE_ARM_RE.test(trimmed)
   ) {
     return true
   }
@@ -472,6 +589,15 @@ export function stripLeadingShellKeywords(s: string): string {
     if (kwPattern.test(cur)) {
       cur = cur.replace(kwPattern, '').trim()
     }
+    if (LEADING_FN_HEADER_RE.test(cur)) {
+      cur = cur.replace(LEADING_FN_HEADER_RE, '').trim()
+    }
+    if (LEADING_CASE_HEADER_RE.test(cur)) {
+      cur = cur.replace(LEADING_CASE_HEADER_RE, '').trim()
+    }
+    if (LEADING_CASE_ARM_RE.test(cur)) {
+      cur = cur.replace(LEADING_CASE_ARM_RE, '').trim()
+    }
     if (/^\{\s+/.test(cur)) {
       cur = cur.replace(/^\{\s+/, '').trim()
     }
@@ -508,11 +634,73 @@ export function stripLeadingShellKeywords(s: string): string {
   return cur
 }
 
+function hasUnquotedRedir(s: string): boolean {
+  let quote: "'" | '"' | null = null
+  let parenDepth = 0
+  let inBacktick = false
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]
+    if (quote) {
+      if (quote === '"' && c === '\\' && i + 1 < s.length) {
+        i++
+        continue
+      }
+      if (c === quote) quote = null
+      continue
+    }
+    if (c === '\\' && i + 1 < s.length) {
+      i++
+      continue
+    }
+    if (c === "'" || c === '"') {
+      quote = c
+      continue
+    }
+    if (c === '`') {
+      inBacktick = !inBacktick
+      continue
+    }
+    if (!inBacktick && c === '$' && s[i + 1] === '(') {
+      parenDepth++
+      i++
+      continue
+    }
+    if (parenDepth > 0) {
+      if (c === '(') parenDepth++
+      else if (c === ')') parenDepth--
+      continue
+    }
+    if (!inBacktick && (c === '>' || c === '<')) {
+      return true
+    }
+  }
+  return false
+}
+
+function isPureShellTest(s: string): boolean {
+  if (/^\[\[\s+[\s\S]*\s+\]\]$/.test(s)) {
+    return true
+  }
+  if (/^\[\s+[\s\S]*\s+\]$/.test(s) || /^test\s+[\s\S]+$/.test(s)) {
+    return !hasUnquotedRedir(s)
+  }
+  return false
+}
+
 export function isShellStructureSegment(s: string): boolean {
   const trimmed = s.trim()
   if (isBareShellKeyword(trimmed)) return true
   const argv = extractArgv(trimmed)
   if (argv.length === 1 && /^(?:do|done|then|else|fi|esac)$/.test(argv[0])) {
+    return true
+  }
+  if (isPureSafeVarAssignment(trimmed)) {
+    return true
+  }
+  if (isPureShellTest(trimmed)) {
+    return true
+  }
+  if (/^for\s*\(\([\s\S]*\)\)$/.test(trimmed)) {
     return true
   }
   return /^(?:for|select)\s+[A-Za-z_][A-Za-z0-9_]*(?:\s+in\b[\s\S]*)?$/.test(

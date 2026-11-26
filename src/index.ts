@@ -356,7 +356,7 @@ export default function piAutoMode(pi: ExtensionAPI): void {
     // Bind the UI surface early so any code that fires before the first
     // tool_call (config reload errors, slash commands, etc.) can notify
     // through the visible TUI channel.
-    setUiContext(ctx.ui, ctx.hasUI)
+    setUiContext(ctx.ui, ctx.hasUI, pi.events?.emit?.bind(pi.events))
     beginSession(sessionRules, denyService, handleSessionStart, event, ctx)
   })
 
@@ -372,7 +372,7 @@ export default function piAutoMode(pi: ExtensionAPI): void {
     pi,
   })
   pi.on('before_agent_start', async (event, ctx) => {
-    setUiContext(ctx.ui, ctx.hasUI)
+    setUiContext(ctx.ui, ctx.hasUI, pi.events?.emit?.bind(pi.events))
     const result = await beforeAgentStart(event, ctx)
     return result
   })
@@ -394,7 +394,7 @@ export default function piAutoMode(pi: ExtensionAPI): void {
     'tool_call',
     createFailClosedToolCall(
       async (event: PiEventData, ctx: ExtensionContext) => {
-        setUiContext(ctx.ui, ctx.hasUI)
+        setUiContext(ctx.ui, ctx.hasUI, pi.events?.emit?.bind(pi.events))
         const cfg = configState.get()
         const classify = (
           input: import('./classifier/llm-layer.ts').ClassifierInput
@@ -458,6 +458,6 @@ export default function piAutoMode(pi: ExtensionAPI): void {
     })
   )
 
-  registerSetCommands(pi, configState)
+  registerSetCommands(pi, configState, sessionRules)
   setAskResolver(createModalAskResolver(pi, sessionRules, configState))
 }

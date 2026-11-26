@@ -216,6 +216,7 @@ const uiConfig = z
     //     del proceso, si alguna vez publicó una (nunca en `pi -p`).
     //   'deny': denegar sin preguntar (comportamiento histórico).
     noUiAsks: z.enum(['bubble', 'deny']).default('bubble'),
+    herdrSelectModal: z.boolean().default(false),
     // Sonido al abrir el modal (opt-in). Ausente = silencioso.
     // `path` vacío → doble tono del sistema (sin archivos); con path → .wav.
     // `remindEveryMs` > 0 repite el aviso hasta decidir; 0 = un solo ding.
@@ -235,6 +236,7 @@ const uiConfig = z
     modalTimeoutMs: 120000,
     subagentModalTimeoutMs: 120000,
     noUiAsks: 'bubble',
+    herdrSelectModal: false,
   })
 
 // ─── Rotación de logs (compartida por telemetry y debug) ────────────────────

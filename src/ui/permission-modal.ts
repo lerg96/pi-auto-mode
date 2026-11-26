@@ -15,11 +15,15 @@ import {
 import type { CustomComponent, ExtensionUI } from '../pi-sdk.ts'
 import { emitUiPrompt } from './ui-prompt.ts'
 import { getUiContext } from '../state/ui-context.ts'
-import { borrowUi, withPromptLock } from '../state/ui-registry.ts'
+import { borrowEmit, borrowUi, withPromptLock } from '../state/ui-registry.ts'
 import { playNotificationSound, type SoundPlayer } from './sound.ts'
 import type { configState } from '../state/config-state.ts'
 import type { SessionRules } from '../permission/session-rules.ts'
 import type { ExtensionAPI } from '../pi-sdk.ts'
+import {
+  buildHerdrBlockedLabel,
+  runHerdrSelectPrompt,
+} from './herdr-select-modal.ts'
 // NOTE: addExternalDirAllow is NOT imported here — the gate (gate.ts) owns
 // persistence for external-directory approvals. The modal only returns the
 // decision id; side effects are applied by the gate after normalisation.
@@ -215,6 +219,42 @@ const HEADER_KEY_WIDTH = 12
 /** Wrap width per header line and max wrapped lines (H5 bound). */
 const HEADER_WRAP_WIDTH = 160
 const HEADER_MAX_LINES = 3
+const HEADER_MAX_CHARS = HEADER_WRAP_WIDTH * HEADER_MAX_LINES
+const INSPECT_PAGE_SIZE = 16
+
+function getInspectableCommand(req?: AskRequest): string {
+  const full = (req?.fullCommand ?? '').trim()
+  if (full.length > 0) return full
+  return (req?.value ?? '').trim()
+}
+
+function isCommandTruncatedOrMultiline(req?: AskRequest): boolean {
+  if (!req) return false
+  const candidates = [req.fullCommand, req.value]
+  for (const raw of candidates) {
+    if (!raw) continue
+    const trimmed = raw.trim()
+    if (trimmed.includes('\n')) return true
+    if (trimmed.replace(/[\n\r]/g, ' ').length > HEADER_MAX_CHARS) return true
+  }
+  return false
+}
+
+function wrapInspectLines(text: string, width: number): string[] {
+  const maxWidth = Math.max(20, width - 2)
+  const logicalLines = text.split(/\r?\n/)
+  const wrapped: string[] = []
+  for (const line of logicalLines) {
+    if (line.length === 0) {
+      wrapped.push('')
+      continue
+    }
+    for (let i = 0; i < line.length; i += maxWidth) {
+      wrapped.push(line.slice(i, i + maxWidth))
+    }
+  }
+  return wrapped
+}
 
 /**
  * Header rows for a possibly-long value: sanitize (strip newlines/trim)
@@ -236,6 +276,12 @@ function headerRows(
     i += HEADER_WRAP_WIDTH, n += 1
   ) {
     rows.push(`${pad}${clean.slice(i, i + HEADER_WRAP_WIDTH)}`)
+  }
+  if (clean.length > HEADER_MAX_CHARS) {
+    const remaining = clean.length - HEADER_MAX_CHARS
+    rows[rows.length - 1] += hint(
+      ` … (+${remaining} chars, press v to view full)`
+    )
   }
   return rows
 }
@@ -365,16 +411,17 @@ function buildFooter(
     req?.segmentIndex && req?.segmentTotal && req?.segmentTotal > 1
       ? `[${req.segmentIndex} of ${req.segmentTotal}] · `
       : ''
+  const viewHint = isCommandTruncatedOrMultiline(req) ? ' · v view full' : ''
   if (isPermanent) {
     return [
       slTheme.hint(
-        `${prefix}[PERMANENT MODE] ↑/↓ move · enter confirm (permanent) · tab session mode · esc deny`
+        `${prefix}[PERMANENT MODE] ↑/↓ move · enter confirm (permanent) · tab session mode${viewHint} · esc deny`
       ),
     ]
   }
   return [
     slTheme.hint(
-      `${prefix}↑/↓ move · enter confirm · tab permanent mode · shift+enter permanent · esc deny`
+      `${prefix}↑/↓ move · enter confirm · tab permanent mode · shift+enter permanent${viewHint} · esc deny`
     ),
   ]
 }
@@ -400,6 +447,8 @@ interface InnerList {
 export class ModalView implements CustomComponent {
   private readonly inner: InnerList
   isPermanentActive = false
+  isInspecting = false
+  inspectScrollOffset = 0
   private readonly items: SettingItem[]
   private readonly req?: AskRequest
   private readonly onDecision?: (decision: AskDecision) => void
@@ -465,7 +514,81 @@ export class ModalView implements CustomComponent {
     this.invalidate()
   }
 
+  private renderInspector(width: number): string[] {
+    const text = getInspectableCommand(this.req)
+    const allLines = wrapInspectLines(text, width)
+    const maxOffset = Math.max(0, allLines.length - INSPECT_PAGE_SIZE)
+    this.inspectScrollOffset = Math.max(
+      0,
+      Math.min(this.inspectScrollOffset, maxOffset)
+    )
+    const visible = allLines.slice(
+      this.inspectScrollOffset,
+      this.inspectScrollOffset + INSPECT_PAGE_SIZE
+    )
+    const startLine = allLines.length === 0 ? 0 : this.inspectScrollOffset + 1
+    const endLine = this.inspectScrollOffset + visible.length
+    const titleText = `Full command [lines ${startLine}-${endLine} of ${allLines.length}]`
+    const footerText =
+      '↑/↓ j/k scroll · pgup/pgdn page · g/G top/bottom · v / esc / q back'
+    const title = this.slTheme ? this.slTheme.label(titleText, true) : titleText
+    const footer = this.slTheme ? this.slTheme.hint(footerText) : footerText
+    return [title, '', ...visible.map((line) => `  ${line}`), '', footer]
+  }
+
+  private handleInspectInput(data: string): void {
+    if (
+      matchesKey(data, 'escape') ||
+      data === '\x1b' ||
+      data === 'v' ||
+      data === 'V' ||
+      data === 'q' ||
+      data === 'Q'
+    ) {
+      this.isInspecting = false
+      this.inspectScrollOffset = 0
+      this.invalidate()
+      return
+    }
+    if (matchesKey(data, 'down') || data === '\x1b[B' || data === 'j') {
+      this.inspectScrollOffset += 1
+      this.invalidate()
+      return
+    }
+    if (matchesKey(data, 'up') || data === '\x1b[A' || data === 'k') {
+      this.inspectScrollOffset = Math.max(0, this.inspectScrollOffset - 1)
+      this.invalidate()
+      return
+    }
+    if (matchesKey(data, 'pageDown') || data === '\x1b[6~' || data === ' ') {
+      this.inspectScrollOffset += INSPECT_PAGE_SIZE
+      this.invalidate()
+      return
+    }
+    if (matchesKey(data, 'pageUp') || data === '\x1b[5~' || data === 'b') {
+      this.inspectScrollOffset = Math.max(
+        0,
+        this.inspectScrollOffset - INSPECT_PAGE_SIZE
+      )
+      this.invalidate()
+      return
+    }
+    if (matchesKey(data, 'home') || data === '\x1b[H' || data === 'g') {
+      this.inspectScrollOffset = 0
+      this.invalidate()
+      return
+    }
+    if (matchesKey(data, 'end') || data === '\x1b[F' || data === 'G') {
+      this.inspectScrollOffset = Number.MAX_SAFE_INTEGER
+      this.invalidate()
+      return
+    }
+  }
+
   render(width: number): string[] {
+    if (this.isInspecting) {
+      return this.renderInspector(width)
+    }
     const footerLines = this.slTheme
       ? buildFooter(this.slTheme, this.req, this.isPermanentActive)
       : (this.footer ?? [])
@@ -478,6 +601,21 @@ export class ModalView implements CustomComponent {
 
   handleInput(data: string): void {
     if (isKeyRelease(data)) {
+      return
+    }
+
+    if (this.isInspecting) {
+      this.handleInspectInput(data)
+      return
+    }
+
+    if (
+      (data === 'v' || data === 'V') &&
+      getInspectableCommand(this.req).length > 0
+    ) {
+      this.isInspecting = true
+      this.inspectScrollOffset = 0
+      this.invalidate()
       return
     }
 
@@ -665,6 +803,55 @@ export function createModalAskResolver(
       pi.events.emit.bind(pi.events)
     )
 
+    const localEmit = pi.events?.emit?.bind(pi.events)
+    const emitTarget =
+      via === 'parent-modal' ? (borrowEmit() ?? localEmit) : localEmit
+    const emitHerdrBlocked = (active: boolean): void => {
+      if (process.env.HERDR_ENV !== '1' || !emitTarget) return
+      try {
+        emitTarget(
+          'herdr:blocked',
+          active
+            ? { active: true, label: buildHerdrBlockedLabel(req) }
+            : { active: false }
+        )
+      } catch {
+        // fire-and-forget
+      }
+    }
+    emitHerdrBlocked(true)
+
+    const uiCfg = cfgState.get().ui
+    const ms =
+      via === 'parent-modal'
+        ? uiCfg.subagentModalTimeoutMs
+        : uiCfg.modalTimeoutMs
+
+    if (
+      via === 'modal' &&
+      uiCfg.herdrSelectModal === true &&
+      process.env.HERDR_ENV === '1'
+    ) {
+      try {
+        return await runHerdrSelectPrompt({
+          req,
+          ui,
+          via,
+          timeoutMs: ms,
+          showClassifierRisk: uiCfg.showClassifierRisk,
+          onClearReminder: () => {
+            if (remindTimer) {
+              clearInterval(remindTimer)
+              remindTimer = undefined
+            }
+          },
+        })
+      } finally {
+        if (remindTimer) clearInterval(remindTimer)
+        emitHerdrBlocked(false)
+      }
+    }
+
     return await new Promise<AskDecision>((resolve) => {
       let settled = false
       let close: (() => void) | undefined
@@ -675,6 +862,7 @@ export function createModalAskResolver(
         settled = true
         if (timer) clearTimeout(timer)
         if (remindTimer) clearInterval(remindTimer)
+        emitHerdrBlocked(false)
         close?.()
         resolve(v)
       }
@@ -684,11 +872,6 @@ export function createModalAskResolver(
       // Los prompts que se renderizan en la UI del padre (sub-sesión sin UI)
       // usan su propio plazo: quien espera es un agente en segundo plano, no la
       // persona que tiene la terminal delante.
-      const uiCfg = cfgState.get().ui
-      const ms =
-        via === 'parent-modal'
-          ? uiCfg.subagentModalTimeoutMs
-          : uiCfg.modalTimeoutMs
       if (ms !== -1) {
         // Nadie respondió: no es una decisión del usuario, así que se marca
         // `via: 'timeout'` en lugar de dejar que se audite como un deny humano.

@@ -10,7 +10,11 @@ import {
   evaluatePermission,
   resolveToolVisibility,
 } from '../permission/visibility.ts'
-import { evaluateExternalDirectory } from '../permission/external-directory.ts'
+import {
+  evaluateExternalDirectory,
+  extractCdTarget,
+  resolveFsPath,
+} from '../permission/external-directory.ts'
 import { grantDirFor } from '../permission/path-scope.ts'
 import {
   normalizeToolCall,
@@ -171,7 +175,10 @@ function evaluateCascade(ctx: GateCtx): CascadeState {
     rulePattern: '*',
   }
   for (const intent of intents) {
-    if (intent.surface === 'shell' && isShellStructureSegment(intent.value)) {
+    if (
+      intent.surface === 'shell' &&
+      isShellStructureSegment(intent.rawValue ?? intent.value)
+    ) {
       continue
     }
     // Evaluate permission cascade (config) - use toolName as key, not surface
@@ -528,13 +535,17 @@ function toExternalDirAsk(
 
 function evaluateSegmentAction(
   ctx: GateCtx,
-  intent: AccessIntent
+  intent: AccessIntent,
+  currentCwd: string = ctx.cwd ?? process.cwd()
 ): {
   action: 'allow' | 'ask' | 'deny'
   extVerdict?: ReturnType<typeof evaluateExternalDirectory>
 } {
   let action: 'allow' | 'ask' | 'deny' = 'allow'
-  if (!(intent.surface === 'shell' && isShellStructureSegment(intent.value))) {
+  if (!(
+    intent.surface === 'shell' &&
+    isShellStructureSegment(intent.rawValue ?? intent.value)
+  )) {
     const evalResult = evaluatePermission(
       ctx.cfg,
       'tools',
@@ -548,7 +559,7 @@ function evaluateSegmentAction(
   const extVerdict = evaluateExternalDirectory(ctx.cfg, [intent], {
     toolName: ctx.toolName,
     sessionRules: ctx.deps.sessionRules,
-    cwd: ctx.cwd,
+    cwd: currentCwd,
   })
   if (extVerdict) {
     const rank = { allow: 0, ask: 1, deny: 2 } as const
@@ -565,15 +576,29 @@ function findUnapprovedShellSegments(
 ): Array<{
   intent: AccessIntent
   extVerdict?: ReturnType<typeof evaluateExternalDirectory>
+  effectiveCwd: string
 }> {
   const { deps, toolName, startedAt } = ctx
   const unapproved: Array<{
     intent: AccessIntent
     extVerdict?: ReturnType<typeof evaluateExternalDirectory>
+    effectiveCwd: string
   }> = []
+  let effectiveCwd = ctx.cwd ?? process.cwd()
+
   for (const intent of ctx.intents) {
-    const { action, extVerdict } = evaluateSegmentAction(ctx, intent)
+    const { action, extVerdict } = evaluateSegmentAction(
+      ctx,
+      intent,
+      effectiveCwd
+    )
     if (action === 'allow') {
+      if (intent.surface === 'shell') {
+        const cdTarget = extractCdTarget(intent.value)
+        if (cdTarget) {
+          effectiveCwd = resolveFsPath(cdTarget, effectiveCwd)
+        }
+      }
       continue
     }
     const reqId =
@@ -588,10 +613,19 @@ function findUnapprovedShellSegments(
         toolName,
         startedAt,
         reqId,
-        ctxDetailFields(ctx)
+        {
+          ...ctxDetailFields(ctx),
+          cwd: effectiveCwd,
+        }
       )
     if (!approved) {
-      unapproved.push({ intent, extVerdict })
+      unapproved.push({ intent, extVerdict, effectiveCwd })
+    }
+    if (intent.surface === 'shell') {
+      const cdTarget = extractCdTarget(intent.value)
+      if (cdTarget) {
+        effectiveCwd = resolveFsPath(cdTarget, effectiveCwd)
+      }
     }
   }
   return unapproved
@@ -611,8 +645,8 @@ async function promptAskMultiSegmentShell(
   const { resolution } = planAsk(ctx, state, agg)
 
   for (let k = 1; k <= totalAsks; k++) {
-    const { intent: seg } = unapproved[k - 1]
-    const current = evaluateSegmentAction(ctx, seg)
+    const { intent: seg, effectiveCwd } = unapproved[k - 1]
+    const current = evaluateSegmentAction(ctx, seg, effectiveCwd)
     if (current.action === 'allow') {
       continue
     }
@@ -628,7 +662,10 @@ async function promptAskMultiSegmentShell(
         toolName,
         startedAt,
         reqId,
-        ctxDetailFields(ctx)
+        {
+          ...ctxDetailFields(ctx),
+          cwd: effectiveCwd,
+        }
       )
     ) {
       continue
@@ -648,6 +685,7 @@ async function promptAskMultiSegmentShell(
       risk: agg.risk,
       startedAt,
       ...ctxDetailFields(ctx),
+      cwd: effectiveCwd,
     }
     const segExternalDirAsk =
       current.extVerdict && current.extVerdict.action === 'ask'
@@ -680,7 +718,7 @@ async function promptAskMultiSegmentShell(
           segmentIndex: k,
           segmentTotal: totalAsks,
           askOrigin: segAskOrigin,
-          cwd: ctx.cwd,
+          cwd: effectiveCwd,
           requestId: reqId,
           segments: ctx.segments,
           externalScope: ctx.externalScope,

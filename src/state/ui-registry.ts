@@ -25,9 +25,13 @@ import type { ExtensionUI } from '../pi-sdk.ts'
 
 const REGISTRY_KEY = Symbol.for('pi-auto-mode:ui-registry')
 
+export type EventEmitFn = (channel: string, data: unknown) => void
+
 interface UiRegistry {
   /** Last dialog-capable UI published by any session in this process. */
   ui?: ExtensionUI
+  /** Event bus emitter belonging to the session that published `ui`. */
+  emit?: EventEmitFn
   /**
    * Tail of the prompt queue. Pi renders ONE extension selector per session,
    * so two prompts reaching the same UI at once would tear each other's
@@ -58,8 +62,10 @@ function registry(): UiRegistry {
  * headless session a "UI" that answers `select() → undefined` and
  * `confirm() → false`, which is a fabricated human decision, not a prompt.
  */
-export function publishUi(ui: ExtensionUI): void {
-  registry().ui = ui
+export function publishUi(ui: ExtensionUI, emit?: EventEmitFn): void {
+  const reg = registry()
+  reg.ui = ui
+  if (emit) reg.emit = emit
 }
 
 /**
@@ -69,6 +75,11 @@ export function publishUi(ui: ExtensionUI): void {
  */
 export function borrowUi(): ExtensionUI | undefined {
   return registry().ui
+}
+
+/** Event emitter of the parent session that published the borrowed UI. */
+export function borrowEmit(): EventEmitFn | undefined {
+  return registry().emit
 }
 
 /**

@@ -619,7 +619,10 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       value: '/tmp/x',
       requestId: 'req-1',
     })
-    expect(order).toEqual([`emit:${BUS_CHANNEL_UI_PROMPT}`, 'custom'])
+    expect(order.filter((e) => e !== 'emit:herdr:blocked')).toEqual([
+      `emit:${BUS_CHANNEL_UI_PROMPT}`,
+      'custom',
+    ])
     expect(eventsEmit).toHaveBeenCalledWith(
       BUS_CHANNEL_UI_PROMPT,
       expect.objectContaining({
@@ -1746,6 +1749,90 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       } finally {
         jest.useRealTimers()
       }
+    })
+  })
+
+  describe('scrollable full-command inspector (v key)', () => {
+    it('shows truncation hint and v view full in footer when fullCommand exceeds header bound', async () => {
+      const longCmd = Array.from(
+        { length: 25 },
+        (_, i) => `echo "segment_${i}_${'a'.repeat(20)}"`
+      ).join('; ')
+      expect(longCmd.length).toBeGreaterThan(480)
+
+      const { lines, settle, promise } = renderModal({
+        tool: 'bash',
+        surface: 'shell',
+        value: 'echo segment_0',
+        fullCommand: longCmd,
+      })
+
+      const text = lines.join('\n')
+      expect(text).toContain('press v to view full')
+      expect(text).toContain('v view full')
+      settle('deny')
+      expect(await promise).toBe('deny')
+    })
+
+    it('opens scrollable full command view on v, scrolls with j/k/G/g, and returns on Esc without denying', async () => {
+      const longLines = Array.from(
+        { length: 30 },
+        (_, i) => `line_${String(i + 1).padStart(2, '0')}: echo ok`
+      )
+      const fullCommand = longLines.join('\n')
+
+      const resolver = makeResolver(new SessionRules())
+      const promise = resolver({
+        tool: 'bash',
+        surface: 'shell',
+        value: 'line_01: echo ok',
+        fullCommand,
+      })
+
+      const view = renderCapture!(
+        undefined,
+        fakeGlobalTheme,
+        undefined,
+        () => {}
+      ) as unknown as ModalView
+      expect(view.isInspecting).toBe(false)
+
+      // Open inspector
+      view.handleInput('v')
+      expect(view.isInspecting).toBe(true)
+
+      const page1 = view.render(80).join('\n')
+      expect(page1).toContain('Full command [lines 1-16 of 30]')
+      expect(page1).toContain('line_01: echo ok')
+      expect(page1).not.toContain('line_30: echo ok')
+
+      // Scroll down 2 lines with j / arrow down
+      view.handleInput('j')
+      view.handleInput('\x1b[B')
+      const scrolled = view.render(80).join('\n')
+      expect(scrolled).toContain('Full command [lines 3-18 of 30]')
+      expect(scrolled).toContain('line_18: echo ok')
+
+      // Jump to bottom with G
+      view.handleInput('G')
+      const bottom = view.render(80).join('\n')
+      expect(bottom).toContain('Full command [lines 15-30 of 30]')
+      expect(bottom).toContain('line_30: echo ok')
+
+      // Jump back to top with g
+      view.handleInput('g')
+      const top = view.render(80).join('\n')
+      expect(top).toContain('Full command [lines 1-16 of 30]')
+
+      // Esc exits inspector back to approval modal (does NOT deny)
+      view.handleInput('\x1b')
+      expect(view.isInspecting).toBe(false)
+      const backToModal = view.render(80).join('\n')
+      expect(backToModal).toContain('Command approval')
+
+      // Now confirm allow
+      choose('allow')
+      expect(await promise).toBe('allow')
     })
   })
 })

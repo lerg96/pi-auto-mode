@@ -415,13 +415,13 @@ function buildFooter(
   if (isPermanent) {
     return [
       slTheme.hint(
-        `${prefix}[PERMANENT MODE] ↑/↓ move · enter confirm (permanent) · tab session mode${viewHint} · esc deny`
+        `${prefix}[PERMANENT MODE] ↑/↓ move · enter confirm (permanent) · tab session mode${viewHint}`
       ),
     ]
   }
   return [
     slTheme.hint(
-      `${prefix}↑/↓ move · enter confirm · tab permanent mode · shift+enter permanent${viewHint} · esc deny`
+      `${prefix}↑/↓ move · enter confirm · tab permanent mode · shift+enter permanent${viewHint}`
     ),
   ]
 }
@@ -606,6 +606,10 @@ export class ModalView implements CustomComponent {
 
     if (this.isInspecting) {
       this.handleInspectInput(data)
+      return
+    }
+
+    if (matchesKey(data, 'escape') || data === '\x1b') {
       return
     }
 
@@ -1010,11 +1014,9 @@ export function createModalAskResolver(
                   }
                 }
               },
-              // onCancel / Esc: Pi's own SettingsList calls onCancel on
-              // Esc. The render is now visible (overlay:false + correct
-              // SettingItem/theme shapes), so Esc-as-deny matches the
-              // expected UX: dismissing the prompt is a deny.
-              () => finish('deny')
+              // onCancel / Esc: disabled so pressing Esc to close an overlay
+              // (e.g. subagent viewer) never cancels a queued permission prompt.
+              () => {}
             )
             const view = new ModalView(
               buildHeader(

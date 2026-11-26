@@ -23,11 +23,13 @@ jest.mock('@earendil-works/pi-tui', () => ({
       items: unknown[],
       _pageLength: number,
       _theme: unknown,
-      _onChange: unknown,
-      onCancel: () => void
+      onChange: (itemId: string, newValue: string) => void | Promise<void>,
+      _onCancel: () => void
     ) {
       this.items = items
-      queueMicrotask(() => onCancel())
+      queueMicrotask(() => {
+        void onChange('deny', '❯')
+      })
     }
   },
 }))

@@ -492,16 +492,20 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
     expect(await promise).toBe('deny')
   })
 
-  // ─── Esc → deny (SettingsList onCancel wiring) ───────────
-  it('resolves to "deny" when SettingsList onCancel fires (Esc / dismiss = deny, fail-closed)', async () => {
+  // ─── Esc ignored (SettingsList onCancel is a no-op) ──────
+  it('does not resolve when SettingsList onCancel fires (Esc does not dismiss the prompt)', async () => {
     const resolver = makeResolver()
     const promise = resolver({ surface: 'fs', value: '/tmp/x' })
-    // Wire the SettingsList up.
+    let settled = false
+    void promise.then(() => {
+      settled = true
+    })
     renderCapture!(undefined, fakeGlobalTheme, undefined, () => {})
     expect(typeof captures.onCancel).toBe('function')
-    // Fire onCancel (SettingsList fires this on Esc / dismiss).
     captures.onCancel!()
-    // Esc-as-deny: the promise resolves to 'deny' immediately.
+    await Promise.resolve()
+    expect(settled).toBe(false)
+    choose('deny')
     expect(await promise).toBe('deny')
   })
 
@@ -1411,7 +1415,7 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       const text = lines.join('\n')
       expect(text).toContain('Command approval [1 of 2]')
       expect(text).toContain(
-        '[1 of 2] · ↑/↓ move · enter confirm · tab permanent mode · shift+enter permanent · esc deny'
+        '[1 of 2] · ↑/↓ move · enter confirm · tab permanent mode · shift+enter permanent'
       )
       settle('allow')
       expect(await promise).toBe('allow')
@@ -1428,7 +1432,7 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       expect(text).not.toContain('[1 of 1]')
       expect(text).toContain('Command approval')
       expect(text).toContain(
-        '↑/↓ move · enter confirm · tab permanent mode · shift+enter permanent · esc deny'
+        '↑/↓ move · enter confirm · tab permanent mode · shift+enter permanent'
       )
       settle('allow')
       expect(await promise).toBe('allow')
@@ -1456,7 +1460,7 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       )
       const lines = view.render(80)
       expect(lines.join('\n')).toContain(
-        '↑/↓ move · enter confirm · tab permanent mode · shift+enter permanent · esc deny'
+        '↑/↓ move · enter confirm · tab permanent mode · shift+enter permanent'
       )
 
       choose('allow')
@@ -1499,7 +1503,7 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
 
       const lines = view.render(80)
       expect(lines.join('\n')).toContain(
-        '[PERMANENT MODE] ↑/↓ move · enter confirm (permanent) · tab session mode · esc deny'
+        '[PERMANENT MODE] ↑/↓ move · enter confirm (permanent) · tab session mode'
       )
 
       choose('allow')
@@ -1534,7 +1538,7 @@ describe('createModalAskResolver (ctx.ui.custom + overlay:false)', () => {
       )
       const lines = view.render(80)
       expect(lines.join('\n')).toContain(
-        '↑/↓ move · enter confirm · tab permanent mode · shift+enter permanent · esc deny'
+        '↑/↓ move · enter confirm · tab permanent mode · shift+enter permanent'
       )
 
       choose('allow')

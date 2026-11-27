@@ -1,4 +1,5 @@
 import { safeRegexpTest } from '../classifier/pattern-matcher.ts'
+import type { ScriptFingerprint } from './script-fingerprint.ts'
 
 export type PermissionState = 'allow' | 'deny' | 'ask'
 
@@ -10,6 +11,7 @@ export interface Rule {
   origin?: string
   priority?: number
   isExact?: boolean
+  scriptFingerprints?: ScriptFingerprint[]
 }
 
 export type Ruleset = Rule[]

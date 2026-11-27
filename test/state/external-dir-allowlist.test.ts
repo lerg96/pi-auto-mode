@@ -1,6 +1,8 @@
 import {
   addExternalDirAllow,
+  getExternalDirAllowlist,
   isExternalDirAllowed,
+  removeExternalDirAllow,
   resetExternalDirAllowlist,
 } from '../../src/state/external-dir-allowlist.ts'
 
@@ -45,6 +47,45 @@ describe('external-dir-allowlist (global)', () => {
     expect(isExternalDirAllowed('C:/tmp/x')).toBe(true)
     resetExternalDirAllowlist()
     expect(isExternalDirAllowed('C:/tmp/x')).toBe(false)
+  })
+
+  describe('getExternalDirAllowlist', () => {
+    it('returns empty array when allowlist is empty', () => {
+      expect(getExternalDirAllowlist()).toEqual([])
+    })
+
+    it('returns all added paths', () => {
+      addExternalDirAllow('C:/tmp')
+      addExternalDirAllow('C:/mnt/shared')
+      const list = getExternalDirAllowlist()
+      expect(list).toHaveLength(2)
+      expect(list.some((p) => p.includes('tmp'))).toBe(true)
+      expect(list.some((p) => p.includes('shared'))).toBe(true)
+    })
+  })
+
+  describe('removeExternalDirAllow', () => {
+    it('removes an existing directory and returns true', () => {
+      addExternalDirAllow('C:/mnt/shared')
+      expect(isExternalDirAllowed('C:/mnt/shared/file.txt')).toBe(true)
+      expect(getExternalDirAllowlist()).toHaveLength(1)
+
+      const removed = removeExternalDirAllow('C:/mnt/shared')
+      expect(removed).toBe(true)
+      expect(isExternalDirAllowed('C:/mnt/shared/file.txt')).toBe(false)
+      expect(getExternalDirAllowlist()).toEqual([])
+    })
+
+    it('returns false when directory does not exist in allowlist', () => {
+      expect(removeExternalDirAllow('C:/nonexistent')).toBe(false)
+    })
+
+    it('removes directory when called with normalized path directly', () => {
+      addExternalDirAllow('C:/mnt/shared')
+      const [normalized] = getExternalDirAllowlist()
+      expect(removeExternalDirAllow(normalized)).toBe(true)
+      expect(getExternalDirAllowlist()).toEqual([])
+    })
   })
 
   // ─── BUG 3: Windows backslash + forward-slash compatibility ───

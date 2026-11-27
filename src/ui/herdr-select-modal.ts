@@ -3,7 +3,40 @@ import type { ExtensionUI } from '../pi-sdk.ts'
 
 export interface SelectOptionEntry {
   label: string
-  decision: AskDecision | 'deny_reason' | 'allow_permanent_menu'
+  decision:
+    AskDecision | 'deny_reason' | 'allow_permanent_menu' | 'view_full_command'
+}
+
+const SELECT_TITLE_CMD_MAX = 160
+const VIEW_PAGE_LINES = 16
+const VIEW_WRAP_WIDTH = 100
+
+export function getFullSelectCommand(req: AskRequest): string {
+  const full = (req.fullCommand ?? '').trim()
+  if (full.length > 0) return full
+  return (req.value ?? '').trim()
+}
+
+export function isSelectCommandTruncated(req: AskRequest): boolean {
+  if (req.type === 'external-directory') return false
+  const raw = getFullSelectCommand(req)
+  if (!raw) return false
+  if (raw.includes('\n')) return true
+  return raw.replace(/\s{2,}/g, ' ').length > SELECT_TITLE_CMD_MAX
+}
+
+function wrapCommandLines(text: string, width = VIEW_WRAP_WIDTH): string[] {
+  const out: string[] = []
+  for (const line of text.split(/\r?\n/)) {
+    if (line.length === 0) {
+      out.push('')
+      continue
+    }
+    for (let i = 0; i < line.length; i += width) {
+      out.push(line.slice(i, i + width))
+    }
+  }
+  return out
 }
 
 export function sanitizeSelectText(text: string, maxWidth = 100): string {
@@ -36,7 +69,7 @@ export function buildSelectTitle(
     req.type === 'external-directory' && req.externalDir
       ? req.externalDir
       : (req.fullCommand ?? req.value)
-  const target = sanitizeSelectText(rawTarget, 160)
+  const target = sanitizeSelectText(rawTarget, SELECT_TITLE_CMD_MAX)
   const lines = [`${prefix}Permission required: ${tool}`]
   if (target) {
     lines.push(
@@ -74,16 +107,24 @@ export function buildSelectOptions(req: AskRequest): SelectOptionEntry[] {
         decision: { decision: 'allow_session', pattern: pat },
       })
     }
-    if (req.sessionPatterns.length > 1) {
+    if (!req.suppressPermanent) {
+      if (req.sessionPatterns.length > 1) {
+        entries.push({
+          label: 'Allow permanently...',
+          decision: 'allow_permanent_menu',
+        })
+      } else {
+        const primaryPattern = req.sessionPatterns[0] ?? req.value
+        entries.push({
+          label: `Allow permanently: ${sanitizeSelectText(primaryPattern, 70)}`,
+          decision: { decision: 'allow_permanent', pattern: primaryPattern },
+        })
+      }
+    }
+    if (isSelectCommandTruncated(req)) {
       entries.push({
-        label: 'Allow permanently...',
-        decision: 'allow_permanent_menu',
-      })
-    } else {
-      const primaryPattern = req.sessionPatterns[0] ?? req.value
-      entries.push({
-        label: `Allow permanently: ${sanitizeSelectText(primaryPattern, 70)}`,
-        decision: { decision: 'allow_permanent', pattern: primaryPattern },
+        label: 'View full command',
+        decision: 'view_full_command',
       })
     }
     entries.push(
@@ -97,7 +138,15 @@ export function buildSelectOptions(req: AskRequest): SelectOptionEntry[] {
       {
         label: 'Allow permanently',
         decision: { decision: 'allow_permanent', pattern: req.value },
-      },
+      }
+    )
+    if (isSelectCommandTruncated(req)) {
+      entries.push({
+        label: 'View full command',
+        decision: 'view_full_command',
+      })
+    }
+    entries.push(
       { label: 'Deny', decision: 'deny' },
       { label: 'Deny with reason', decision: 'deny_reason' }
     )
@@ -205,6 +254,45 @@ export async function runHerdrSelectPrompt(params: {
       const picked = options.find((o) => o.label === chosen)
       if (!picked) {
         return 'deny'
+      }
+      if (picked.decision === 'view_full_command') {
+        const lines = wrapCommandLines(getFullSelectCommand(req))
+        const totalPages = Math.max(
+          1,
+          Math.ceil(lines.length / VIEW_PAGE_LINES)
+        )
+        let page = 0
+        while (true) {
+          const slice = lines.slice(
+            page * VIEW_PAGE_LINES,
+            (page + 1) * VIEW_PAGE_LINES
+          )
+          const header =
+            totalPages > 1
+              ? `Full command (page ${page + 1}/${totalPages})`
+              : 'Full command'
+          const nav: string[] = []
+          if (page + 1 < totalPages) nav.push('Next page')
+          if (page > 0) nav.push('Previous page')
+          nav.push('Back')
+          const navChosen = await selectWithTimeout(
+            `${header}\n\n${slice.join('\n')}`,
+            nav
+          )
+          if (timedOut) {
+            return { decision: 'deny', via: 'timeout' }
+          }
+          if (navChosen === 'Next page') {
+            page++
+            continue
+          }
+          if (navChosen === 'Previous page') {
+            page--
+            continue
+          }
+          break
+        }
+        continue
       }
       if (picked.decision !== 'allow_permanent_menu') {
         match = picked

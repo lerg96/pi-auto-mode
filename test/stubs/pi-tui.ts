@@ -43,6 +43,24 @@ export function matchesKey(data: string, keyId: string): boolean {
   if (keyId === 'enter') {
     return data === '\r' || data === '\n'
   }
+  if (keyId === 'up') {
+    return data === '\x1b[A' || data === 'up'
+  }
+  if (keyId === 'down') {
+    return data === '\x1b[B' || data === 'down'
+  }
+  if (keyId === 'left') {
+    return data === '\x1b[D' || data === 'left'
+  }
+  if (keyId === 'right') {
+    return data === '\x1b[C' || data === 'right'
+  }
+  if (keyId === 'escape') {
+    return data === '\x1b' || data === 'escape' || data === 'esc'
+  }
+  if (keyId === 'backspace') {
+    return data === '\x7f' || data === '\b' || data === 'backspace'
+  }
   return false
 }
 

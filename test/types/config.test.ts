@@ -624,3 +624,70 @@ describe('trustGitWorktrees (external_directory × git worktrees)', () => {
     expect(cfg.trustGitWorktrees).toBe(true)
   })
 })
+
+describe('classifier.onlyFlagged & PatternRule.classify', () => {
+  it('defaults classifier.onlyFlagged to false', () => {
+    expect(parseConfig({}).classifier.onlyFlagged).toBe(false)
+    expect(DEFAULT_CONFIG.classifier.onlyFlagged).toBe(false)
+  })
+
+  it('accepts classifier.onlyFlagged=true and PatternRule.classify=true', () => {
+    const cfg = parseConfig({
+      classifier: { onlyFlagged: true },
+      permissions: {
+        tools: {
+          bash: [{ pattern: 'python3 *', action: 'ask', classify: true }],
+        },
+      },
+    })
+    expect(cfg.classifier.onlyFlagged).toBe(true)
+    const bashRules = cfg.permissions.tools?.bash
+    expect(Array.isArray(bashRules) && bashRules[0]?.classify).toBe(true)
+  })
+
+  it('rejects non-boolean classifier.onlyFlagged and PatternRule.classify', () => {
+    expect(() => parseConfig({ classifier: { onlyFlagged: 'yes' } })).toThrow()
+    expect(() =>
+      parseConfig({
+        permissions: {
+          tools: {
+            bash: [{ pattern: 'python3 *', action: 'ask', classify: 'yes' }],
+          },
+        },
+      })
+    ).toThrow()
+  })
+
+  it('config.example.json parses with onlyFlagged=false', () => {
+    const raw = JSON.parse(readFileSync(EXAMPLE_PATH, 'utf8'))
+    const cfg = parseConfig(raw)
+    expect(cfg.classifier.onlyFlagged).toBe(false)
+  })
+})
+
+describe('classifier.llm.api & minAllowConfidence (Jev)', () => {
+  it('accepts api="jev" and minAllowConfidence in [0, 1]', () => {
+    const cfg = parseConfig({
+      classifier: {
+        llm: {
+          api: 'jev',
+          minAllowConfidence: 0.9,
+        },
+      },
+    })
+    expect(cfg.classifier.llm.api).toBe('jev')
+    expect(cfg.classifier.llm.minAllowConfidence).toBe(0.9)
+  })
+
+  it('rejects invalid api and out-of-range minAllowConfidence', () => {
+    expect(() =>
+      parseConfig({ classifier: { llm: { api: 'invalid-api' } } })
+    ).toThrow()
+    expect(() =>
+      parseConfig({ classifier: { llm: { minAllowConfidence: 1.5 } } })
+    ).toThrow()
+    expect(() =>
+      parseConfig({ classifier: { llm: { minAllowConfidence: -0.1 } } })
+    ).toThrow()
+  })
+})

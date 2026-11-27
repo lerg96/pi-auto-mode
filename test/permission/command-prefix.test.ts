@@ -152,6 +152,34 @@ describe('buildSessionPatterns', () => {
         'kubectl get *',
       ],
     },
+    {
+      input: 'python3 /tmp/cw/parse.py arg1',
+      expected: [
+        'python3 /tmp/cw/parse.py arg1',
+        'python3 /tmp/cw/parse.py *',
+        'python3 *',
+      ],
+    },
+    {
+      input: 'python3 /tmp/cw/parse.py --json',
+      expected: [
+        'python3 /tmp/cw/parse.py --json',
+        'python3 /tmp/cw/parse.py *',
+        'python3 *',
+      ],
+    },
+    {
+      input: 'bash ./scripts/q.sh arg1',
+      expected: ['bash ./scripts/q.sh arg1', 'bash ./scripts/q.sh *', 'bash *'],
+    },
+    {
+      input: 'node src/index.js --port 8080',
+      expected: [
+        'node src/index.js --port 8080',
+        'node src/index.js *',
+        'node *',
+      ],
+    },
   ]
 
   it.each(tableCases)('$input', ({ input, expected }) => {

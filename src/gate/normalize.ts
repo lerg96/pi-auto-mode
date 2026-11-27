@@ -689,9 +689,13 @@ function isPureShellTest(s: string): boolean {
 
 export function isShellStructureSegment(s: string): boolean {
   const trimmed = s.trim()
+  if (trimmed.startsWith('#')) return true
   if (isBareShellKeyword(trimmed)) return true
   const argv = extractArgv(trimmed)
   if (argv.length === 1 && /^(?:do|done|then|else|fi|esac)$/.test(argv[0])) {
+    return true
+  }
+  if (/^(?:break|continue|return|exit)(?:\s+\d+)?$/.test(trimmed)) {
     return true
   }
   if (isPureSafeVarAssignment(trimmed)) {

@@ -1,4 +1,5 @@
 import type { Rule, PermissionState } from './rule.ts'
+import type { ScriptFingerprint } from './script-fingerprint.ts'
 import { sessionPatternMatches } from './wildcard-matcher.ts'
 import { stripEnvPrefix } from './command-prefix.ts'
 
@@ -89,26 +90,80 @@ export function sessionPatternCovers(pattern: string, value: string): boolean {
   return patternCovers({ pattern }, { pattern: value })
 }
 
+function mergeFingerprints(
+  existing: ScriptFingerprint[] | undefined,
+  incoming: ScriptFingerprint[]
+): ScriptFingerprint[] {
+  if (!existing || existing.length === 0) return incoming
+  const map = new Map<string, ScriptFingerprint>()
+  const isWin = process.platform === 'win32'
+  for (const fp of existing) {
+    map.set(isWin ? fp.path.toLowerCase() : fp.path, fp)
+  }
+  for (const fp of incoming) {
+    map.set(isWin ? fp.path.toLowerCase() : fp.path, fp)
+  }
+  return Array.from(map.values())
+}
+
 export class SessionRules {
   add(rule: SessionRule): void {
-    registry().rules.push(rule)
+    const reg = registry()
+    const existing = reg.rules.find(
+      (r) =>
+        r.surface === rule.surface &&
+        r.pattern === rule.pattern &&
+        r.action === rule.action &&
+        Boolean(r.isExact) === Boolean(rule.isExact)
+    )
+    if (existing) {
+      if (rule.scriptFingerprints && rule.scriptFingerprints.length > 0) {
+        existing.scriptFingerprints = mergeFingerprints(
+          existing.scriptFingerprints,
+          rule.scriptFingerprints
+        )
+      }
+      return
+    }
+    reg.rules.push(rule)
+  }
+
+  remove(surface: string, pattern: string, action?: PermissionState): boolean {
+    const reg = registry()
+    const before = reg.rules.length
+    reg.rules = reg.rules.filter(
+      (r) =>
+        !(
+          r.surface === surface &&
+          r.pattern === pattern &&
+          (action === undefined || r.action === action)
+        )
+    )
+    return reg.rules.length < before
   }
 
   approveForSession(
     surface: string,
     pattern: string,
     action: PermissionState,
-    isExact?: boolean
+    isExact?: boolean,
+    scriptFingerprints?: ScriptFingerprint[]
   ): void {
     const reg = registry()
     const incoming: PatternCandidate = { pattern, isExact }
-    const alreadyCovered = reg.rules.some(
+    const coveringRule = reg.rules.find(
       (r) =>
         r.surface === surface &&
         r.action === action &&
         patternCovers(r, incoming)
     )
-    if (alreadyCovered) {
+    if (coveringRule) {
+      if (scriptFingerprints && scriptFingerprints.length > 0) {
+        coveringRule.scriptFingerprints = mergeFingerprints(
+          coveringRule.scriptFingerprints,
+          scriptFingerprints
+        )
+      }
       return
     }
 
@@ -126,11 +181,19 @@ export class SessionRules {
     if (isExact !== undefined) {
       rule.isExact = isExact
     }
+    if (scriptFingerprints && scriptFingerprints.length > 0) {
+      rule.scriptFingerprints = scriptFingerprints
+    }
     this.add(rule)
   }
 
   snapshot(): Rule[] {
-    return registry().rules.map((r) => ({ ...r }))
+    return registry().rules.map((r) => ({
+      ...r,
+      ...(r.scriptFingerprints
+        ? { scriptFingerprints: r.scriptFingerprints.map((fp) => ({ ...fp })) }
+        : {}),
+    }))
   }
 
   clear(): void {

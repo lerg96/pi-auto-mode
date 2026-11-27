@@ -11,6 +11,9 @@ import type {
   ExtensionCommandContext,
 } from '@earendil-works/pi-coding-agent'
 import { configState } from '../../src/state/config-state.ts'
+import { SessionRules } from '../../src/permission/session-rules.ts'
+import { resetUiRegistry } from '../../src/state/ui-registry.ts'
+import { setUiContext } from '../../src/state/ui-context.ts'
 
 const baseConfig: Config = {
   ...DEFAULT_CONFIG,
@@ -433,5 +436,120 @@ describe('yolo command', () => {
     expect(configState.isYoloSession()).toBe(true)
     await m.commands['yolo'].handler('off', ctx)
     expect(configState.isYoloSession()).toBe(false)
+  })
+})
+
+describe('permissions-list command', () => {
+  let state: ReturnType<typeof makeState>
+  let sessionRules: SessionRules
+  let commands: Record<
+    string,
+    { handler: Function; getArgumentCompletions?: Function }
+  >
+  let registerCommand: ReturnType<typeof jest.fn>
+
+  beforeEach(() => {
+    resetUiRegistry()
+    setUiContext(undefined, false)
+    state = makeState(baseConfig)
+    sessionRules = new SessionRules()
+    const m = makePi()
+    registerCommand = m.registerCommand
+    commands = m.commands
+    registerSetCommands(m.pi, state as never, sessionRules)
+  })
+
+  it('registers both permissions-list and auto-mode:permissions commands', () => {
+    expect(registerCommand).toHaveBeenCalledWith(
+      'permissions-list',
+      expect.objectContaining({
+        description: expect.stringContaining('interactive modal'),
+        handler: expect.any(Function),
+      })
+    )
+    expect(registerCommand).toHaveBeenCalledWith(
+      'auto-mode:permissions',
+      expect.objectContaining({
+        description: expect.stringContaining('Alias for /permissions-list'),
+        handler: expect.any(Function),
+      })
+    )
+    expect(commands['permissions-list']).toBeDefined()
+    expect(commands['auto-mode:permissions']).toBeDefined()
+  })
+
+  it('invoking /permissions-list with interactive UI opens the modal and does not emit a warning', async () => {
+    const custom = jest.fn(
+      (
+        render: (
+          tui: unknown,
+          theme: unknown,
+          kb: unknown,
+          done: () => void
+        ) => { handleInput?: (key: string) => void }
+      ) => {
+        const comp = render(null, null, null, () => {})
+        comp.handleInput?.('q')
+        return Promise.resolve()
+      }
+    )
+    const notify = jest.fn()
+    const ctx = {
+      ui: { custom, notify },
+      hasUI: true,
+    } as unknown as ExtensionCommandContext
+
+    await commands['permissions-list'].handler('', ctx)
+
+    expect(custom).toHaveBeenCalledWith(expect.any(Function), {
+      overlay: false,
+    })
+    expect(notify).not.toHaveBeenCalled()
+  })
+
+  it('invoking /auto-mode:permissions alias also opens the modal', async () => {
+    const custom = jest.fn(
+      (
+        render: (
+          tui: unknown,
+          theme: unknown,
+          kb: unknown,
+          done: () => void
+        ) => { handleInput?: (key: string) => void }
+      ) => {
+        const comp = render(null, null, null, () => {})
+        comp.handleInput?.('q')
+        return Promise.resolve()
+      }
+    )
+    const notify = jest.fn()
+    const ctx = {
+      ui: { custom, notify },
+      hasUI: true,
+    } as unknown as ExtensionCommandContext
+
+    await commands['auto-mode:permissions'].handler('', ctx)
+
+    expect(custom).toHaveBeenCalledWith(expect.any(Function), {
+      overlay: false,
+    })
+    expect(notify).not.toHaveBeenCalled()
+  })
+
+  it('invoking /permissions-list when hasUI: false (and no borrowed UI) notifies a warning', async () => {
+    resetUiRegistry()
+    setUiContext(undefined, false)
+    const notify = jest.fn()
+    const ctx = {
+      ui: { notify },
+      hasUI: false,
+    } as unknown as ExtensionCommandContext
+
+    await commands['permissions-list'].handler('', ctx)
+
+    expect(notify).toHaveBeenCalledWith(
+      'Permissions list modal requires an interactive UI.',
+      'warning'
+    )
   })
 })

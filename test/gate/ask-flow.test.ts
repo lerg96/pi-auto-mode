@@ -3,7 +3,11 @@ import {
   askDeniedAudit,
   verdictExtra,
   resolveAsk,
+  trySessionAllow,
 } from '../../src/gate/ask-flow.ts'
+import { join } from 'node:path'
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import type { GateDeps } from '../../src/gate/gate.ts'
 import { setAskResolver, defaultAskResolver } from '../../src/gate/ask.ts'
 import {
@@ -319,5 +323,138 @@ describe('resolveAsk', () => {
       (r) => r.surface === 'shell' && r.pattern === 'git *'
     )
     expect(rule).toBeDefined()
+  })
+
+  describe('script fingerprinting in ask-flow', () => {
+    let scriptDir: string
+
+    beforeEach(() => {
+      scriptDir = mkdtempSync(join(tmpdir(), 'pi-askflow-script-test-'))
+    })
+
+    afterEach(() => {
+      try {
+        rmSync(scriptDir, { recursive: true, force: true })
+      } catch {
+        // ignore
+      }
+    })
+
+    it('captures scriptFingerprints on allow_session and validates in trySessionAllow', async () => {
+      const { deps } = makeDeps()
+      const scriptPath = join(scriptDir, 'script.py')
+      writeFileSync(scriptPath, 'print("v1")\n')
+      const cmd = `python3 ${scriptPath}`
+
+      setAskResolver(async () => ({
+        decision: 'allow_session',
+        pattern: 'python3 *',
+      }))
+
+      const res = await resolveAsk(
+        'shell',
+        cmd,
+        undefined,
+        deps,
+        undefined,
+        'bash',
+        cmd,
+        Date.now(),
+        undefined,
+        { cwd: scriptDir }
+      )
+      expect(res.verdict).toBe('allow_session')
+
+      const rule = deps.sessionRules
+        .snapshot()
+        .find((r) => r.pattern === 'python3 *')
+      expect(rule).toBeDefined()
+      expect(rule?.scriptFingerprints).toHaveLength(1)
+
+      // trySessionAllow succeeds while file is unchanged
+      const allowed = trySessionAllow(
+        deps,
+        'shell',
+        cmd,
+        undefined,
+        'bash',
+        Date.now(),
+        'req-1',
+        { cwd: scriptDir }
+      )
+      expect(allowed).toBe(true)
+
+      // Modifying script invalidates and removes session rule
+      writeFileSync(scriptPath, 'print("v2 - modified")\n')
+      const allowedAfterMod = trySessionAllow(
+        deps,
+        'shell',
+        cmd,
+        undefined,
+        'bash',
+        Date.now(),
+        'req-2',
+        { cwd: scriptDir }
+      )
+      expect(allowedAfterMod).toBe(false)
+      expect(deps.sessionRules.snapshot()).toHaveLength(0)
+    })
+
+    it('does not allow command with un-fingerprinted script under broad pattern', async () => {
+      const { deps } = makeDeps()
+      const script1 = join(scriptDir, 'a.py')
+      const script2 = join(scriptDir, 'b.py')
+      writeFileSync(script1, 'print("a")\n')
+      writeFileSync(script2, 'print("b")\n')
+
+      setAskResolver(async () => ({
+        decision: 'allow_session',
+        pattern: 'python3 *',
+      }))
+
+      await resolveAsk(
+        'shell',
+        `python3 ${script1}`,
+        undefined,
+        deps,
+        undefined,
+        'bash',
+        `python3 ${script1}`,
+        Date.now(),
+        undefined,
+        { cwd: scriptDir }
+      )
+
+      // a.py is allowed
+      expect(
+        trySessionAllow(
+          deps,
+          'shell',
+          `python3 ${script1}`,
+          undefined,
+          'bash',
+          Date.now(),
+          'req-1',
+          { cwd: scriptDir }
+        )
+      ).toBe(true)
+
+      // b.py is NOT allowed by this rule
+      expect(
+        trySessionAllow(
+          deps,
+          'shell',
+          `python3 ${script2}`,
+          undefined,
+          'bash',
+          Date.now(),
+          'req-2',
+          { cwd: scriptDir }
+        )
+      ).toBe(false)
+
+      // But rule for a.py is still preserved
+      expect(deps.sessionRules.snapshot()).toHaveLength(1)
+    })
   })
 })

@@ -437,4 +437,50 @@ describe('createModalAskResolver with herdrSelectModal toggle', () => {
       childEmitted.filter((e) => e.channel === 'herdr:blocked')
     ).toHaveLength(0)
   })
+
+  it('omits Allow permanently options when suppressPermanent is true', () => {
+    const opts = buildSelectOptions({
+      surface: 'shell',
+      tool: 'bash',
+      value: 'sed -i -e 87,108d src/libs/lambda.ts',
+      sessionPatterns: ['sed -i -e 87,108d src/libs/lambda.ts'],
+      suppressPermanent: true,
+    })
+    expect(opts.map((o) => o.label)).toEqual([
+      'Allow once',
+      'Allow for session: sed -i -e 87,108d src/libs/lambda.ts',
+      'Deny',
+      'Deny with reason',
+    ])
+  })
+
+  it('offers View full command for multiline/long commands and returns via Back', async () => {
+    process.env.HERDR_ENV = '1'
+    const { pi } = makePi()
+    const { ui, select } = makeUi()
+    const fullCmd = "python3 - <<'EOF'\nprint('line 1')\nprint('line 2')\nEOF"
+    select
+      .mockResolvedValueOnce('View full command')
+      .mockResolvedValueOnce('Back')
+      .mockResolvedValueOnce('Allow once')
+    setUiContext(ui, true)
+
+    const resolver = createModalAskResolver(
+      pi,
+      new SessionRules(),
+      makeConfigState({ ui: { herdrSelectModal: true, modalTimeoutMs: -1 } })
+    )
+    const res = await resolver({
+      surface: 'shell',
+      tool: 'bash',
+      value: fullCmd,
+      fullCommand: fullCmd,
+      sessionPatterns: [fullCmd],
+    })
+
+    expect(res).toBe('allow')
+    expect(select).toHaveBeenCalledTimes(3)
+    expect(select.mock.calls[1][0]).toContain("print('line 2')")
+    expect(select.mock.calls[1][1]).toEqual(['Back'])
+  })
 })

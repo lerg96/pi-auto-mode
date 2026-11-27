@@ -58,12 +58,25 @@ interface ResolvedLlmCreds {
  * to `fallbackDecision(cfg, 'onError', e)`. Resolution never silently
  * passes through an empty string to `fetch`.
  */
+function isJevApi(llm: import('../types/config.ts').LlmConfig): boolean {
+  return llm.api === 'jev'
+}
+
 async function resolveLlmCredentials(
   llm: import('../types/config.ts').LlmConfig,
   models: ModelRegistryLike | undefined
 ): Promise<ResolvedLlmCreds> {
+  const jev = isJevApi(llm)
+
   // 1. apiKey
   let apiKey = llm.apiKey.trim()
+  if (!apiKey && jev) {
+    const envKey =
+      llm.provider === 'opencode'
+        ? process.env.OPENCODE_API_KEY?.trim()
+        : process.env.TYPESAFE_API_KEY?.trim()
+    if (envKey) apiKey = envKey
+  }
   if (!apiKey) {
     if (!models) {
       throw new LlmCredentialResolutionError(
@@ -83,6 +96,22 @@ async function resolveLlmCredentials(
 
   // 2. baseUrl
   let baseUrl = llm.baseUrl.trim()
+  if (!baseUrl && models && llm.model) {
+    const model = models.find(llm.provider, llm.model)
+    const resolvedUrl =
+      model && typeof model === 'object'
+        ? (model as { baseUrl?: unknown }).baseUrl
+        : undefined
+    if (typeof resolvedUrl === 'string' && resolvedUrl.trim().length > 0) {
+      baseUrl = resolvedUrl.trim()
+    }
+  }
+  if (!baseUrl && jev) {
+    baseUrl =
+      llm.provider === 'opencode'
+        ? 'https://opencode.ai/zen/v1'
+        : DEFAULT_JEV_BASE_URL
+  }
   if (!baseUrl) {
     if (!models) {
       throw new LlmCredentialResolutionError(
@@ -96,22 +125,10 @@ async function resolveLlmCredentials(
         'not configured, classifier.llm.model is empty (registry cannot resolve a baseUrl without a model id)'
       )
     }
-    const model = models.find(llm.provider, llm.model)
-    // The runtime `Model` from `@earendil-works/pi-ai` has a `baseUrl: string`
-    // field carrying the LiteLLM endpoint URL. We only read that field and
-    // tolerate unknown shapes (`unknown`) for forward-compat with future
-    // model kinds that might drop it.
-    const resolvedUrl =
-      model && typeof model === 'object'
-        ? (model as { baseUrl?: unknown }).baseUrl
-        : undefined
-    if (typeof resolvedUrl !== 'string' || resolvedUrl.trim().length === 0) {
-      throw new LlmCredentialResolutionError(
-        'baseUrl',
-        `Pi model registry has no baseUrl for provider "${llm.provider}" / model "${llm.model}"`
-      )
-    }
-    baseUrl = resolvedUrl.trim()
+    throw new LlmCredentialResolutionError(
+      'baseUrl',
+      `Pi model registry has no baseUrl for provider "${llm.provider}" / model "${llm.model}"`
+    )
   }
 
   return { apiKey, baseUrl }
@@ -130,10 +147,24 @@ import {
   safeHostname,
   type LlmCallResult,
 } from './llm-client.ts'
+import {
+  callJevWithFallback,
+  DEFAULT_JEV_BASE_URL,
+  DEFAULT_JEV_MIN_ALLOW_CONFIDENCE,
+  DEFAULT_JEV_MODEL,
+  mapJevResult,
+} from './jev-client.ts'
 
 const DEFAULT_SYSTEM =
   'You are a security classifier for an AI coding agent. Decide allow/block/ask ' +
-  'for the proposed tool call and return strict JSON: ' +
+  'for the proposed tool call.\n' +
+  'Policy:\n' +
+  '- NEVER return "allow" for SQL or NoSQL delete/destructive operations (e.g. DELETE, DROP, TRUNCATE, deleteOne, deleteMany, dropDatabase, dropCollection, FLUSHDB, FLUSHALL, DEL, DeleteItem, DeleteTable); return "ask" or "block".\n' +
+  '- NEVER return "allow" for file or directory deletions (e.g. rm, rmdir, unlink, shutil.rmtree, fs.rm, fs.unlink, os.remove) UNLESS every deleted target path is strictly inside /tmp with no ".." traversal.\n' +
+  '- NEVER return "allow" for rule circumvention (using python -c, node -e, sed -i, cat >, heredocs, or redirections to write/modify sensitive or restricted files such as .env, credentials, SSH/AWS configs, system configs, or paths outside the working directory).\n' +
+  '- NEVER return "allow" for modifying shared/production systems, publishing/posting to external services, credential/secret exfiltration, arbitrary remote code execution, or destructive git/system modifications.\n' +
+  '- Return "allow" only when the operation is clearly safe (read-only inspection, local build/typecheck/tests, or non-destructive local dev work). When uncertain or borderline, return "ask".\n' +
+  'Return strict JSON only: ' +
   '{"decision":"allow"|"block"|"ask","riskScore":0-10,"riskReason":"...","category":"..."}.'
 
 export interface ClassifierInput {
@@ -257,6 +288,33 @@ export function redactSecrets(text: string): string {
   // this: that model must be able to reissue the real path. See home-path.ts.
   out = maskHomePrefix(out)
   return out
+}
+
+function buildJevState(
+  input: ClassifierInput,
+  fileFragment?: string,
+  customPolicy?: string
+): string {
+  const redactedArgs = Object.fromEntries(
+    Object.entries(input.arguments ?? {}).map(([k, v]) => [
+      k,
+      typeof v === 'string' ? redactSecrets(v) : v,
+    ])
+  )
+  const args = redactSecrets(JSON.stringify(redactedArgs))
+  const value = redactSecrets(input.value ?? '')
+  const parts = [`Tool: ${input.toolName}`, `Surface: ${input.surface}`]
+  if (input.cwd && input.cwd.trim().length > 0) {
+    parts.push(`WorkingDirectory: ${redactSecrets(input.cwd.trim())}`)
+  }
+  parts.push(`Arguments: ${args}`, `Value: ${value}`)
+  if (fileFragment && fileFragment.trim().length > 0) {
+    parts.push(fileFragment)
+  }
+  if (customPolicy && customPolicy.trim().length > 0) {
+    parts.push(`AdditionalPolicy: ${customPolicy.trim()}`)
+  }
+  return parts.join('\n')
 }
 
 function buildLlmPrompt(
@@ -499,14 +557,35 @@ async function runLlmBranch(
         fileFragment = redactSecrets(formatFileExtraction(extracted))
       }
     }
-    const prompt = buildLlmPrompt(input, config, fileFragment)
-    // Resolve credentials lazily: per call (the user can switch Pi models
-    // mid-session). Empty config values fall through to the Pi model
-    // registry. A resolution failure routes to `fallbackDecision` so the
-    // gate's existing fail-closed path runs unchanged — we never throw
-    // out of `classifyToolCall` for a credential lookup miss.
     const creds = await resolveLlmCredentials(params.llm, deps.models)
     debugHost = safeHostname(creds.baseUrl)
+    const onAttempt = (a: import('./llm-client.ts').LlmAttempt): void => {
+      deps.debug?.record(
+        'llm:attempt',
+        input.requestId ? { ...a, requestId: input.requestId } : a
+      )
+    }
+
+    if (isJevApi(params.llm)) {
+      const jevRes = await callJevWithFallback({
+        baseUrl: creds.baseUrl,
+        apiKey: creds.apiKey,
+        model: params.llm.model.trim() || DEFAULT_JEV_MODEL,
+        fallbackModel: params.llm.fallbackModel,
+        state: buildJevState(input, fileFragment, params.llm.systemPrompt),
+        timeoutMs: params.llm.timeoutMs,
+        extraBody: params.llm.extraBody,
+        extraHeaders: params.llm.extraHeaders,
+        onAttempt,
+        retries: params.llm.retries,
+      })
+      return mapJevResult(
+        jevRes,
+        params.llm.minAllowConfidence ?? DEFAULT_JEV_MIN_ALLOW_CONFIDENCE
+      )
+    }
+
+    const prompt = buildLlmPrompt(input, config, fileFragment)
     const extraBody = input.requestId
       ? {
           ...(params.llm.extraBody ?? {}),
@@ -523,19 +602,12 @@ async function runLlmBranch(
       model: params.llm.model,
       fallbackModel: params.llm.fallbackModel,
       prompt,
-      systemPrompt: params.llm.systemPrompt ?? DEFAULT_SYSTEM,
+      systemPrompt: params.llm.systemPrompt?.trim() || DEFAULT_SYSTEM,
       timeoutMs: params.llm.timeoutMs,
       maxTokens: params.llm.maxTokens,
       extraBody,
       extraHeaders: params.llm.extraHeaders,
-      // Per-attempt diagnostics → debug jsonl (`llm:attempt` events).
-      // No-op when the debug recorder is absent or disabled.
-      onAttempt: (a) => {
-        deps.debug?.record(
-          'llm:attempt',
-          input.requestId ? { ...a, requestId: input.requestId } : a
-        )
-      },
+      onAttempt,
       retries: params.llm.retries,
     })
     return mapLlmResult(res, params)

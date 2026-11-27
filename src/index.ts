@@ -7,7 +7,6 @@ import type {
 import type { Config } from './types/config.ts'
 import {
   loadConfig,
-  watchConfig,
   isSecurityWeakening,
   resolveConfigPath,
 } from './config/config-loader.ts'
@@ -330,27 +329,6 @@ export default function piAutoMode(pi: ExtensionAPI): void {
   telemetry.subscribe(pi, debugLog)
 
   const denyService = new DenyAndContinueService(initialConfig.denyStrategy)
-
-  watchConfig(
-    cfgPath,
-    (cfg) => {
-      applyConfigReload(cfg, {
-        configState,
-        denyService,
-        telemetry,
-        debug: debugLog,
-        pi,
-      })
-    },
-    (err) => {
-      const message = err instanceof Error ? err.message : String(err)
-      console.warn(`pi-auto-mode: config reload failed: ${message}`)
-      notifyUi(
-        'pi-auto-mode: config reload failed, keeping previous config',
-        'warning'
-      )
-    }
-  )
 
   pi.on('session_start', (event, ctx) => {
     // Bind the UI surface early so any code that fires before the first

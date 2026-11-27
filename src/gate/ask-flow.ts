@@ -1,5 +1,10 @@
 import type { ClassifierResult } from '../classifier/llm-layer.ts'
-import type { PermissionState } from '../permission/rule.ts'
+import type { PermissionState, Rule } from '../permission/rule.ts'
+import {
+  captureScriptFingerprints,
+  areScriptFingerprintsIntact,
+  verifyScriptFingerprints,
+} from '../permission/script-fingerprint.ts'
 import {
   wildcardMatch,
   sessionPatternMatches,
@@ -110,6 +115,22 @@ function normalizePatternOrValue(str: string): string {
   return process.platform === 'win32' ? collapsed.toLowerCase() : collapsed
 }
 
+function isSessionRuleValid(
+  rule: Rule,
+  value: string,
+  deps: GateDeps,
+  cwd?: string
+): boolean {
+  if (!rule.scriptFingerprints || rule.scriptFingerprints.length === 0) {
+    return true
+  }
+  if (!areScriptFingerprintsIntact(rule.scriptFingerprints)) {
+    deps.sessionRules.remove(rule.surface, rule.pattern, rule.action)
+    return false
+  }
+  return verifyScriptFingerprints(rule.scriptFingerprints, value, cwd)
+}
+
 // Session allow short-circuit (Bug A fix)
 // Check if there's a session allow rule matching this surface and value
 export function trySessionAllow(
@@ -135,13 +156,14 @@ export function trySessionAllow(
       return false
     }
     const isWin = process.platform === 'win32'
+    let matched = false
     if (r.isExact) {
       const exactMatch = isWin
         ? r.pattern.toLowerCase() === value.toLowerCase()
         : r.pattern === value
       const normMatch =
         normalizePatternOrValue(r.pattern) === normalizePatternOrValue(value)
-      return (
+      matched =
         exactMatch ||
         normMatch ||
         sessionPatternMatches(r.pattern, value) ||
@@ -149,22 +171,23 @@ export function trySessionAllow(
           normalizePatternOrValue(r.pattern),
           normalizePatternOrValue(value)
         )
-      )
+    } else {
+      matched =
+        sessionPatternMatches(r.pattern, value) ||
+        sessionPatternMatches(
+          normalizePatternOrValue(r.pattern),
+          normalizePatternOrValue(value)
+        ) ||
+        normalizePatternOrValue(r.pattern) === normalizePatternOrValue(value) ||
+        (strippedValue !== value &&
+          (sessionPatternMatches(r.pattern, strippedValue) ||
+            sessionPatternMatches(
+              normalizePatternOrValue(r.pattern),
+              normalizePatternOrValue(strippedValue)
+            )))
     }
-    return (
-      sessionPatternMatches(r.pattern, value) ||
-      sessionPatternMatches(
-        normalizePatternOrValue(r.pattern),
-        normalizePatternOrValue(value)
-      ) ||
-      normalizePatternOrValue(r.pattern) === normalizePatternOrValue(value) ||
-      (strippedValue !== value &&
-        (sessionPatternMatches(r.pattern, strippedValue) ||
-          sessionPatternMatches(
-            normalizePatternOrValue(r.pattern),
-            normalizePatternOrValue(strippedValue)
-          )))
-    )
+    if (!matched) return false
+    return isSessionRuleValid(r, value, deps, detailCtx?.cwd)
   })
   if (!sessionApproved) return false
   emit(deps.hooks, surface, value, 'allow', 'session_allow', {
@@ -193,16 +216,39 @@ function applyAllowDecision(
   value: string,
   externalDir: ExternalDirAsk | undefined,
   toolName: string | undefined,
-  chosenPattern?: string
+  chosenPattern?: string,
+  cwd?: string
 ): AskVerdict {
   deps.denyService?.onContinueSucceeded()
   if (decision === 'allow') {
     return 'allow'
   }
+  const isShell =
+    surface === 'shell' || surface === 'bash' || surface === 'powershell'
+  const scriptFps = isShell ? captureScriptFingerprints(value, cwd) : []
+  if (
+    isShell &&
+    scriptFps.length === 0 &&
+    chosenPattern &&
+    chosenPattern !== value
+  ) {
+    const fromPattern = captureScriptFingerprints(chosenPattern, cwd)
+    if (fromPattern.length > 0) {
+      scriptFps.push(...fromPattern)
+    }
+  }
+  const fps = scriptFps.length > 0 ? scriptFps : undefined
+
   if (decision === 'allow_session') {
     const safePattern = chosenPattern ?? value
     const isExact = chosenPattern ? chosenPattern === value : true
-    deps.sessionRules.approveForSession(surface, safePattern, 'allow', isExact)
+    deps.sessionRules.approveForSession(
+      surface,
+      safePattern,
+      'allow',
+      isExact,
+      fps
+    )
     return 'allow_session'
   }
   if (decision === 'allow_permanent') {
@@ -228,7 +274,13 @@ function applyAllowDecision(
     }
     const safePattern = chosenPattern ?? value
     const isExact = chosenPattern ? chosenPattern === value : true
-    deps.sessionRules.approveForSession(surface, safePattern, 'allow', isExact)
+    deps.sessionRules.approveForSession(
+      surface,
+      safePattern,
+      'allow',
+      isExact,
+      fps
+    )
     persistPermanentAllow({
       surface: surface,
       pattern: safePattern,
@@ -255,6 +307,7 @@ function applyAllowDecision(
 
 export interface ResolveAskExtra {
   sessionPatterns?: string[]
+  suppressPermanent?: boolean
   segmentIndex?: number
   segmentTotal?: number
   askOrigin?: AskOrigin
@@ -325,6 +378,7 @@ export async function resolveAsk(
     type: externalDir?.isExternalDir ? 'external-directory' : 'tool-permission',
     externalDir: externalDir?.externalGrantDir ?? externalDir?.externalDirPath,
     sessionPatterns: extra?.sessionPatterns,
+    suppressPermanent: extra?.suppressPermanent,
     segmentIndex: extra?.segmentIndex,
     segmentTotal: extra?.segmentTotal,
     askOrigin,
@@ -343,7 +397,8 @@ export async function resolveAsk(
         value,
         externalDir,
         toolName,
-        pattern
+        pattern,
+        extra?.cwd
       ),
     }
   }

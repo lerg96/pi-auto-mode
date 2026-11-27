@@ -6,7 +6,7 @@ import {
   evaluatePermission,
 } from '../../src/permission/visibility.ts'
 import { applyMode } from '../../src/permission/modes.ts'
-import type { Config } from '../../src/types/config.ts'
+import { parseConfig, type Config } from '../../src/types/config.ts'
 
 function cfg(partial: Partial<Config>): Config {
   return {
@@ -30,6 +30,7 @@ function cfg(partial: Partial<Config>): Config {
       fallback: { onTimeout: 'ask-user', onError: 'ask-user' },
       onBlock: 'deny',
       onBlockUserOverride: false,
+      onlyFlagged: false,
     },
     denyStrategy: {
       mode: 'both',
@@ -509,5 +510,110 @@ describe('whitespace-mangled commands vs literal-space rules', () => {
     })
     // First match still wins, exactly as before the hardening.
     expect(resolveToolVisibility(c, 'bash', 'git  reset  --hard')).toBe('allow')
+  })
+})
+
+describe('PatternRule excluding tokens', () => {
+  it('blocks git show dangerous flags while allowing normal read-only usage', () => {
+    const c = cfg({
+      permissions: {
+        tools: {
+          bash: [
+            {
+              pattern: 'git show *',
+              action: 'allow',
+              excluding: ['--ext-diff', '--textconv', '--output', '--output=*'],
+            },
+            { pattern: '*', action: 'ask' },
+          ],
+        },
+      },
+    })
+
+    expect(evaluatePermission(c, 'tools', 'bash', 'git show HEAD').action).toBe(
+      'allow'
+    )
+    expect(
+      evaluatePermission(c, 'tools', 'bash', 'git show --stat abc123').action
+    ).toBe('allow')
+    expect(
+      evaluatePermission(c, 'tools', 'bash', 'git show HEAD:my--output.txt')
+        .action
+    ).toBe('allow')
+
+    expect(
+      evaluatePermission(c, 'tools', 'bash', 'git show --ext-diff HEAD').action
+    ).toBe('ask')
+    expect(
+      evaluatePermission(c, 'tools', 'bash', "git show '--ext-diff' HEAD")
+        .action
+    ).toBe('ask')
+    expect(
+      evaluatePermission(c, 'tools', 'bash', 'git show --textconv HEAD').action
+    ).toBe('ask')
+    expect(
+      evaluatePermission(c, 'tools', 'bash', 'git show --output /tmp/out HEAD')
+        .action
+    ).toBe('ask')
+    expect(
+      evaluatePermission(c, 'tools', 'bash', 'git show --output=/tmp/out HEAD')
+        .action
+    ).toBe('ask')
+    expect(
+      evaluatePermission(
+        c,
+        'tools',
+        'bash',
+        'git -c diff.external=evil show HEAD'
+      ).action
+    ).toBe('ask')
+  })
+
+  it('supports cat * excluding write redirections', () => {
+    const c = cfg({
+      permissions: {
+        tools: {
+          bash: [
+            {
+              pattern: 'cat *',
+              action: 'allow',
+              excluding: ['>', '>>', '>*', '*>*'],
+            },
+            { pattern: '*', action: 'ask' },
+          ],
+        },
+      },
+    })
+
+    expect(evaluatePermission(c, 'tools', 'bash', 'cat README.md').action).toBe(
+      'allow'
+    )
+    expect(
+      evaluatePermission(c, 'tools', 'bash', 'cat a > out.txt').action
+    ).toBe('ask')
+    expect(
+      evaluatePermission(c, 'tools', 'bash', 'cat a >> out.txt').action
+    ).toBe('ask')
+    expect(
+      evaluatePermission(c, 'tools', 'bash', 'cat a >out.txt').action
+    ).toBe('ask')
+    expect(evaluatePermission(c, 'tools', 'bash', 'cat a>out.txt').action).toBe(
+      'ask'
+    )
+    expect(
+      evaluatePermission(c, 'tools', 'bash', 'cat a 2>err.txt').action
+    ).toBe('ask')
+  })
+
+  it('rejects empty string entries in excluding via zod schema', () => {
+    expect(() =>
+      parseConfig({
+        permissions: {
+          tools: {
+            bash: [{ pattern: 'git show *', action: 'allow', excluding: [''] }],
+          },
+        },
+      })
+    ).toThrow()
   })
 })

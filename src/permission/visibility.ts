@@ -7,7 +7,7 @@ import type {
 } from '../types/config.ts'
 import { wildcardMatch } from './wildcard-matcher.ts'
 import { collapseWhitespaceForMatching } from '../classifier/pattern-matcher.ts'
-import { stripEnvPrefix } from './command-prefix.ts'
+import { stripEnvPrefix, tokenizeCommandWithSpans } from './command-prefix.ts'
 
 // ─── Legacy compat exports (tests only) ────────────────────────────────
 // These are the OLD API (tool:arg keys, wildcards). Kept so existing tests
@@ -60,7 +60,34 @@ function isPatternRuleArray(perm: ToolPermission): perm is PatternRule[] {
  * normalizing them would silently grant a call whose text the user never
  * wrote, turning a prompt into a pass. Normalization may only ever harden.
  */
-function ruleMatchesCall(rule: PatternRule, value: string): boolean {
+function unquoteToken(token: string): string {
+  if (
+    token.length >= 2 &&
+    ((token.startsWith("'") && token.endsWith("'")) ||
+      (token.startsWith('"') && token.endsWith('"')))
+  ) {
+    return token.slice(1, -1)
+  }
+  return token
+}
+
+function isExcludedByTokens(
+  excluding: string[] | undefined,
+  value: string
+): boolean {
+  if (!excluding || excluding.length === 0) return false
+  const tokens = tokenizeCommandWithSpans(value)
+  for (const { token } of tokens) {
+    const unquoted = unquoteToken(token)
+    for (const excl of excluding) {
+      if (wildcardMatch(excl, token)) return true
+      if (unquoted !== token && wildcardMatch(excl, unquoted)) return true
+    }
+  }
+  return false
+}
+
+function patternMatchesCall(rule: PatternRule, value: string): boolean {
   if (wildcardMatch(rule.pattern, value)) return true
 
   const stripped = stripEnvPrefix(value)
@@ -81,6 +108,12 @@ function ruleMatchesCall(rule: PatternRule, value: string): boolean {
   const collapsed = collapseWhitespaceForMatching(value)
   if (collapsed === value) return false
   return wildcardMatch(rule.pattern, collapsed)
+}
+
+function ruleMatchesCall(rule: PatternRule, value: string): boolean {
+  if (!patternMatchesCall(rule, value)) return false
+  if (isExcludedByTokens(rule.excluding, value)) return false
+  return true
 }
 
 /**
@@ -142,7 +175,7 @@ function evaluatePermissionsBlock(
  */
 export interface PermissionEvaluation {
   action: Visibility
-  matchedRule?: { pattern: string; reason?: string }
+  matchedRule?: { pattern: string; reason?: string; classify?: boolean }
 }
 
 /**
@@ -154,7 +187,10 @@ function evaluatePermissionsBlockWithRule(
   name: string,
   callValue: string | undefined
 ):
-  | { action: SimpleAction; matchedRule?: { pattern: string; reason?: string } }
+  | {
+      action: SimpleAction
+      matchedRule?: { pattern: string; reason?: string; classify?: boolean }
+    }
   | undefined {
   if (!block) return undefined
   const map = block[namespace]
@@ -175,7 +211,11 @@ function evaluatePermissionsBlockWithRule(
     if (match)
       return {
         action: match.action,
-        matchedRule: { pattern: match.pattern, reason: match.reason },
+        matchedRule: {
+          pattern: match.pattern,
+          reason: match.reason,
+          ...(match.classify !== undefined ? { classify: match.classify } : {}),
+        },
       }
     return undefined
   }
@@ -199,7 +239,8 @@ function resolveCascadeWithRule(
   }
 
   let decision: SimpleAction | undefined
-  let matchedRule: { pattern: string; reason?: string } | undefined
+  let matchedRule:
+    { pattern: string; reason?: string; classify?: boolean } | undefined
 
   for (const source of sources) {
     const result = evaluatePermissionsBlockWithRule(
@@ -307,4 +348,32 @@ export function evaluatePermission(
       matchedRule: undefined,
     }
   )
+}
+
+export function getExistingAllowPatterns(
+  cfg: Config,
+  toolName: string
+): Set<string> {
+  const patterns = new Set<string>()
+  const sources: PermissionsBlock[] = [cfg.permissions]
+  for (const setId of cfg.activePermissionSets ?? []) {
+    const set = cfg.permissionSets[setId]
+    if (set?.permissions) sources.push(set.permissions)
+  }
+  for (const source of sources) {
+    const map = source.tools
+    if (!map) continue
+    const perm =
+      map[toolName] ??
+      (toolName === 'bash' || toolName === 'powershell'
+        ? (map['shell'] ?? map['bash'])
+        : undefined)
+    if (!perm || !isPatternRuleArray(perm)) continue
+    for (const rule of perm) {
+      if (rule.action === 'allow') {
+        patterns.add(rule.pattern)
+      }
+    }
+  }
+  return patterns
 }

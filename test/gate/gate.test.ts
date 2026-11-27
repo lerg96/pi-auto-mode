@@ -6,7 +6,9 @@ import {
   resetSessionRulesRegistry,
 } from '../../src/permission/session-rules.ts'
 import { DenyAndContinueService } from '../../src/deny/deny-service.ts'
-import { resolve } from 'node:path'
+import { resolve, join } from 'node:path'
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import {
   setAskResolver,
   getAskResolver,
@@ -55,6 +57,7 @@ const config: Config = {
     fallback: { onTimeout: 'ask-user', onError: 'ask-user' },
     onBlock: 'deny',
     onBlockUserOverride: false,
+    onlyFlagged: false,
   },
   denyStrategy: {
     mode: 'both',
@@ -85,7 +88,7 @@ function makeDeps(): GateDeps {
         risk: { score: 7, level: 'high', reason: 'x', category: 'x' },
       }
     }
-    return { decision: 'allow' }
+    return { decision: 'ask' }
   }
   return { configState, sessionRules, hooks: {}, classify, denyService }
 }
@@ -471,7 +474,7 @@ describe('gateToolCall', () => {
         },
       },
       classify: async (): Promise<ClassifierResult> => ({
-        decision: 'allow',
+        decision: 'ask',
       }),
     }
     setAskResolver(async () => ({ decision: 'deny', via: 'no-ui' }))
@@ -511,7 +514,7 @@ describe('gateToolCall', () => {
         },
       },
       classify: async (): Promise<ClassifierResult> => ({
-        decision: 'allow',
+        decision: 'ask',
       }),
     }
     setAskResolver(async () => ({ decision: 'deny', via: 'timeout' }))
@@ -549,7 +552,7 @@ describe('gateToolCall', () => {
         },
       },
       classify: async (): Promise<ClassifierResult> => ({
-        decision: 'allow',
+        decision: 'ask',
       }),
     }
     setAskResolver(async () => ({ decision: 'allow', via: 'parent-modal' }))
@@ -584,7 +587,7 @@ describe('gateToolCall', () => {
       },
     })
     const classify = async (): Promise<ClassifierResult> => ({
-      decision: 'allow',
+      decision: 'ask',
     })
     const deps = { configState, sessionRules, hooks: {}, classify, denyService }
 
@@ -623,7 +626,7 @@ describe('gateToolCall', () => {
       escalation: { consecutive: 3, total: 20 },
     })
     const classify = async (): Promise<ClassifierResult> => ({
-      decision: 'allow',
+      decision: 'ask',
     })
     const deps = { configState, sessionRules, hooks: {}, classify, denyService }
 
@@ -966,7 +969,7 @@ describe('gateToolCall', () => {
           },
         })
         const deps = askDepsWithCapture([], async () => ({
-          decision: 'allow',
+          decision: 'ask',
         }))
         let capturedReason: string | undefined
         setAskResolver(async ({ rule }) => {
@@ -989,7 +992,7 @@ describe('gateToolCall', () => {
           },
         })
         const deps = askDepsWithCapture([], async () => ({
-          decision: 'allow',
+          decision: 'ask',
         }))
         let capturedReason: string | undefined
         setAskResolver(async ({ rule }) => {
@@ -1016,7 +1019,7 @@ describe('gateToolCall', () => {
           },
         })
         const deps = askDepsWithCapture([], async () => ({
-          decision: 'allow',
+          decision: 'ask',
         }))
         let capturedReason: string | undefined
         setAskResolver(async ({ rule }) => {
@@ -1160,7 +1163,7 @@ describe('decision training fields: ruleId, strategy, userVerdict', () => {
 
   it('ruleId is a stable sha1(surface|pattern); no strategy on ask-branch events', async () => {
     configState.set(askCfg())
-    const { deps, events } = captureDeps(allowClassify)
+    const { deps, events } = captureDeps(async () => ({ decision: 'ask' }))
     setAskResolver(async () => 'allow')
     try {
       await gateToolCall('bash', { command: 'maybe this' }, deps)
@@ -1180,7 +1183,7 @@ describe('decision training fields: ruleId, strategy, userVerdict', () => {
 
   it('allow_session verdict is recorded distinctly from allow', async () => {
     configState.set(askCfg())
-    const { deps, events } = captureDeps(allowClassify)
+    const { deps, events } = captureDeps(async () => ({ decision: 'ask' }))
     setAskResolver(async () => 'allow_session')
     try {
       await gateToolCall('bash', { command: 'maybe that' }, deps)
@@ -2290,6 +2293,531 @@ rm -f /tmp/agy1.txt /tmp/agy2.txt /tmp/agy3.txt`
       )
       expect(overrideDenyEvent?.userVerdict).toBe('deny')
       expect(overrideDenyEvent?.decidedBy).toBe('user')
+    })
+  })
+
+  describe('script fingerprinting and session invalidation', () => {
+    let scriptDir: string
+
+    beforeEach(() => {
+      scriptDir = mkdtempSync(join(tmpdir(), 'pi-gate-script-test-'))
+    })
+
+    afterEach(() => {
+      setAskResolver(getAskResolver())
+      try {
+        rmSync(scriptDir, { recursive: true, force: true })
+      } catch {
+        // ignore cleanup errors
+      }
+    })
+
+    it('records script fingerprints on allow_session and short-circuits unchanged script', async () => {
+      const askConfig = {
+        ...config,
+        permissions: {
+          tools: {
+            bash: [{ pattern: '*', action: 'ask' }],
+          },
+        },
+      }
+      configState.set(askConfig)
+      const deps = makeDeps()
+
+      const scriptPath = join(scriptDir, 'test.py')
+      writeFileSync(scriptPath, 'print("version 1")\n')
+      const command = `python3 ${scriptPath}`
+
+      let askCount = 0
+      setAskResolver(async () => {
+        askCount++
+        return {
+          decision: 'allow_session',
+          pattern: 'python3 *',
+        }
+      })
+
+      // First run prompts user and saves session rule with fingerprints
+      await gateToolCall('bash', { command }, deps)
+      expect(askCount).toBe(1)
+      const rule = deps.sessionRules
+        .snapshot()
+        .find((r) => r.pattern === 'python3 *')
+      expect(rule).toBeDefined()
+      expect(rule?.scriptFingerprints).toHaveLength(1)
+      expect(rule?.scriptFingerprints?.[0].path).toBe(resolve(scriptPath))
+
+      // Second run with unchanged content short-circuits without prompting
+      await gateToolCall('bash', { command }, deps)
+      expect(askCount).toBe(1)
+    })
+
+    it('invalidates and removes session rule when script content is modified, prompting again', async () => {
+      const askConfig = {
+        ...config,
+        permissions: {
+          tools: {
+            bash: [{ pattern: '*', action: 'ask' }],
+          },
+        },
+      }
+      configState.set(askConfig)
+      const deps = makeDeps()
+
+      const scriptPath = join(scriptDir, 'run.sh')
+      writeFileSync(scriptPath, '#!/bin/bash\necho "initial"\n')
+      const command = `${scriptPath} "some-arg"`
+
+      let askCount = 0
+      setAskResolver(async () => {
+        askCount++
+        return {
+          decision: 'allow_session',
+          pattern: `${scriptPath} *`,
+        }
+      })
+
+      // 1. Initial call prompts and approves
+      await gateToolCall('bash', { command }, deps)
+      expect(askCount).toBe(1)
+      expect(deps.sessionRules.snapshot()).toHaveLength(1)
+
+      // 2. Modify the script content
+      writeFileSync(scriptPath, '#!/bin/bash\necho "modified content"\n')
+
+      // 3. Second call detects modified script, removes session rule, and prompts again
+      await gateToolCall('bash', { command }, deps)
+      expect(askCount).toBe(2)
+    })
+
+    it('handles exact user scenario with /tmp/cw/q.sh and compound segments', async () => {
+      const askConfig = {
+        ...config,
+        permissions: {
+          tools: {
+            bash: [
+              { pattern: 'date *', action: 'allow' as const },
+              { pattern: '*', action: 'ask' as const },
+            ],
+          },
+        },
+      }
+      configState.set(askConfig)
+      const deps = makeDeps()
+
+      const scriptPath = join(scriptDir, 'q.sh')
+      writeFileSync(scriptPath, '#!/bin/bash\necho "querying logs"\n')
+
+      const cmd = `${scriptPath} "/ecs/alegra-app-production/nginx" $(date +%s) $(date +%s) 'filter request'`
+
+      let askCount = 0
+      setAskResolver(async () => {
+        askCount++
+        return {
+          decision: 'allow_session',
+          pattern: `${scriptPath} *`,
+        }
+      })
+
+      // 1. Approved on first call
+      await gateToolCall('bash', { command: cmd }, deps)
+      expect(askCount).toBe(1)
+
+      // 2. Unchanged script runs without prompting
+      await gateToolCall('bash', { command: cmd }, deps)
+      expect(askCount).toBe(1)
+
+      // 3. Modified script invalidates rule and prompts user again
+      writeFileSync(scriptPath, '#!/bin/bash\necho "tampered query"\n')
+      await gateToolCall('bash', { command: cmd }, deps)
+      expect(askCount).toBe(2)
+    })
+
+    it('detects tampering of nested script (q.sh -> parse.py attack vector) in gate E2E', async () => {
+      const askConfig = {
+        ...config,
+        permissions: {
+          tools: {
+            bash: [{ pattern: '*', action: 'ask' as const }],
+          },
+        },
+      }
+      configState.set(askConfig)
+      const deps = makeDeps()
+
+      const qPath = join(scriptDir, 'q.sh')
+      const parsePath = join(scriptDir, 'parse.py')
+      writeFileSync(
+        qPath,
+        `if [ "$S" = "Complete" ]; then echo "$R" | python3 "${parsePath}"; break; fi\n`
+      )
+      writeFileSync(parsePath, 'print("initial parse")\n')
+
+      const cmd = `bash ${qPath} arg1`
+
+      let askCount = 0
+      setAskResolver(async () => {
+        askCount++
+        return {
+          decision: 'allow_session',
+          pattern: `bash ${qPath} *`,
+        }
+      })
+
+      // 1. First run prompts user and saves session rule with fingerprints for BOTH q.sh and parse.py
+      await gateToolCall('bash', { command: cmd }, deps)
+      expect(askCount).toBe(1)
+      const rule = deps.sessionRules
+        .snapshot()
+        .find((r) => r.pattern === `bash ${qPath} *`)
+      expect(rule).toBeDefined()
+      expect(rule?.scriptFingerprints).toHaveLength(2)
+
+      // 2. Second run without tampering passes without prompt
+      await gateToolCall('bash', { command: cmd }, deps)
+      expect(askCount).toBe(1)
+
+      // 3. Agent modifies ONLY parse.py (leaving q.sh untouched)
+      writeFileSync(parsePath, 'print("malicious parse")\n')
+
+      // 4. Third run detects hash mismatch on parse.py, invalidates session rule, and prompts again
+      await gateToolCall('bash', { command: cmd }, deps)
+      expect(askCount).toBe(2)
+    })
+
+    it('tracks cd across multi-segment shell commands and verifies script fingerprints relative to effective cwd', async () => {
+      const askConfig = {
+        ...config,
+        permissions: {
+          tools: {
+            bash: [
+              { pattern: 'cd *', action: 'allow' as const },
+              { pattern: '*', action: 'ask' as const },
+            ],
+          },
+        },
+      }
+      configState.set(askConfig)
+      const deps = makeDeps()
+
+      const qPath = join(scriptDir, 'q.sh')
+      writeFileSync(qPath, '#!/bin/bash\necho "running in target dir"\n')
+
+      // Command changes directory then executes relative script
+      const cmd = `cd ${scriptDir} && ./q.sh arg1`
+
+      let askCount = 0
+      setAskResolver(async () => {
+        askCount++
+        return {
+          decision: 'allow_session',
+          pattern: `./q.sh *`,
+        }
+      })
+
+      // 1. First run: cd allows, ./q.sh prompts and is approved with session rule
+      await gateToolCall('bash', { command: cmd }, deps)
+      expect(askCount).toBe(1)
+
+      const rule = deps.sessionRules
+        .snapshot()
+        .find((r) => r.pattern === `./q.sh *`)
+      expect(rule).toBeDefined()
+      expect(rule?.scriptFingerprints).toHaveLength(1)
+      expect(rule?.scriptFingerprints?.[0].path).toBe(resolve(qPath))
+
+      // 2. Second run with unchanged script: short-circuits without prompt
+      await gateToolCall('bash', { command: cmd }, deps)
+      expect(askCount).toBe(1)
+
+      // 3. Modify script in target dir
+      writeFileSync(qPath, '#!/bin/bash\necho "tampered script"\n')
+
+      // 4. Third run detects hash mismatch, removes session rule, prompts user again
+      await gateToolCall('bash', { command: cmd }, deps)
+      expect(askCount).toBe(2)
+    })
+  })
+
+  describe('selective classifier (classifier.onlyFlagged & PatternRule.classify)', () => {
+    it('onlyFlagged=true skips LLM for unflagged ask rules and prompts user directly', async () => {
+      configState.set({
+        ...config,
+        classifier: {
+          ...config.classifier,
+          enabled: true,
+          onlyFlagged: true,
+        },
+        permissions: {
+          tools: {
+            bash: [
+              { pattern: 'python3 *', action: 'ask', classify: true },
+              { pattern: '*', action: 'ask' },
+            ],
+          },
+        },
+      })
+      const classified: string[] = []
+      const events: Array<Record<string, unknown>> = []
+      const deps: GateDeps = {
+        ...makeDeps(),
+        classify: async (inp) => {
+          classified.push(inp.value)
+          return { decision: 'allow' }
+        },
+        hooks: {
+          emit: (_ch, data) => {
+            events.push(data as Record<string, unknown>)
+          },
+        },
+      }
+      let askCount = 0
+      setAskResolver(async () => {
+        askCount++
+        return { decision: 'allow_once' }
+      })
+
+      await gateToolCall('bash', { command: 'curl https://example.com' }, deps)
+      expect(classified).toEqual([])
+      expect(askCount).toBe(1)
+      expect(events[0]?.resolution).toBe('permission_ask')
+    })
+
+    it('onlyFlagged=false auto-approves unflagged ask rule when LLM returns allow', async () => {
+      configState.set({
+        ...config,
+        classifier: {
+          ...config.classifier,
+          enabled: true,
+          onlyFlagged: false,
+        },
+        permissions: {
+          tools: {
+            bash: [{ pattern: '*', action: 'ask' }],
+          },
+        },
+      })
+      const classified: string[] = []
+      const events: Array<Record<string, unknown>> = []
+      const deps: GateDeps = {
+        ...makeDeps(),
+        classify: async (inp) => {
+          classified.push(inp.value)
+          return {
+            decision: 'allow',
+            risk: { score: 1, level: 'low', reason: 'safe command' },
+          }
+        },
+        hooks: {
+          emit: (_ch, data) => {
+            events.push(data as Record<string, unknown>)
+          },
+        },
+      }
+      let askCount = 0
+      setAskResolver(async () => {
+        askCount++
+        return { decision: 'allow_once' }
+      })
+
+      await gateToolCall('bash', { command: 'echo hello' }, deps)
+      expect(classified).toEqual(['echo hello'])
+      expect(askCount).toBe(0)
+      expect(events[0]?.resolution).toBe('classifier_allow')
+      expect(events[0]?.decidedBy).toBe('classifier')
+    })
+
+    it('auto-approves flagged ask rule without prompting when LLM returns allow', async () => {
+      configState.set({
+        ...config,
+        classifier: {
+          ...config.classifier,
+          enabled: true,
+          onlyFlagged: true,
+        },
+        permissions: {
+          tools: {
+            bash: [
+              { pattern: 'python3 *', action: 'ask', classify: true },
+              { pattern: '*', action: 'ask' },
+            ],
+          },
+        },
+      })
+      const classified: string[] = []
+      const events: Array<Record<string, unknown>> = []
+      const deps: GateDeps = {
+        ...makeDeps(),
+        classify: async (inp) => {
+          classified.push(inp.value)
+          return {
+            decision: 'allow',
+            risk: { score: 1, level: 'low', reason: 'safe script' },
+          }
+        },
+        hooks: {
+          emit: (_ch, data) => {
+            events.push(data as Record<string, unknown>)
+          },
+        },
+      }
+      let askCount = 0
+      setAskResolver(async () => {
+        askCount++
+        return { decision: 'allow_once' }
+      })
+
+      await gateToolCall('bash', { command: 'python3 -c "print(1)"' }, deps)
+      expect(classified).toEqual(['python3 -c print(1)'])
+      expect(askCount).toBe(0)
+      expect(events[0]?.resolution).toBe('classifier_allow')
+      expect(events[0]?.decidedBy).toBe('classifier')
+    })
+
+    it('falls back to human modal when LLM returns ask on a flagged rule', async () => {
+      configState.set({
+        ...config,
+        classifier: {
+          ...config.classifier,
+          enabled: true,
+          onlyFlagged: true,
+        },
+        permissions: {
+          tools: {
+            bash: [{ pattern: 'python3 *', action: 'ask', classify: true }],
+          },
+        },
+      })
+      const deps: GateDeps = {
+        ...makeDeps(),
+        classify: async () => ({
+          decision: 'ask',
+          risk: { score: 6, level: 'medium', reason: 'deletes files' },
+        }),
+      }
+      let askCount = 0
+      setAskResolver(async () => {
+        askCount++
+        return { decision: 'allow_once' }
+      })
+
+      await gateToolCall('bash', { command: 'python3 cleanup.py' }, deps)
+      expect(askCount).toBe(1)
+    })
+
+    it('onlyFlagged=true on multi-segment shell classifies only flagged segment and still prompts for unflagged segment', async () => {
+      configState.set({
+        ...config,
+        classifier: {
+          ...config.classifier,
+          enabled: true,
+          onlyFlagged: true,
+        },
+        permissions: {
+          tools: {
+            bash: [
+              { pattern: 'python3 *', action: 'ask', classify: true },
+              { pattern: '*', action: 'ask' },
+            ],
+          },
+        },
+      })
+      const classified: string[] = []
+      const prompted: string[] = []
+      const deps: GateDeps = {
+        ...makeDeps(),
+        classify: async (inp) => {
+          classified.push(inp.value)
+          return {
+            decision: 'allow',
+            risk: { score: 1, level: 'low', reason: 'safe script' },
+          }
+        },
+      }
+      setAskResolver(async (req) => {
+        prompted.push(req.value)
+        return { decision: 'allow_once' }
+      })
+
+      await gateToolCall(
+        'bash',
+        { command: 'python3 -c "print(1)" && curl https://example.com' },
+        deps
+      )
+      expect(classified).toEqual(['python3 -c print(1)'])
+      expect(prompted).toEqual(['curl https://example.com'])
+    })
+
+    it('never auto-approves an external_directory ask even if tool rule has classify=true', async () => {
+      configState.set({
+        ...config,
+        confineToWorkingDirectory: true,
+        externalDirectoryTools: ['bash'],
+        classifier: {
+          ...config.classifier,
+          enabled: true,
+          onlyFlagged: true,
+        },
+        permissions: {
+          tools: {
+            bash: [{ pattern: 'python3 *', action: 'ask', classify: true }],
+          },
+          external_directory: {
+            '/etc/*': 'ask',
+          },
+        },
+      })
+      const classified: string[] = []
+      const deps: GateDeps = {
+        ...makeDeps(),
+        classify: async (inp) => {
+          classified.push(inp.value)
+          return { decision: 'allow' }
+        },
+      }
+      let askCount = 0
+      setAskResolver(async () => {
+        askCount++
+        return { decision: 'allow_once' }
+      })
+
+      await gateToolCall(
+        'bash',
+        { command: 'python3 /etc/hosts', cwd: process.cwd() },
+        deps
+      )
+      expect(classified).toEqual([])
+      expect(askCount).toBe(1)
+    })
+
+    it('filters already-allowed wildcard patterns (e.g. sed * with excluding) from sessionPatterns and sets suppressPermanent=true', async () => {
+      configState.set({
+        ...config,
+        classifier: { ...config.classifier, enabled: false },
+        permissions: {
+          tools: {
+            bash: [
+              { pattern: 'sed *', action: 'allow', excluding: ['-i', '-i*'] },
+              { pattern: '*', action: 'ask' },
+            ],
+          },
+        },
+      })
+      let capturedPatterns: string[] | undefined
+      let capturedSuppress: boolean | undefined
+      setAskResolver(async (req) => {
+        capturedPatterns = req.sessionPatterns
+        capturedSuppress = req.suppressPermanent
+        return { decision: 'allow' }
+      })
+
+      await gateToolCall(
+        'bash',
+        { command: "sed -i -e '87,108d' src/libs/lambda.ts" },
+        makeDeps()
+      )
+      expect(capturedPatterns).toEqual(['sed -i -e 87,108d src/libs/lambda.ts'])
+      expect(capturedSuppress).toBe(true)
     })
   })
 })

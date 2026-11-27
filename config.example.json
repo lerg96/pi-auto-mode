@@ -7,6 +7,16 @@
       "bash": [
         { "pattern": "aws get_*", "action": "allow" },
         {
+          "pattern": "git show *",
+          "action": "allow",
+          "excluding": ["--ext-diff", "--textconv", "--output", "--output=*"]
+        },
+        {
+          "pattern": "python3 *",
+          "action": "ask",
+          "classify": true
+        },
+        {
           "pattern": "aws delete_*",
           "action": "deny",
           "reason": "destructive command not allowed"
@@ -55,8 +65,10 @@
   "externalDirectoryTools": ["bash", "write", "edit", "read"],
   "classifier": {
     "enabled": true,
+    "onlyFlagged": false,
     "llm": {
       "provider": "anthropic",
+      "api": "openai-completions",
       "model": "claude-opus-4",
       "baseUrl": "",
       "apiKey": "",

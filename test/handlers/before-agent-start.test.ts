@@ -28,6 +28,7 @@ function cfg(partial: Partial<Config>): Config {
       fallback: { onTimeout: 'ask-user', onError: 'ask-user' },
       onBlock: 'deny',
       onBlockUserOverride: false,
+      onlyFlagged: false,
     },
     denyStrategy: {
       mode: 'both',

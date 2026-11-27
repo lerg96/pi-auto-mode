@@ -36,6 +36,7 @@ export interface AskRequest {
    */
   externalDir?: string
   sessionPatterns?: string[]
+  suppressPermanent?: boolean
   segmentIndex?: number
   segmentTotal?: number
   askOrigin?: AskOrigin

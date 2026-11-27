@@ -14,7 +14,8 @@
     "test": "jest --coverage",
     "test:watch": "jest --watch",
     "build": "tsc -p tsconfig.json",
-    "prepare": "husky"
+    "prepare": "husky",
+    "dataset:export": "node --experimental-strip-types src/telemetry/dataset-exporter.ts"
   },
   "dependencies": {
     "tree-sitter-wasms": "^0.1.13",

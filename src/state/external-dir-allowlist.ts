@@ -64,6 +64,24 @@ export function addExternalDirAllow(dir: string): void {
   registry().allowlist.add(normalized)
 }
 
+/** Snapshot del allowlist global como array de paths. */
+export function getExternalDirAllowlist(): string[] {
+  return [...registry().allowlist]
+}
+
+/**
+ * Eliminar un directorio del allowlist global.
+ * Intenta eliminar tanto `dir` como su forma normalizada `normalizeAllowPath(dir)`.
+ * Retorna true si se eliminó alguna entrada, false de lo contrario.
+ */
+export function removeExternalDirAllow(dir: string): boolean {
+  const { allowlist } = registry()
+  const normalized = normalizeAllowPath(dir)
+  const deletedRaw = allowlist.delete(dir)
+  const deletedNorm = allowlist.delete(normalized)
+  return deletedRaw || deletedNorm
+}
+
 /**
  * Verificar si un path está permitido por el allowlist global.
  * Compara con `${dir}/**` para cada entrada usando wildcardMatch.

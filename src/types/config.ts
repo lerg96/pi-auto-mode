@@ -55,10 +55,14 @@ const patternRule = z.object({
   pattern: z.string(),
   action: simpleAction,
   reason: z.string().optional(),
+  excluding: z.array(z.string().min(1)).optional(),
+  classify: z.boolean().optional(),
 }) satisfies z.ZodType<{
   pattern: string
   action: 'allow' | 'deny' | 'ask'
   reason?: string
+  excluding?: string[]
+  classify?: boolean
 }>
 
 // Permiso por tool: puede ser acción simple (string) O array de PatternRule[]
@@ -88,6 +92,13 @@ const llmConfig = z
     //   find(provider, model)?.baseUrl   y   getApiKeyForProvider(provider)
     // Cualquier ID configurado en Pi (ej. 'litellm', 'anthropic', 'ollama') es válido.
     provider: z.string().min(1).default('anthropic'),
+    // Protocolo HTTP del clasificador:
+    //   'openai-completions' (default): POST <baseUrl>/chat/completions
+    //   'jev': TypeSafe AI System One (POST <baseUrl>/systemone)
+    api: z.enum(['openai-completions', 'jev']).optional(),
+    // Umbral mínimo de confianza/probabilidad (0..1) para que Jev auto-apruebe
+    // un `choice: 'allow'`. Por debajo cae fail-closed a `ask`. Default 0.85.
+    minAllowConfidence: z.number().min(0).max(1).optional(),
     model: z.string().default(''),
     // '' (vacío) → resuelve lazy desde modelRegistry de Pi por call.
     baseUrl: z.string().default(''),
@@ -149,6 +160,7 @@ const fallbackConfig = z
 const classifierConfig = z
   .object({
     enabled: z.boolean().default(true),
+    onlyFlagged: z.boolean().default(false),
     llm: llmConfig,
     fallback: fallbackConfig,
     // 'deny' (default) → muro absoluto; 'ask' → pasa a denyStrategy
@@ -159,6 +171,7 @@ const classifierConfig = z
   })
   .default({
     enabled: true,
+    onlyFlagged: false,
     llm: {
       provider: 'anthropic',
       model: '',
@@ -413,6 +426,8 @@ export interface PatternRule {
   pattern: string
   action: SimpleAction
   reason?: string
+  excluding?: string[]
+  classify?: boolean
 }
 
 export type ToolPermission = SimpleAction | PatternRule[]
@@ -430,6 +445,8 @@ export interface PermissionSet {
 
 export interface LlmConfig {
   provider: string
+  api?: 'openai-completions' | 'jev'
+  minAllowConfidence?: number
   model: string
   baseUrl: string
   apiKey: string
@@ -451,6 +468,7 @@ export interface LlmRetryPolicy {
 
 export interface ClassifierConfig {
   enabled?: boolean
+  onlyFlagged?: boolean
   llm: LlmConfig
   fallback: {
     onTimeout: 'ask-user' | 'deny' | 'allow'

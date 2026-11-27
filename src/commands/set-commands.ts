@@ -1,8 +1,14 @@
-import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
+import type {
+  ExtensionAPI,
+  ExtensionCommandContext,
+} from '@earendil-works/pi-coding-agent'
 import type { Config } from '../types/config.ts'
 import { composeActiveSets } from '../permission/compose.ts'
 import { getAskResolver } from '../gate/ask.ts'
 import type { configState } from '../state/config-state.ts'
+import { SessionRules } from '../permission/session-rules.ts'
+import { setUiContext } from '../state/ui-context.ts'
+import { openPermissionsListModal } from '../ui/permissions-list-modal.ts'
 
 // H7: changing `activePermissionSets` is a privileged, runtime elevation of privileges.
 // We reuse the same ask-resolver the gate uses (getAskResolver) so the user
@@ -92,8 +98,42 @@ export function setMode(config: Config, mode: string): ModeChange {
 
 export function registerSetCommands(
   pi: ExtensionAPI,
-  state: typeof configState
+  state: typeof configState,
+  sessionRules: SessionRules = new SessionRules()
 ): void {
+  const handlePermissionsList = async (
+    _args: string,
+    ctx: ExtensionCommandContext
+  ): Promise<void> => {
+    if (ctx.ui) {
+      setUiContext(ctx.ui, ctx.hasUI)
+    }
+    const opened = await openPermissionsListModal({
+      configState: state,
+      sessionRules,
+      ui: ctx.ui,
+      hasUI: ctx.hasUI,
+    })
+    if (!opened) {
+      ctx.ui?.notify(
+        'Permissions list modal requires an interactive UI.',
+        'warning'
+      )
+    }
+  }
+
+  pi.registerCommand('permissions-list', {
+    description:
+      'Open interactive modal to view, add (a), and delete (d) permanent and session permissions.',
+    handler: handlePermissionsList,
+  })
+
+  pi.registerCommand('auto-mode:permissions', {
+    description:
+      'Alias for /permissions-list: manage permanent and session permissions.',
+    handler: handlePermissionsList,
+  })
+
   pi.registerCommand('auto-mode:sets', {
     description:
       'Activate/deactivate permission sets at runtime. Usage: activate <name> | deactivate <name> | list',

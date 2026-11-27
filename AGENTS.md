@@ -14,17 +14,20 @@ Instrucciones operativas para agentes de IA que trabajen en **pi-auto-mode**. L�
 
 ```
 src/            Código de la extensión (entrada: src/index.ts)
-  gate/         Orquesta tool calls: normalize.ts, gate.ts, ask.ts (decisión allow/deny/ask)
-  permission/   Compone y evalúa permission sets: visibility.ts, wildcard-matcher.ts, modes.ts, session-rules.ts
-  classifier/   Riesgo: block-rules.ts, pattern-matcher.ts, rule-evaluator.ts, secret-guard.ts, llm-layer.ts
-  config/       Carga + validación zod de config.json (fail-closed): config-loader.ts
-  commands/     Slash commands (set-commands.ts)
-  deny/         Estrategia deny-and-continue (deny-service.ts)
-  state/        Estado global en memoria (config-state.ts)
-  ui/           Interfaz de confirmación (permission-modal.ts, ui-prompt.ts)
-  telemetry/    Logging de eventos (telemetry.ts)
-  types/        Tipos zod de config (config.ts) + tipos del TUI (pi-tui.d.ts)
+  gate/         Orquesta tool calls: gate.ts, normalize.ts, ask.ts, ask-flow.ts, ask-audit.ts, classifier-block.ts, decision-detail.ts, deny-message.ts, deny-strategy.ts, risk-aggregation.ts
+  permission/   Compone y evalúa permission sets: visibility.ts, evaluate.ts, compose.ts, rule.ts, external-directory.ts, path-scope.ts, shell-parse.ts, git-worktrees.ts, command-prefix.ts, wildcard-matcher.ts, modes.ts, session-rules.ts, active-tools.ts, skill-filter.ts
+  classifier/   Riesgo y LLM: llm-layer.ts, llm-client.ts, file-extraction.ts, secret-guard.ts, pattern-matcher.ts, home-path.ts
+  config/       Carga + validación zod de config (fail-closed): config-loader.ts, permanent-allow.ts
+  commands/     Slash commands: set-commands.ts (/auto-mode:sets, /auto-mode:mode, /yolo)
+  handlers/     Hooks de runtime Pi: before-agent-start.ts, system-prompt-sanitizer.ts, skill-prompt-sanitizer.ts, stub.ts
+  deny/         Estrategia deny-and-continue: deny-service.ts (auto-retry / ask-user / both)
+  state/        Estado compartido multi-instancia en memoria: config-state.ts, external-dir-allowlist.ts, ui-context.ts, ui-registry.ts
+  ui/           Interfaz de confirmación y feedback: permission-modal.ts, ui-prompt.ts, sound.ts
+  telemetry/    Logging de eventos y dataset: telemetry.ts, dataset-exporter.ts
+  types/        Tipos zod de config: config.ts
+  events.ts     Tipado de eventos de runtime
   pi-sdk.d.ts   Stub de tipos del SDK Pi (NO debe importarse en runtime real)
+  pi-tui.d.ts   Tipos del TUI de Pi
 test/           Espejo 1:1 de src/ (+ test/stubs/pi-tui.ts para tipar @earendil-works/pi-tui)
 config.example.json  Plantilla para crear tu config.json (NUNCA editar config.json directamente)
 TASK.md          Notas de plan, fases, y temas pendientes (UNTRACKED, ver §7)
@@ -41,7 +44,7 @@ npm install                 # instala dependencias
 npm run prepare             # instala el hook de git (husky) — se ejecuta solo en install
 ```
 
-- **Sin variables de entorno obligatorias.** Una opcional: `PI_AUTO_MODE_CONFIG` → ruta al archivo de config (si no existe, usa `config.json` en la raíz). Ver `src/index.ts:178`.
+- **Sin variables de entorno obligatorias.** Una opcional: `PI_AUTO_MODE_CONFIG` para sobreescribir la ruta del archivo de configuración; si no está definida, resuelve `~/.pi/pi-auto-mode.json` (auto-sembrado en el primer arranque a partir de `config.example.json`; ver `src/config/config-loader.ts`).
 - **No hay `.nvmrc` / `.env`.** Runtime requerido: Node ≥ 20 (dev en v24), ESM. No fijado con versionador; respeta el comportamiento ESM del proyecto.
 - Para la capa LLM del clasificador se puede pasar `apiKey`/`baseUrl` en el config; **no uses variables de entorno hardcodeadas** salvo que ya existan.
 
@@ -52,6 +55,7 @@ npm run check        # typecheck: tsc --noEmit (NO compila a dist)
 npm run build        # compila a dist/ (tsc -p tsconfig.json)
 npm test             # tests con reporte de cobertura (Jest --coverage)
 npm run test:watch   # jest --watch
+npm run dataset:export # exporta dataset curado ChatML de fine-tuning (~/.pi/pi-auto-mode.jsonl → ~/.pi/pi-auto-mode.dataset.jsonl)
 npx prettier --write .         # formatear
 npx prettier --check .         # verificar formato (uso como "lint"; no hay ESLint)
 ```
@@ -69,7 +73,7 @@ npx prettier --check .         # verificar formato (uso como "lint"; no hay ESLi
 
 - **Formato:** Prettier con `.prettierrc` — **`semi: false`**, `singleQuote: true`, `tabWidth: 2`, `trailingComma: 'es5'`. Es config no negociable; un hook de husky/lint-staged aplica `prettier --write` + tests sobre los `.ts` staged. Código nuevo debe pasar `npx prettier --check .`.
 - **TypeScript estricto:** `strict: true`. **Nunca uses `any`**; si necesitas flexibilidad, usa `unknown` con narrowing o tipos explícitos. Respeta los `paths` del tsconfig (`@earendil-works/pi-coding-agent` → stub local). Importa módulos ESM; el mapeo `.*\.js → $1` de Jest cubre las extensiones `.js` en imports.
-- **Nombres de archivos:** kebab-case (`config-loader.ts`, `session-rules.ts`). Clases en `PascalCase`, funciones en `camelCase`, tipos de zod en `camelCase` (convención del repo, p. ej. `permissionSet`, `customBlockRule`).
+- **Nombres de archivos:** kebab-case (`config-loader.ts`, `session-rules.ts`). Clases en `PascalCase`, funciones en `camelCase`, tipos de zod en `camelCase` (convención del repo, p. ej. `permissionSet`, `patternRule`).
 - **Patrones que respetar:**
   - **Fail-closed:** cualquier error bloquea la ejecución (`createFailClosedToolCall`, carga de config con `loadInitialConfig`). **Nunca** relajes esto para "degradar con gracia" a defaults inseguros.
   - **Validación con zod** en los límites de entrada (`src/types/config.ts`, `src/config/config-loader.ts`). Todo config nuevo se declara como schema zod con defaults.
@@ -123,7 +127,12 @@ Si se aporta CI, debe correr exactamente esos tres pasos; **no debes inventar ni
 - **Surface:** tipo de superficie del tool call (`fs`, `shell`, `mcp`) + tools custom via `surfaceForTool`.
 - **Fail-closed (clave):** ante cualquier error de carga/eval, se **bloquea** la tool call — nunca se abre a un default permiso inseguro. Romper esto es un cambio de seguridad mayor.
 - **Trust boundary:** paths/órdenes protegidos — ahora en block rules del clasificador LLM, no en ruleBased.
-- **External scope (`external_directory`):** opt-in vía `confineToWorkingDirectory` (default `false`). Mapa plano `Record<glob, SimpleAction>` en cascada; fuera de `cwd()` sin match → `ask`; solo endurece, nunca relaja. El clasificador solo endurece `ask`; `allow` explícito es final. Extracción shell con tree-sitter-bash (`src/permission/shell-parse.ts`, deps `web-tree-sitter` + `tree-sitter-wasms`, sin nativos) + fallback heurístico; veredicto lleva `engine`. Crash classes conocidas del wasm 0.20.x: heredocs `<<` y `case` (→ heurístico).
+- **Slash command `/yolo` (`/yolo [on|off]`):** desactiva la validación del gate de Capa 2 para la sesión actual mientras mantiene intacto el filtrado y ocultamiento de herramientas con `deny` de Capa 1 (`setActiveTools`).
+- **Estado compartido multi-instancia en `jiti`:** sincronizado vía `globalThis[Symbol.for('pi-auto-mode:...')]` (`config-state`, `session-rules`, `external-dir-allowlist`, `ui-registry`, `ask-resolver`). Protección de cierre en sub-sesiones hijas: cuando `ctx.hasUI === false`, el shutdown no limpia los `sessionRules` ni el estado de `yoloSession` del proceso padre.
+- **External scope (`external_directory`):** opt-in vía `confineToWorkingDirectory` (default `false`). Mapa plano `Record<glob, SimpleAction>` en cascada; fuera de `cwd()` sin match → `ask`; solo endurece, nunca relaja. El clasificador solo endurece `ask`; `allow` explícito es final. Extracción shell con tree-sitter-bash (`src/permission/shell-parse.ts`, deps `web-tree-sitter` + `tree-sitter-wasms`, sin nativos) + fallback heurístico; veredicto lleva `engine`. Crash classes conocidas del wasm 0.20.x: heredocs `<<` y `case` (→ heurístico). Soporta seguimiento de `cd` a lo largo de segmentos compuestos, paridad entre `powershell` y `bash`, y persistencia de permisos permanentes con `Tab` / `Shift+Enter` (`persistPermanentAllow`).
+- **Separación de Telemetría vs Debug:**
+  - `~/.pi/pi-auto-mode.jsonl`: dataset de decisiones puras `permissions:decision` (incluye clave de join `requestId`, `cwd`, `fullCommand`, `segments`, `externalScope`, `rule`, `risk.decision`, `denialReason`, y redacción quirúrgica de secretos mediante `redactSecretsForModel` + `maskHomePrefix`).
+  - `~/.pi/pi-auto-mode.debug.jsonl`: diagnósticos técnicos (`llm:attempt`, `llm:error`, `tool_call_blocked`, `permissions:ui_prompt`, `classifier:file_extraction`).
 - **ReDoS / bypasses:** en `wildcard-matcher.ts`; al añadir patrones, mántelos lineales/seguros.
 
 ## 11. Troubleshooting común
@@ -162,7 +171,7 @@ Confirma que el árbol compila y pasa tests **antes** de meter la extensión en 
 
 ```bash
 npm run check        # tsc --noEmit (NO toca dist/)
-npm test             # 579 tests (Jest + @swc/jest)
+npm test             # 1150+ tests (54 suites) (Jest + @swc/jest)
 npx prettier --check .
 ```
 
@@ -215,7 +224,9 @@ npm unlink pi-auto-mode
 | Recurso                | Ruta                                                                                                                       |
 | ---------------------- | -------------------------------------------------------------------------------------------------------------------------- |
 | Config del usuario     | `~/.pi/pi-auto-mode.json` (auto-seeded desde `config.example.json` al primer arranque; override con `PI_AUTO_MODE_CONFIG`) |
-| Telemetría (default)   | `~/.pi/pi-auto-mode.jsonl` (configurable vía `Config.telemetry.path`)                                                      |
+| Telemetría / Dataset   | `~/.pi/pi-auto-mode.jsonl` (configurable vía `Config.telemetry.path`)                                                      |
+| Diagnóstico / Debug    | `~/.pi/pi-auto-mode.debug.jsonl` (trazas técnicas, reintentos LLM y bloqueos)                                              |
+| Dataset exportado      | `~/.pi/pi-auto-mode.dataset.jsonl` (dataset ChatML curado para fine-tuning)                                                |
 | Link del paquete en Pi | `~/.pi/agent/settings.json` → array `packages`                                                                             |
 
 > **Importante:** `config.json` en la raíz del repo es gitignored y del usuario. Para cambios de diseño de schema, edita `config.example.json` + `src/types/config.ts`; **nunca** tocar `config.json`.

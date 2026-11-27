@@ -282,6 +282,7 @@ describe('gateToolCall with wrapper commands', () => {
       fallback: { onTimeout: 'ask-user', onError: 'ask-user' },
       onBlock: 'deny',
       onBlockUserOverride: false,
+      onlyFlagged: false,
     },
     denyStrategy: {
       mode: 'auto-retry',

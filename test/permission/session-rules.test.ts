@@ -58,6 +58,56 @@ describe('SessionRules', () => {
     expect(rules.snapshot()).toEqual([])
   })
 
+  describe('remove', () => {
+    it('removes an existing rule, returns true, and decreases size', () => {
+      rules.approveForSession('fs', '/tmp/*', 'allow')
+      expect(rules.size()).toBe(1)
+      const removed = rules.remove('fs', '/tmp/*')
+      expect(removed).toBe(true)
+      expect(rules.size()).toBe(0)
+      expect(rules.snapshot()).toEqual([])
+    })
+
+    it('returns false and does not change size when removing non-existent rule', () => {
+      rules.approveForSession('fs', '/tmp/*', 'allow')
+      expect(rules.remove('shell', 'echo hello')).toBe(false)
+      expect(rules.remove('fs', '/var/*')).toBe(false)
+      expect(rules.size()).toBe(1)
+    })
+
+    it('filters with action specified: only removes when action matches', () => {
+      rules.approveForSession('shell', 'git status', 'allow')
+      expect(rules.remove('shell', 'git status', 'deny')).toBe(false)
+      expect(rules.size()).toBe(1)
+      expect(rules.remove('shell', 'git status', 'allow')).toBe(true)
+      expect(rules.size()).toBe(0)
+    })
+
+    it('filters without action specified: removes matching surface and pattern regardless of action', () => {
+      rules.approveForSession('shell', 'git status', 'allow')
+      expect(rules.remove('shell', 'git status')).toBe(true)
+      expect(rules.size()).toBe(0)
+    })
+
+    it('removes all matching rules if multiple exist', () => {
+      rules.add({
+        surface: 'shell',
+        pattern: 'git diff',
+        action: 'allow',
+        origin: 'session',
+      })
+      rules.add({
+        surface: 'shell',
+        pattern: 'git diff',
+        action: 'deny',
+        origin: 'session',
+      })
+      expect(rules.size()).toBe(2)
+      expect(rules.remove('shell', 'git diff')).toBe(true)
+      expect(rules.size()).toBe(0)
+    })
+  })
+
   it('L5: approveForSession deduplicates the same (surface, value) pair', () => {
     // Simulate the gate re-persisting after the modal already approved-for-session.
     rules.approveForSession('fs', '/etc/shadow', 'allow')
@@ -247,6 +297,49 @@ describe('SessionRules', () => {
       rules.approveForSession('shell', 'rm *', 'allow')
       expect(rules.size()).toBe(1)
       expect(rules.snapshot()[0]?.pattern).toBe('rm *')
+    })
+
+    it('stores and merges scriptFingerprints on approveForSession', () => {
+      rules.approveForSession('shell', 'python3 *', 'allow', false, [
+        { path: '/tmp/a.py', hash: 'hash-a' },
+      ])
+      expect(rules.size()).toBe(1)
+      expect(rules.snapshot()[0]?.scriptFingerprints).toEqual([
+        { path: '/tmp/a.py', hash: 'hash-a' },
+      ])
+
+      // Approving another script under the covering rule merges fingerprints
+      rules.approveForSession('shell', 'python3 /tmp/b.py', 'allow', false, [
+        { path: '/tmp/b.py', hash: 'hash-b' },
+      ])
+      expect(rules.size()).toBe(1)
+      const fps = rules.snapshot()[0]?.scriptFingerprints
+      expect(fps).toHaveLength(2)
+      expect(fps).toContainEqual({ path: '/tmp/a.py', hash: 'hash-a' })
+      expect(fps).toContainEqual({ path: '/tmp/b.py', hash: 'hash-b' })
+    })
+
+    it('updates scriptFingerprints on exact duplicate add()', () => {
+      rules.add({
+        surface: 'shell',
+        pattern: 'python3 *',
+        action: 'allow',
+        origin: 'session',
+        scriptFingerprints: [{ path: '/tmp/a.py', hash: 'hash-a' }],
+      })
+      expect(rules.size()).toBe(1)
+
+      rules.add({
+        surface: 'shell',
+        pattern: 'python3 *',
+        action: 'allow',
+        origin: 'session',
+        scriptFingerprints: [{ path: '/tmp/a.py', hash: 'new-hash-a' }],
+      })
+      expect(rules.size()).toBe(1)
+      expect(rules.snapshot()[0]?.scriptFingerprints).toEqual([
+        { path: '/tmp/a.py', hash: 'new-hash-a' },
+      ])
     })
   })
 })

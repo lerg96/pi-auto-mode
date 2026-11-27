@@ -856,4 +856,23 @@ describe('bash function headers, var assignments, and C-style for loops', () => 
     )
     expect(segs).toEqual(['curl -s -o out.zip $url', 'echo skip'])
   })
+
+  it('treats break, continue, return, and exit (with optional numeric arg) as shell structure', () => {
+    expect(isShellStructureSegment('break')).toBe(true)
+    expect(isShellStructureSegment('break 2')).toBe(true)
+    expect(isShellStructureSegment('continue')).toBe(true)
+    expect(isShellStructureSegment('return 0')).toBe(true)
+    expect(isShellStructureSegment('exit 1')).toBe(true)
+    expect(isShellStructureSegment('break > /tmp/out')).toBe(false)
+    expect(isShellStructureSegment('exit $(whoami)')).toBe(false)
+  })
+
+  it('treats shell comment lines starting with # as shell structure', () => {
+    expect(
+      isShellStructureSegment(
+        '# buscar en la campaign de validacion las URLs usadas contra categories-v2'
+      )
+    ).toBe(true)
+    expect(isShellStructureSegment('   # indented comment')).toBe(true)
+  })
 })

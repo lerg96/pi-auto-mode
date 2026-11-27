@@ -8,6 +8,7 @@ import type {
 import type { DenyAndContinueService } from '../deny/deny-service.ts'
 import {
   evaluatePermission,
+  getExistingAllowPatterns,
   resolveToolVisibility,
 } from '../permission/visibility.ts'
 import {
@@ -351,6 +352,21 @@ async function handlePermDeny(
   })
 }
 
+function resolveSessionPatterns(
+  cfg: Config,
+  toolName: string,
+  commandValue: string
+): { sessionPatterns: string[]; suppressPermanent: boolean } {
+  const raw = buildSessionPatterns(commandValue)
+  const existingAllows = getExistingAllowPatterns(cfg, toolName)
+  const filtered = raw.filter((p) => !existingAllows.has(p))
+  const suppressPermanent = filtered.length < raw.length
+  return {
+    sessionPatterns: filtered.length > 0 ? filtered : [commandValue],
+    suppressPermanent,
+  }
+}
+
 async function handleDenyAskUser(
   ctx: GateCtx,
   state: CascadeState
@@ -362,8 +378,8 @@ async function handleDenyAskUser(
     ctx.intents.some((i) => i.surface === 'shell') ||
     toolName === 'bash' ||
     toolName === 'powershell'
-  const sessionPatterns = isShell
-    ? buildSessionPatterns(matchedValue)
+  const patternOpts = isShell
+    ? resolveSessionPatterns(ctx.cfg, toolName, matchedValue)
     : undefined
   const detail: DetailFn = (strategy) =>
     buildDecisionDetail({
@@ -392,7 +408,8 @@ async function handleDenyAskUser(
       undefined,
       {
         askOrigin: 'deny-override',
-        sessionPatterns,
+        sessionPatterns: patternOpts?.sessionPatterns,
+        suppressPermanent: patternOpts?.suppressPermanent,
         cwd: ctx.cwd,
         requestId: ctx.requestId,
         segments: ctx.segments,
@@ -445,19 +462,58 @@ function emitAllowDecision(ctx: GateCtx, state: CascadeState): void {
   )
 }
 
-// permAction === "ask": harden with classifier BEFORE prompting.
+function partitionAskIntents(ctx: GateCtx): {
+  flagged: AccessIntent[]
+  unflagged: AccessIntent[]
+} {
+  const flagged: AccessIntent[] = []
+  const unflagged: AccessIntent[] = []
+  let effectiveCwd = ctx.cwd ?? process.cwd()
+  for (const intent of ctx.intents) {
+    const { action, classify } = evaluateSegmentAction(
+      ctx,
+      intent,
+      effectiveCwd
+    )
+    if (action === 'ask') {
+      if (classify) flagged.push(intent)
+      else unflagged.push(intent)
+    }
+    if (intent.surface === 'shell') {
+      const cdTarget = extractCdTarget(intent.value)
+      if (cdTarget) {
+        effectiveCwd = resolveFsPath(cdTarget, effectiveCwd)
+      }
+    }
+  }
+  return { flagged, unflagged }
+}
+
+// permAction === "ask": harden with classifier BEFORE prompting, and allow
+// auto-approval for rules explicitly flagged with `classify: true`.
 async function handleAskPath(
   ctx: GateCtx,
   state: CascadeState,
   external: ExternalScopeResult
 ): Promise<void> {
-  const agg = await aggregateClassify(
-    ctx.intents,
-    ctx.toolName,
-    ctx.input,
-    ctx.deps,
-    { cwd: ctx.cwd, requestId: ctx.requestId }
-  )
+  const { flagged, unflagged } = partitionAskIntents(ctx)
+  const onlyFlagged = ctx.cfg.classifier.onlyFlagged === true
+  const intentsToClassify = onlyFlagged ? flagged : ctx.intents
+
+  const agg: AggResult =
+    onlyFlagged && intentsToClassify.length === 0
+      ? {
+          action: 'allow',
+          surface: state.matchedSurface,
+          value: state.matchedValue,
+        }
+      : await aggregateClassify(
+          intentsToClassify,
+          ctx.toolName,
+          ctx.input,
+          ctx.deps,
+          { cwd: ctx.cwd, requestId: ctx.requestId }
+        )
   if (agg.action === 'deny') {
     const proceeded = await handleClassifierBlock(ctx.deps, ctx.cfg, {
       toolName: ctx.toolName,
@@ -487,7 +543,57 @@ async function handleAskPath(
       })
     )
   }
-  await promptAskAfterClassifier(ctx, state, external, agg)
+
+  const autoApprovableIntents = onlyFlagged
+    ? flagged
+    : [...flagged, ...unflagged]
+  const classifierAutoApproved =
+    ctx.cfg.classifier.enabled === true &&
+    agg.action === 'allow' &&
+    autoApprovableIntents.length > 0
+
+  if (
+    classifierAutoApproved &&
+    (!onlyFlagged || unflagged.length === 0) &&
+    !external.isExternalDirAsk
+  ) {
+    emit(
+      ctx.deps.hooks,
+      state.matchedSurface,
+      state.matchedValue,
+      'allow',
+      'classifier_allow',
+      {
+        requestId: ctx.requestId,
+        decidedBy: 'classifier',
+        ...buildDecisionDetail({
+          toolName: ctx.toolName,
+          matchedSurface: state.matchedSurface,
+          matchedValue: state.matchedValue,
+          rule: {
+            surface: state.ruleSurface,
+            pattern: state.rulePattern,
+            reason: state.ruleReason,
+          },
+          risk: agg.risk,
+          startedAt: ctx.startedAt,
+          ...ctxDetailFields(ctx),
+        }),
+      }
+    )
+    return
+  }
+
+  const classifierApprovedIntents = classifierAutoApproved
+    ? new Set(autoApprovableIntents)
+    : undefined
+  await promptAskAfterClassifier(
+    ctx,
+    state,
+    external,
+    agg,
+    classifierApprovedIntents
+  )
 }
 
 // Which surface/value/resolution the ask prompt should carry once the
@@ -540,8 +646,10 @@ function evaluateSegmentAction(
 ): {
   action: 'allow' | 'ask' | 'deny'
   extVerdict?: ReturnType<typeof evaluateExternalDirectory>
+  classify: boolean
 } {
   let action: 'allow' | 'ask' | 'deny' = 'allow'
+  let classify = false
   if (!(
     intent.surface === 'shell' &&
     isShellStructureSegment(intent.rawValue ?? intent.value)
@@ -555,6 +663,7 @@ function evaluateSegmentAction(
     const cascadeAction = evalResult.action
     action =
       cascadeAction && cascadeAction !== 'unknown' ? cascadeAction : 'allow'
+    classify = action === 'ask' && evalResult.matchedRule?.classify === true
   }
   const extVerdict = evaluateExternalDirectory(ctx.cfg, [intent], {
     toolName: ctx.toolName,
@@ -566,13 +675,17 @@ function evaluateSegmentAction(
     if (rank[extVerdict.action] > rank[action]) {
       action = extVerdict.action
     }
+    if (extVerdict.action === 'ask' || extVerdict.action === 'deny') {
+      classify = false
+    }
   }
-  return { action, extVerdict }
+  return { action, extVerdict, classify }
 }
 
 function findUnapprovedShellSegments(
   ctx: GateCtx,
-  agg: AggResult
+  agg: AggResult,
+  classifierApprovedIntents?: Set<AccessIntent>
 ): Array<{
   intent: AccessIntent
   extVerdict?: ReturnType<typeof evaluateExternalDirectory>
@@ -603,6 +716,38 @@ function findUnapprovedShellSegments(
     }
     const reqId =
       globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)
+    if (
+      extVerdict?.action !== 'ask' &&
+      classifierApprovedIntents?.has(intent)
+    ) {
+      emit(
+        deps.hooks,
+        intent.surface,
+        intent.value,
+        'allow',
+        'classifier_allow',
+        {
+          requestId: reqId,
+          decidedBy: 'classifier',
+          ...buildDecisionDetail({
+            toolName,
+            matchedSurface: intent.surface,
+            matchedValue: intent.value,
+            risk: agg.risk,
+            startedAt,
+            ...ctxDetailFields(ctx),
+            cwd: effectiveCwd,
+          }),
+        }
+      )
+      if (intent.surface === 'shell') {
+        const cdTarget = extractCdTarget(intent.value)
+        if (cdTarget) {
+          effectiveCwd = resolveFsPath(cdTarget, effectiveCwd)
+        }
+      }
+      continue
+    }
     const approved =
       extVerdict?.action !== 'ask' &&
       trySessionAllow(
@@ -635,9 +780,14 @@ async function promptAskMultiSegmentShell(
   ctx: GateCtx,
   state: CascadeState,
   external: ExternalScopeResult,
-  agg: AggResult
+  agg: AggResult,
+  classifierApprovedIntents?: Set<AccessIntent>
 ): Promise<void> {
-  const unapproved = findUnapprovedShellSegments(ctx, agg)
+  const unapproved = findUnapprovedShellSegments(
+    ctx,
+    agg,
+    classifierApprovedIntents
+  )
   const totalAsks = unapproved.length
   if (totalAsks === 0) return
 
@@ -650,6 +800,10 @@ async function promptAskMultiSegmentShell(
     if (current.action === 'allow') {
       continue
     }
+    const segWasClassified =
+      ctx.cfg.classifier.onlyFlagged !== true || current.classify
+    const segRisk = segWasClassified ? agg.risk : undefined
+    const segResolution = segWasClassified ? resolution : 'permission_ask'
     const reqId =
       globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)
     if (
@@ -658,7 +812,7 @@ async function promptAskMultiSegmentShell(
         deps,
         seg.surface,
         seg.value,
-        agg.risk,
+        segRisk,
         toolName,
         startedAt,
         reqId,
@@ -671,7 +825,11 @@ async function promptAskMultiSegmentShell(
       continue
     }
 
-    const sessionPatterns = buildSessionPatterns(seg.value)
+    const { sessionPatterns, suppressPermanent } = resolveSessionPatterns(
+      ctx.cfg,
+      toolName,
+      seg.value
+    )
     const matchedRule = {
       surface: toolName,
       pattern: state.rulePattern,
@@ -682,7 +840,7 @@ async function promptAskMultiSegmentShell(
       matchedSurface: seg.surface,
       matchedValue: seg.value,
       rule: matchedRule,
-      risk: agg.risk,
+      risk: segRisk,
       startedAt,
       ...ctxDetailFields(ctx),
       cwd: effectiveCwd,
@@ -698,7 +856,7 @@ async function promptAskMultiSegmentShell(
 
     const segAskOrigin: AskOrigin = segExternalDirAsk?.isExternalDir
       ? 'external-directory'
-      : resolution === 'classifier_ask'
+      : segResolution === 'classifier_ask'
         ? 'classifier'
         : 'rule'
 
@@ -706,7 +864,7 @@ async function promptAskMultiSegmentShell(
       const { requestId, verdict, via } = await resolveAsk(
         seg.surface,
         seg.value,
-        agg.risk,
+        segRisk,
         deps,
         matchedRule,
         toolName,
@@ -715,6 +873,7 @@ async function promptAskMultiSegmentShell(
         segExternalDirAsk,
         {
           sessionPatterns,
+          suppressPermanent,
           segmentIndex: k,
           segmentTotal: totalAsks,
           askOrigin: segAskOrigin,
@@ -724,7 +883,7 @@ async function promptAskMultiSegmentShell(
           externalScope: ctx.externalScope,
         }
       )
-      emit(deps.hooks, seg.surface, seg.value, 'allow', resolution, {
+      emit(deps.hooks, seg.surface, seg.value, 'allow', segResolution, {
         requestId,
         decidedBy: askActor(via),
         via,
@@ -732,7 +891,7 @@ async function promptAskMultiSegmentShell(
         ...buildDecisionDetail(detailArgs),
       })
     } catch (err) {
-      emit(deps.hooks, seg.surface, seg.value, 'deny', resolution, {
+      emit(deps.hooks, seg.surface, seg.value, 'deny', segResolution, {
         ...askDeniedAudit(err),
         ...buildDecisionDetail(detailArgs),
       })
@@ -745,13 +904,20 @@ async function promptAskAfterClassifier(
   ctx: GateCtx,
   state: CascadeState,
   external: ExternalScopeResult,
-  agg: AggResult
+  agg: AggResult,
+  classifierApprovedIntents?: Set<AccessIntent>
 ): Promise<void> {
   if (
     ctx.intents.length > 1 &&
     ctx.intents.every((i) => i.surface === 'shell')
   ) {
-    return promptAskMultiSegmentShell(ctx, state, external, agg)
+    return promptAskMultiSegmentShell(
+      ctx,
+      state,
+      external,
+      agg,
+      classifierApprovedIntents
+    )
   }
 
   const { deps, toolName, fullCommand, startedAt } = ctx
@@ -775,7 +941,9 @@ async function promptAskAfterClassifier(
     ctx.intents.some((i) => i.surface === 'shell') ||
     toolName === 'bash' ||
     toolName === 'powershell'
-  const sessionPatterns = isShell ? buildSessionPatterns(askValue) : undefined
+  const patternOpts = isShell
+    ? resolveSessionPatterns(ctx.cfg, toolName, askValue)
+    : undefined
 
   const askOrigin: AskOrigin = externalDirAsk?.isExternalDir
     ? 'external-directory'
@@ -795,7 +963,8 @@ async function promptAskAfterClassifier(
       startedAt,
       externalDirAsk,
       {
-        sessionPatterns,
+        sessionPatterns: patternOpts?.sessionPatterns,
+        suppressPermanent: patternOpts?.suppressPermanent,
         askOrigin,
         cwd: ctx.cwd,
         requestId: ctx.requestId,

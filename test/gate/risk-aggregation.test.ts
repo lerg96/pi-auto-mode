@@ -112,4 +112,34 @@ describe('aggregateClassify', () => {
     expect(agg.surface).toBe('shell')
     expect(agg.value).toBe('askme')
   })
+
+  it('scopes arguments.command per shell segment so sibling segments do not leak into classify()', async () => {
+    const seen: Array<{ value: string; command: unknown; cwd: unknown }> = []
+    const classify = async (i: ClassifierInput): Promise<ClassifierResult> => {
+      seen.push({
+        value: i.value,
+        command: i.arguments.command,
+        cwd: i.arguments.cwd,
+      })
+      return { decision: 'allow' }
+    }
+    const deps = depsWith({}, classify)
+    await aggregateClassify(
+      [intent('shell', 'python3 -c "print(1)"')],
+      'bash',
+      {
+        command:
+          'curl -H "Authorization: Bearer $TOKEN_A" https://x && python3 -c "print(1)"',
+        cwd: '/tmp',
+      },
+      deps
+    )
+    expect(seen).toEqual([
+      {
+        value: 'python3 -c "print(1)"',
+        command: 'python3 -c "print(1)"',
+        cwd: '/tmp',
+      },
+    ])
+  })
 })

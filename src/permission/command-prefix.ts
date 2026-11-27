@@ -9,6 +9,7 @@ export function tokenizeCommandWithSpans(segment: string): TokenSpan[] {
   let buf = ''
   let tokenStart = -1
   let quote: "'" | '"' | null = null
+  let substDepth = 0
   let i = 0
 
   while (i < segment.length) {
@@ -32,6 +33,16 @@ export function tokenizeCommandWithSpans(segment: string): TokenSpan[] {
       if (tokenStart === -1) tokenStart = i
       buf += c
       quote = c
+    } else if (c === '$' && segment[i + 1] === '(') {
+      if (tokenStart === -1) tokenStart = i
+      substDepth++
+      buf += '$('
+      i++
+    } else if (substDepth > 0) {
+      if (tokenStart === -1) tokenStart = i
+      if (c === '(') substDepth++
+      else if (c === ')') substDepth--
+      buf += c
     } else if (c === ' ' || c === '\t' || c === '\n' || c === '\r') {
       if (buf.length > 0) {
         tokens.push({ token: buf, start: tokenStart, end: i })

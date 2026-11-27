@@ -70,9 +70,13 @@ export async function aggregateClassify(
   for (const intent of intentsToClassify) {
     if (!deps.classify)
       return { action: 'deny', surface: repSurface, value: repValue }
+    const segmentArgs =
+      intent.surface === 'shell' && typeof input.command === 'string'
+        ? { ...input, command: intent.value }
+        : input
     const r = await deps.classify({
       toolName,
-      arguments: input,
+      arguments: segmentArgs,
       surface: intent.surface,
       value: intent.value,
       ...(extra?.cwd !== undefined ? { cwd: extra.cwd } : {}),

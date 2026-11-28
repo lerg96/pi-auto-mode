@@ -666,17 +666,19 @@ describe('classifier.onlyFlagged & PatternRule.classify', () => {
 })
 
 describe('classifier.llm.api & minAllowConfidence (Jev)', () => {
-  it('accepts api="jev" and minAllowConfidence in [0, 1]', () => {
+  it('accepts api="jev", minAllowConfidence, and minAllowProbability in [0, 1]', () => {
     const cfg = parseConfig({
       classifier: {
         llm: {
           api: 'jev',
-          minAllowConfidence: 0.9,
+          minAllowConfidence: 0.75,
+          minAllowProbability: 0.8,
         },
       },
     })
     expect(cfg.classifier.llm.api).toBe('jev')
-    expect(cfg.classifier.llm.minAllowConfidence).toBe(0.9)
+    expect(cfg.classifier.llm.minAllowConfidence).toBe(0.75)
+    expect(cfg.classifier.llm.minAllowProbability).toBe(0.8)
   })
 
   it('rejects invalid api and out-of-range minAllowConfidence', () => {

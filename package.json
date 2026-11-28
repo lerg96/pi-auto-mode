@@ -1,7 +1,38 @@
 {
-  "name": "pi-auto-mode",
+  "name": "@lerg96/pi-auto-mode",
   "version": "0.1.0",
+  "description": "Permission gate and selective LLM/Jev risk classifier extension for Pi coding agent.",
   "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi-coding-agent",
+    "permissions",
+    "security",
+    "classifier",
+    "jev"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lerg96/pi-auto-mode.git"
+  },
+  "homepage": "https://github.com/lerg96/pi-auto-mode#readme",
+  "bugs": {
+    "url": "https://github.com/lerg96/pi-auto-mode/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "index.ts",
+    "src",
+    "config.example.json",
+    "README.md"
+  ],
   "pi": {
     "extensions": [
       "./index.ts"

@@ -17,7 +17,12 @@ import {
   classifyToolCall,
   type ModelRegistryLike,
 } from '../../src/classifier/llm-layer.ts'
+import { clearClassifierCache } from '../../src/classifier/classifier-cache.ts'
 import type { ClassifierConfig, LlmConfig } from '../../src/types/config.ts'
+
+beforeEach(() => {
+  clearClassifierCache()
+})
 
 const SENTINEL_KEY = 'sk-secret-XYZ'
 const SENTINEL_BASEURL = 'https://registry-resolved.example.com/v1'

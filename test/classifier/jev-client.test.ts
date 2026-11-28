@@ -139,6 +139,27 @@ describe('jev-client', () => {
     expect(mapped.risk?.reason).toContain('0.72 < threshold 0.85 -> ask')
   })
 
+  it('evaluates minAllowConfidence and minAllowProbability independently', () => {
+    const res = {
+      response: {
+        answers: {
+          decision: {
+            choice: 'allow',
+            confidence: 0.77,
+            probabilities: { allow: 0.85, ask: 0.13, block: 0.02 },
+          },
+          risk: { score: 1.0 },
+          category: { choice: 'safe_local_dev' },
+        },
+      },
+      usedFallback: false,
+    }
+    expect(mapJevResult(res, 0.75, 0.8).decision).toBe('allow')
+    const lowProb = mapJevResult(res, 0.75, 0.9)
+    expect(lowProb.decision).toBe('ask')
+    expect(lowProb.risk?.reason).toContain('p(allow) 0.85 < threshold 0.90')
+  })
+
   it('downgrades allow to ask when confidence and probabilities are missing (fail-closed)', () => {
     const mapped = mapJevResult(
       {

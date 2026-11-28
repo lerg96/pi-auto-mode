@@ -647,9 +647,13 @@ function evaluateSegmentAction(
   action: 'allow' | 'ask' | 'deny'
   extVerdict?: ReturnType<typeof evaluateExternalDirectory>
   classify: boolean
+  rulePattern: string
+  ruleReason?: string
 } {
   let action: 'allow' | 'ask' | 'deny' = 'allow'
   let classify = false
+  let rulePattern = intent.value
+  let ruleReason: string | undefined
   if (!(
     intent.surface === 'shell' &&
     isShellStructureSegment(intent.rawValue ?? intent.value)
@@ -664,6 +668,15 @@ function evaluateSegmentAction(
     action =
       cascadeAction && cascadeAction !== 'unknown' ? cascadeAction : 'allow'
     classify = action === 'ask' && evalResult.matchedRule?.classify === true
+    const matched = evalResult.matchedRule
+    rulePattern = matched?.pattern ?? intent.value
+    if (matched?.reason !== undefined) {
+      ruleReason = matched.reason
+    } else if (matched === undefined) {
+      ruleReason = `default '${action}' for tool '${ctx.toolName}'`
+    } else {
+      ruleReason = `rule '${matched.pattern}' matched`
+    }
   }
   const extVerdict = evaluateExternalDirectory(ctx.cfg, [intent], {
     toolName: ctx.toolName,
@@ -674,12 +687,14 @@ function evaluateSegmentAction(
     const rank = { allow: 0, ask: 1, deny: 2 } as const
     if (rank[extVerdict.action] > rank[action]) {
       action = extVerdict.action
+      rulePattern = extVerdict.pattern ?? '*'
+      ruleReason = `access outside the working directory is not allowed: ${extVerdict.absPath}`
     }
     if (extVerdict.action === 'ask' || extVerdict.action === 'deny') {
       classify = false
     }
   }
-  return { action, extVerdict, classify }
+  return { action, extVerdict, classify, rulePattern, ruleReason }
 }
 
 function findUnapprovedShellSegments(
@@ -832,8 +847,8 @@ async function promptAskMultiSegmentShell(
     )
     const matchedRule = {
       surface: toolName,
-      pattern: state.rulePattern,
-      reason: state.ruleReason,
+      pattern: current.rulePattern,
+      reason: current.ruleReason,
     }
     const detailArgs = {
       toolName,

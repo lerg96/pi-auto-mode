@@ -1,5 +1,6 @@
 import {
   registerSetCommands,
+  dryRunBashCommand,
   formatSets,
   setMode,
   MODES,
@@ -551,5 +552,47 @@ describe('permissions-list command', () => {
       'Permissions list modal requires an interactive UI.',
       'warning'
     )
+  })
+})
+
+describe('auto-mode:test dry-run', () => {
+  it('reports per-segment structure, matched rules, and classifier verdicts', async () => {
+    const cfg: Config = {
+      ...baseConfig,
+      classifier: {
+        ...baseConfig.classifier,
+        enabled: true,
+        onlyFlagged: true,
+      },
+      permissions: {
+        tools: {
+          bash: [
+            { pattern: 'git status', action: 'allow' },
+            { pattern: 'python3 *', action: 'ask', classify: true },
+            { pattern: '*', action: 'ask' },
+          ],
+        },
+      },
+    }
+    const out = await dryRunBashCommand(
+      'git status && python3 -c "print(1)" && curl https://example.com',
+      cfg,
+      {
+        classify: async () => ({
+          decision: 'allow',
+          risk: {
+            score: 0,
+            level: 'low',
+            reason: 'Jev [safe_local_dev]: decision=allow',
+          },
+        }),
+      }
+    )
+    expect(out).toContain("allow [rule='git status']")
+    expect(out).toContain("ask [rule='python3 *' classify=true]")
+    expect(out).toContain(
+      'classifier=allow (Jev [safe_local_dev]: decision=allow)'
+    )
+    expect(out).toContain('classifier=skipped(onlyFlagged)')
   })
 })

@@ -589,6 +589,9 @@ export function stripLeadingShellKeywords(s: string): string {
     if (kwPattern.test(cur)) {
       cur = cur.replace(kwPattern, '').trim()
     }
+    if (/^!\s+/.test(cur)) {
+      cur = cur.replace(/^!\s+/, '').trim()
+    }
     if (LEADING_FN_HEADER_RE.test(cur)) {
       cur = cur.replace(LEADING_FN_HEADER_RE, '').trim()
     }
@@ -1050,6 +1053,12 @@ export function segmentCommand(
     }
 
     // Outside any quote
+    if (c === '#' && (i === 0 || /[\s;&|(\n\r]/.test(cleanCommand[i - 1]))) {
+      while (i < cleanCommand.length && cleanCommand[i] !== '\n') {
+        i++
+      }
+      continue
+    }
     if (c === '\\' && i + 1 < cleanCommand.length) {
       buf += c + cleanCommand[i + 1]
       i += 2

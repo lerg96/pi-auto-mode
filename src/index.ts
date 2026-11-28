@@ -25,6 +25,7 @@ import { gateToolCall } from './gate/gate.ts'
 import { setAskResolver } from './gate/ask.ts'
 import { createModalAskResolver } from './ui/permission-modal.ts'
 import { classifyToolCall } from './classifier/llm-layer.ts'
+import { clearClassifierCache } from './classifier/classifier-cache.ts'
 import { DenyAndContinueService } from './deny/deny-service.ts'
 import { TelemetryLogger } from './telemetry/telemetry.ts'
 import { fileURLToPath } from 'node:url'
@@ -156,6 +157,7 @@ export async function endSession(
     (ctx as { hasUI?: boolean } | undefined)?.hasUI === false
   if (!isChildSession) {
     sessionRules.clear()
+    clearClassifierCache()
     configState.setYoloSession(false)
   }
   denyService.reset()

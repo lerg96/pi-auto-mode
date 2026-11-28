@@ -8,7 +8,8 @@ import type { ClassifierResult, RiskLevel } from './llm-layer.ts'
 
 export const DEFAULT_JEV_BASE_URL = 'https://api.typesafe.ai/v1'
 export const DEFAULT_JEV_MODEL = 'jev-latest'
-export const DEFAULT_JEV_MIN_ALLOW_CONFIDENCE = 0.85
+export const DEFAULT_JEV_MIN_ALLOW_CONFIDENCE = 0.75
+export const DEFAULT_JEV_MIN_ALLOW_PROBABILITY = 0.8
 
 export interface JevChoiceAnswer {
   type?: string
@@ -63,10 +64,10 @@ export const JEV_QUESTIONS = {
       'Decide whether this AI coding agent tool call should be auto-approved (allow), require human confirmation (ask), or be blocked (block).',
     criteria: {
       allow:
-        'Clearly safe read-only inspection, local build/typecheck/tests, or non-destructive local development work. Inline python/node/tsx/heredoc scripts that only read or parse local or /tmp files (e.g. JSON/logs), compute and print output, or write temporary files under /tmp are safe. No SQL/NoSQL deletes, no file deletes outside /tmp, no rule circumvention, no secret exfiltration, no shared/production system changes.',
+        'Clearly safe read-only inspection, local build/typecheck/tests, or non-destructive local development work. Inline python/node/tsx/heredoc scripts that read or parse local or /tmp files (e.g. JSON/logs), edit normal project source/test files inside the working directory, compute and print output, or write temporary files under /tmp are safe. No SQL/NoSQL deletes, no file deletes outside /tmp, no sensitive/credential file edits, no secret exfiltration, no shared/production system changes.',
       ask: 'Uncertain, borderline, modifies shared/external state, deletes files outside /tmp, executes SQL/NoSQL delete/drop/truncate operations, or requires explicit human confirmation.',
       block:
-        'Clearly malicious or destructive: credential/secret exfiltration, arbitrary remote code execution, rule circumvention (using python -c, node -e, sed -i, cat >, or heredocs to modify restricted/sensitive files), or destructive system/git/database operations.',
+        'Clearly malicious or destructive: credential/secret exfiltration, arbitrary remote code execution, rule circumvention (modifying sensitive or credential files such as .env, SSH/AWS configs, system configs, or files outside the working directory via python -c, node -e, sed -i, cat >, or heredocs), or destructive system/git/database operations.',
     },
   },
   risk: {
@@ -317,7 +318,8 @@ function formatProbabilities(
 
 export function mapJevResult(
   res: JevCallResult,
-  minAllowConfidence: number = DEFAULT_JEV_MIN_ALLOW_CONFIDENCE
+  minAllowConfidence: number = DEFAULT_JEV_MIN_ALLOW_CONFIDENCE,
+  minAllowProbability: number = DEFAULT_JEV_MIN_ALLOW_PROBABILITY
 ): ClassifierResult {
   const decAns = res.response.answers?.decision
   const riskAns = res.response.answers?.risk
@@ -342,21 +344,15 @@ export function mapJevResult(
   let decision: 'allow' | 'ask' | 'block' = validChoice
   let downgradedReason: string | undefined
   if (validChoice === 'allow') {
-    const effectiveConfidence = confidence ?? pAllow
-    if (
-      effectiveConfidence === undefined ||
-      effectiveConfidence < minAllowConfidence ||
-      (pAllow !== undefined && pAllow < minAllowConfidence)
-    ) {
+    if (confidence === undefined && pAllow === undefined) {
       decision = 'ask'
-      const measured =
-        pAllow !== undefined && pAllow < minAllowConfidence
-          ? pAllow
-          : effectiveConfidence
-      downgradedReason =
-        measured === undefined
-          ? `allow missing confidence (< threshold ${minAllowConfidence.toFixed(2)}) -> ask`
-          : `allow confidence ${measured.toFixed(2)} < threshold ${minAllowConfidence.toFixed(2)} -> ask`
+      downgradedReason = `allow missing confidence (< threshold ${minAllowConfidence.toFixed(2)}) -> ask`
+    } else if (confidence !== undefined && confidence < minAllowConfidence) {
+      decision = 'ask'
+      downgradedReason = `allow confidence ${confidence.toFixed(2)} < threshold ${minAllowConfidence.toFixed(2)} -> ask`
+    } else if (pAllow !== undefined && pAllow < minAllowProbability) {
+      decision = 'ask'
+      downgradedReason = `allow p(allow) ${pAllow.toFixed(2)} < threshold ${minAllowProbability.toFixed(2)} -> ask`
     }
   }
 

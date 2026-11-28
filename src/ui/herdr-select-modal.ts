@@ -8,8 +8,25 @@ export interface SelectOptionEntry {
 }
 
 const SELECT_TITLE_CMD_MAX = 160
+const PATTERN_LABEL_MAX = 120
+const OPTION_LABEL_MAX = 150
 const VIEW_PAGE_LINES = 16
 const VIEW_WRAP_WIDTH = 100
+
+export function sanitizeMiddleText(
+  text: string,
+  maxWidth = PATTERN_LABEL_MAX
+): string {
+  const clean = text
+    .replace(/[\n\r]+/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+  if (clean.length <= maxWidth) return clean
+  if (maxWidth <= 3) return clean.slice(0, maxWidth)
+  const tailLen = Math.min(36, Math.floor((maxWidth - 1) / 3))
+  const headLen = maxWidth - 1 - tailLen
+  return `${clean.slice(0, headLen)}…${clean.slice(-tailLen)}`
+}
 
 export function getFullSelectCommand(req: AskRequest): string {
   const full = (req.fullCommand ?? '').trim()
@@ -21,8 +38,11 @@ export function isSelectCommandTruncated(req: AskRequest): boolean {
   if (req.type === 'external-directory') return false
   const raw = getFullSelectCommand(req)
   if (!raw) return false
-  if (raw.includes('\n')) return true
-  return raw.replace(/\s{2,}/g, ' ').length > SELECT_TITLE_CMD_MAX
+  const normalized = raw
+    .replace(/[\n\r]+/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+  return normalized.length > SELECT_TITLE_CMD_MAX
 }
 
 function wrapCommandLines(text: string, width = VIEW_WRAP_WIDTH): string[] {
@@ -101,7 +121,7 @@ export function buildSelectOptions(req: AskRequest): SelectOptionEntry[] {
   } else if (req.sessionPatterns && req.sessionPatterns.length > 0) {
     entries.push({ label: 'Allow once', decision: 'allow' })
     for (const pat of req.sessionPatterns) {
-      const cleanPat = sanitizeSelectText(pat, 70)
+      const cleanPat = sanitizeMiddleText(pat, PATTERN_LABEL_MAX)
       entries.push({
         label: `Allow for session: ${cleanPat}`,
         decision: { decision: 'allow_session', pattern: pat },
@@ -116,7 +136,7 @@ export function buildSelectOptions(req: AskRequest): SelectOptionEntry[] {
       } else {
         const primaryPattern = req.sessionPatterns[0] ?? req.value
         entries.push({
-          label: `Allow permanently: ${sanitizeSelectText(primaryPattern, 70)}`,
+          label: `Allow permanently: ${sanitizeMiddleText(primaryPattern, PATTERN_LABEL_MAX)}`,
           decision: { decision: 'allow_permanent', pattern: primaryPattern },
         })
       }
@@ -154,7 +174,7 @@ export function buildSelectOptions(req: AskRequest): SelectOptionEntry[] {
 
   const seen = new Map<string, number>()
   return entries.map((entry) => {
-    const base = sanitizeSelectText(entry.label, 100)
+    const base = sanitizeSelectText(entry.label, OPTION_LABEL_MAX)
     const count = seen.get(base) ?? 0
     seen.set(base, count + 1)
     const label = count === 0 ? base : `${base} (${count + 1})`
@@ -168,7 +188,10 @@ export function buildPermanentPatternOptions(
   const seen = new Map<string, number>()
   const entries: Array<{ label: string; pattern: string | null }> =
     patterns.map((pat) => {
-      const base = sanitizeSelectText(`Allow permanently: ${pat}`, 100)
+      const base = sanitizeSelectText(
+        `Allow permanently: ${sanitizeMiddleText(pat, PATTERN_LABEL_MAX)}`,
+        OPTION_LABEL_MAX
+      )
       const count = seen.get(base) ?? 0
       seen.set(base, count + 1)
       const label = count === 0 ? base : `${base} (${count + 1})`
@@ -221,8 +244,12 @@ export async function runHerdrSelectPrompt(params: {
       selectTitle,
       selectLabels,
       remaining === -1
-        ? { signal: controller.signal }
-        : { signal: controller.signal, timeout: remaining }
+        ? { signal: controller.signal, blockedKind: 'permission' }
+        : {
+            signal: controller.signal,
+            timeout: remaining,
+            blockedKind: 'permission',
+          }
     )
     if (remaining === -1) {
       return await selectPromise
@@ -337,7 +364,9 @@ export async function runHerdrSelectPrompt(params: {
       reason = await ui.input(
         'Reason for denial',
         'Why is this denied? Shown to the model.',
-        timeoutMs === -1 ? {} : { timeout: timeoutMs }
+        timeoutMs === -1
+          ? { blockedKind: 'permission' }
+          : { timeout: timeoutMs, blockedKind: 'permission' }
       )
     } catch {
       return 'deny'

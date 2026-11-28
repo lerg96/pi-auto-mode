@@ -454,11 +454,20 @@ describe('createModalAskResolver with herdrSelectModal toggle', () => {
     ])
   })
 
-  it('offers View full command for multiline/long commands and returns via Back', async () => {
+  it('offers View full command only when command exceeds select title length and returns via Back', async () => {
+    const shortOpts = buildSelectOptions({
+      surface: 'shell',
+      tool: 'bash',
+      value: 'echo line1\necho line2',
+      fullCommand: 'echo line1\necho line2',
+      sessionPatterns: ['echo line1\necho line2'],
+    })
+    expect(shortOpts.map((o) => o.label)).not.toContain('View full command')
+
     process.env.HERDR_ENV = '1'
     const { pi } = makePi()
     const { ui, select } = makeUi()
-    const fullCmd = "python3 - <<'EOF'\nprint('line 1')\nprint('line 2')\nEOF"
+    const fullCmd = `python3 - <<'EOF'\n${'x = 12345678901234567890123456789012345678901234567890\n'.repeat(4)}print('line 2')\nEOF`
     select
       .mockResolvedValueOnce('View full command')
       .mockResolvedValueOnce('Back')
@@ -482,5 +491,56 @@ describe('createModalAskResolver with herdrSelectModal toggle', () => {
     expect(select).toHaveBeenCalledTimes(3)
     expect(select.mock.calls[1][0]).toContain("print('line 2')")
     expect(select.mock.calls[1][1]).toEqual(['Back'])
+  })
+
+  it('middle-truncates very long patterns so differing tails stay distinct without (2)/(3)', () => {
+    const prefix =
+      'bash /home/user/.pi/agent/skills/very-long-skill-name-directory/nested/subpath/scripts/wait-greptile-checks-runner-v2-extended.sh'
+    const opts = buildSelectOptions({
+      surface: 'shell',
+      tool: 'bash',
+      value: `${prefix} 985 120 30`,
+      sessionPatterns: [
+        `${prefix} 985 120 30`,
+        `${prefix} 985 120 *`,
+        `${prefix} 985 *`,
+        `${prefix} *`,
+      ],
+    })
+    const labels = opts
+      .filter((o) => o.label.startsWith('Allow for session:'))
+      .map((o) => o.label)
+    expect(labels.every((l) => !/\(\d+\)$/.test(l))).toBe(true)
+    expect(labels[0]).toContain('985 120 30')
+    expect(labels[1]).toContain('985 120 *')
+    expect(labels[2]).toContain('985 *')
+    expect(labels[3]).toContain('…')
+  })
+
+  it('passes blockedKind="permission" to ui.select and ui.input', async () => {
+    process.env.HERDR_ENV = '1'
+    const { pi } = makePi()
+    const { ui, select, input } = makeUi()
+    select.mockResolvedValueOnce('Deny with reason')
+    input.mockResolvedValueOnce('nope')
+    setUiContext(ui, true)
+
+    const resolver = createModalAskResolver(
+      pi,
+      new SessionRules(),
+      makeConfigState({ ui: { herdrSelectModal: true, modalTimeoutMs: -1 } })
+    )
+    await resolver({
+      surface: 'shell',
+      tool: 'bash',
+      value: 'rm foo',
+    })
+
+    expect(select.mock.calls[0][2]).toMatchObject({
+      blockedKind: 'permission',
+    })
+    expect(input.mock.calls[0][2]).toMatchObject({
+      blockedKind: 'permission',
+    })
   })
 })

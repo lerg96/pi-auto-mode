@@ -5,7 +5,12 @@ import {
   classifyToolCall,
   redactSecrets,
 } from '../../src/classifier/llm-layer.ts'
+import { clearClassifierCache } from '../../src/classifier/classifier-cache.ts'
 import type { ClassifierConfig, LlmConfig } from '../../src/types/config.ts'
+
+beforeEach(() => {
+  clearClassifierCache()
+})
 
 const baseConfig: ClassifierConfig = {
   enabled: true,

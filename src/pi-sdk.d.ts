@@ -130,19 +130,31 @@ export interface ExtensionUI {
   select(
     title: string,
     options: string[],
-    opts?: { signal?: AbortSignal; timeout?: number }
+    opts?: {
+      signal?: AbortSignal
+      timeout?: number
+      blockedKind?: 'permission' | 'question' | 'login'
+    }
   ): Promise<string | undefined>
   /** Native yes/no confirmation; resolves to `true`/`false`. */
   confirm(
     title: string,
     message: string,
-    opts?: { signal?: AbortSignal; timeout?: number }
+    opts?: {
+      signal?: AbortSignal
+      timeout?: number
+      blockedKind?: 'permission' | 'question' | 'login'
+    }
   ): Promise<boolean>
   /** Free-form text input; resolves to the entered string or undefined. */
   input(
     title: string,
     placeholder?: string,
-    opts?: { signal?: AbortSignal; timeout?: number }
+    opts?: {
+      signal?: AbortSignal
+      timeout?: number
+      blockedKind?: 'permission' | 'question' | 'login'
+    }
   ): Promise<string | undefined>
 }
 

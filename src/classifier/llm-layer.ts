@@ -151,9 +151,15 @@ import {
   callJevWithFallback,
   DEFAULT_JEV_BASE_URL,
   DEFAULT_JEV_MIN_ALLOW_CONFIDENCE,
+  DEFAULT_JEV_MIN_ALLOW_PROBABILITY,
   DEFAULT_JEV_MODEL,
   mapJevResult,
 } from './jev-client.ts'
+import {
+  buildClassifierCacheKey,
+  getCachedClassifierAllow,
+  setCachedClassifierAllow,
+} from './classifier-cache.ts'
 
 const DEFAULT_SYSTEM =
   'You are a security classifier for an AI coding agent. Decide allow/block/ask ' +
@@ -533,6 +539,19 @@ async function runLlmBranch(
   // Host for debug events: assigned after credential resolution. The catch
   // below runs outside `creds` scope, so it travels in this binding.
   let debugHost = ''
+  const cacheApi = isJevApi(params.llm) ? 'jev' : 'openai-completions'
+  const cacheModel =
+    params.llm.model.trim() || (isJevApi(params.llm) ? DEFAULT_JEV_MODEL : '')
+  const cacheKey = buildClassifierCacheKey(input, cacheModel, cacheApi)
+  const cached = getCachedClassifierAllow(cacheKey, input)
+  if (cached) {
+    deps.debug?.record('classifier:cache_hit', {
+      model: cacheModel,
+      api: cacheApi,
+      ...(input.requestId ? { requestId: input.requestId } : {}),
+    })
+    return cached
+  }
   try {
     let fileFragment: string | undefined
     if (
@@ -579,10 +598,13 @@ async function runLlmBranch(
         onAttempt,
         retries: params.llm.retries,
       })
-      return mapJevResult(
+      const mapped = mapJevResult(
         jevRes,
-        params.llm.minAllowConfidence ?? DEFAULT_JEV_MIN_ALLOW_CONFIDENCE
+        params.llm.minAllowConfidence ?? DEFAULT_JEV_MIN_ALLOW_CONFIDENCE,
+        params.llm.minAllowProbability ?? DEFAULT_JEV_MIN_ALLOW_PROBABILITY
       )
+      setCachedClassifierAllow(cacheKey, input, mapped)
+      return mapped
     }
 
     const prompt = buildLlmPrompt(input, config, fileFragment)
@@ -610,7 +632,9 @@ async function runLlmBranch(
       onAttempt,
       retries: params.llm.retries,
     })
-    return mapLlmResult(res, params)
+    const mapped = mapLlmResult(res, params)
+    setCachedClassifierAllow(cacheKey, input, mapped)
+    return mapped
   } catch (e) {
     // Debug observability: record structured LLM failure diagnostics to
     // the separate debug jsonl. NEVER the prompt, headers, or apiKey —

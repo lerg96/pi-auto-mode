@@ -874,5 +874,28 @@ describe('bash function headers, var assignments, and C-style for loops', () => 
       )
     ).toBe(true)
     expect(isShellStructureSegment('   # indented comment')).toBe(true)
+    expect(
+      splitShellSegments(
+        'echo ok\n# comment with ; semicolon and | pipe\necho done'
+      )
+    ).toEqual(['echo ok', 'echo done'])
+    expect(splitShellSegments('echo foo#bar $# ${#x}')).toEqual([
+      'echo foo#bar $# ${#x}',
+    ])
+  })
+
+  it('strips leading bash pipeline negation (!) so negated commands match their base rule', () => {
+    expect(
+      stripLeadingShellKeywords('! grep -q AUTHORIZER_CLIENT_URL $f')
+    ).toBe('grep -q AUTHORIZER_CLIENT_URL $f')
+    expect(
+      splitShellSegments('if ! grep -q FOO bar; then echo missing; fi')
+    ).toEqual(['grep -q FOO bar', 'echo missing'])
+    expect(stripLeadingShellKeywords('! ! grep -q a b')).toBe('grep -q a b')
+    expect(stripLeadingShellKeywords('!foo bar')).toBe('!foo bar')
+    expect(splitShellSegments('! [ -f foo ] && echo nope')).toEqual([
+      '[ -f foo ]',
+      'echo nope',
+    ])
   })
 })

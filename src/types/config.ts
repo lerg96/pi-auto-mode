@@ -96,9 +96,10 @@ const llmConfig = z
     //   'openai-completions' (default): POST <baseUrl>/chat/completions
     //   'jev': TypeSafe AI System One (POST <baseUrl>/systemone)
     api: z.enum(['openai-completions', 'jev']).optional(),
-    // Umbral mínimo de confianza/probabilidad (0..1) para que Jev auto-apruebe
-    // un `choice: 'allow'`. Por debajo cae fail-closed a `ask`. Default 0.85.
+    // Umbrales mínimos (0..1) para que Jev auto-apruebe un `choice: 'allow'`.
+    // Por debajo cae fail-closed a `ask`. Defaults: confidence 0.75, probability 0.80.
     minAllowConfidence: z.number().min(0).max(1).optional(),
+    minAllowProbability: z.number().min(0).max(1).optional(),
     model: z.string().default(''),
     // '' (vacío) → resuelve lazy desde modelRegistry de Pi por call.
     baseUrl: z.string().default(''),
@@ -447,6 +448,7 @@ export interface LlmConfig {
   provider: string
   api?: 'openai-completions' | 'jev'
   minAllowConfidence?: number
+  minAllowProbability?: number
   model: string
   baseUrl: string
   apiKey: string

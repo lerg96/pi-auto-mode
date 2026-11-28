@@ -9,6 +9,22 @@ import type { configState } from '../state/config-state.ts'
 import { SessionRules } from '../permission/session-rules.ts'
 import { setUiContext } from '../state/ui-context.ts'
 import { openPermissionsListModal } from '../ui/permissions-list-modal.ts'
+import {
+  isShellStructureSegment,
+  normalizeToolCall,
+} from '../gate/normalize.ts'
+import { evaluatePermission } from '../permission/visibility.ts'
+import {
+  evaluateExternalDirectory,
+  extractCdTarget,
+  resolveFsPath,
+} from '../permission/external-directory.ts'
+import {
+  classifyToolCall,
+  type ClassifierInput,
+  type ClassifierResult,
+} from '../classifier/llm-layer.ts'
+import { formatTelemetryStats, readTelemetryStats } from '../telemetry/stats.ts'
 
 // H7: changing `activePermissionSets` is a privileged, runtime elevation of privileges.
 // We reuse the same ask-resolver the gate uses (getAskResolver) so the user
@@ -94,6 +110,69 @@ export function setMode(config: Config, mode: string): ModeChange {
     return { ok: true, mode: m, already: true }
   }
   return { ok: true, mode: m, already: false }
+}
+
+export async function dryRunBashCommand(
+  command: string,
+  cfg: Config,
+  opts: {
+    cwd?: string
+    sessionRules?: SessionRules
+    classify?: (input: ClassifierInput) => Promise<ClassifierResult>
+  } = {}
+): Promise<string> {
+  const intents = normalizeToolCall('bash', { command })
+  let effectiveCwd = opts.cwd ?? process.cwd()
+  const lines: string[] = [`Dry-run bash (${intents.length} segment(s)):`]
+
+  for (let i = 0; i < intents.length; i++) {
+    const intent = intents[i]
+    const raw = intent.rawValue ?? intent.value
+    if (intent.surface === 'shell' && isShellStructureSegment(raw)) {
+      lines.push(`  [${i + 1}] structure (skip): ${intent.value}`)
+      continue
+    }
+    const perm = evaluatePermission(cfg, 'tools', 'bash', intent.value)
+    const ext = evaluateExternalDirectory(cfg, [intent], {
+      toolName: 'bash',
+      sessionRules: opts.sessionRules,
+      cwd: effectiveCwd,
+    })
+    const ruleTag = perm.matchedRule
+      ? `rule='${perm.matchedRule.pattern}'${perm.matchedRule.classify ? ' classify=true' : ''}`
+      : 'no rule'
+    const extTag = ext ? ` ext=${ext.action}(${ext.absPath})` : ''
+    let clfTag = ''
+    const willClassify =
+      perm.action === 'ask' &&
+      ext?.action !== 'ask' &&
+      cfg.classifier.enabled === true &&
+      (cfg.classifier.onlyFlagged !== true ||
+        perm.matchedRule?.classify === true)
+    if (willClassify && opts.classify) {
+      const r = await opts.classify({
+        toolName: 'bash',
+        arguments: { command: intent.value },
+        surface: intent.surface,
+        value: intent.value,
+        cwd: effectiveCwd,
+      })
+      const reason = r.risk?.reason ? ` (${r.risk.reason})` : ''
+      clfTag = ` -> classifier=${r.decision}${reason}`
+    } else if (perm.action === 'ask' && cfg.classifier.enabled === true) {
+      clfTag = ' -> classifier=skipped(onlyFlagged)'
+    }
+    lines.push(
+      `  [${i + 1}] ${perm.action} [${ruleTag}${extTag}]${clfTag}: ${intent.value}`
+    )
+    if (intent.surface === 'shell') {
+      const cdTarget = extractCdTarget(intent.value)
+      if (cdTarget) {
+        effectiveCwd = resolveFsPath(cdTarget, effectiveCwd)
+      }
+    }
+  }
+  return lines.join('\n')
 }
 
 export function registerSetCommands(
@@ -273,5 +352,61 @@ export function registerSetCommands(
           label: opt,
           description: opt === 'on' ? 'enable YOLO mode' : 'disable YOLO mode',
         })),
+  })
+
+  pi.registerCommand('auto-mode:test', {
+    description:
+      'Dry-run a bash command against rules and classifier without executing it. Usage: /auto-mode:test <command>',
+    handler: async (args, ctx) => {
+      const cmd = (args ?? '').trim()
+      if (!cmd) {
+        ctx.ui?.notify('Usage: /auto-mode:test <bash command>', 'warning')
+        return
+      }
+      const cfg = state.get()
+      const report = await dryRunBashCommand(cmd, cfg, {
+        cwd: ctx.cwd,
+        sessionRules,
+        classify: (input) =>
+          classifyToolCall(
+            input,
+            { config: cfg.classifier, llm: cfg.classifier.llm },
+            { models: ctx.modelRegistry }
+          ),
+      })
+      ctx.ui?.notify(report, 'info')
+    },
+  })
+
+  pi.registerCommand('auto-mode:stats', {
+    description:
+      'Show summary stats and top user prompts from telemetry logs. Usage: /auto-mode:stats [limit]',
+    handler: async (args, ctx) => {
+      const raw = (args ?? '').trim()
+      let limit: number | undefined
+      if (raw) {
+        const parsed = Number.parseInt(raw, 10)
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+          ctx.ui?.notify(
+            'Usage: /auto-mode:stats [limit] (positive integer, default 1000)',
+            'warning'
+          )
+          return
+        }
+        limit = parsed
+      }
+      const cfg = state.get()
+      try {
+        const stats = await readTelemetryStats(
+          cfg.telemetry.path,
+          cfg.debug.path,
+          { limit }
+        )
+        ctx.ui?.notify(formatTelemetryStats(stats), 'info')
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        ctx.ui?.notify(`Failed to read telemetry stats: ${msg}`, 'error')
+      }
+    },
   })
 }

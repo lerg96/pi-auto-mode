@@ -2819,5 +2819,75 @@ rm -f /tmp/agy1.txt /tmp/agy2.txt /tmp/agy3.txt`
       expect(capturedPatterns).toEqual(['sed -i -e 87,108d src/libs/lambda.ts'])
       expect(capturedSuppress).toBe(true)
     })
+
+    it('uses each segment own matched rule and reason in mixed multi-segment pipelines', async () => {
+      configState.set({
+        ...config,
+        classifier: {
+          ...config.classifier,
+          enabled: true,
+          onlyFlagged: true,
+        },
+        permissions: {
+          tools: {
+            bash: [
+              {
+                pattern: 'aws *',
+                action: 'ask',
+                reason: 'aws bloqueado en este proyecto',
+              },
+              {
+                pattern: 'python3 *',
+                action: 'ask',
+                classify: true,
+              },
+              { pattern: '*', action: 'ask', reason: 'fallback ask' },
+            ],
+          },
+        },
+      })
+
+      const askedReqs: AskRequest[] = []
+      setAskResolver(async (req) => {
+        askedReqs.push(req)
+        return { decision: 'allow' }
+      })
+
+      const events: Array<Record<string, unknown>> = []
+      const deps: GateDeps = {
+        ...makeDeps(),
+        classify: async () => ({ decision: 'allow' }),
+        hooks: {
+          emit: (_ch, data) => {
+            events.push(data as Record<string, unknown>)
+          },
+        },
+      }
+
+      await gateToolCall(
+        'bash',
+        {
+          command:
+            'aws cloudformation get-template --stack-name foo | python3 -c "print(1)"',
+        },
+        deps
+      )
+
+      expect(askedReqs).toHaveLength(1)
+      expect(askedReqs[0].value).toBe(
+        'aws cloudformation get-template --stack-name foo'
+      )
+      expect(askedReqs[0].rule).toMatchObject({
+        surface: 'bash',
+        pattern: 'aws *',
+        reason: 'aws bloqueado en este proyecto',
+      })
+
+      const userEvent = events.find((e) => e.decidedBy === 'user')
+      expect((userEvent?.detail as { rule?: unknown })?.rule).toMatchObject({
+        pattern: 'aws *',
+        reason: 'aws bloqueado en este proyecto',
+      })
+    })
   })
 })
